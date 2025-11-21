@@ -667,6 +667,7 @@ def coverage(
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".geojson", delete=False
                 ) as tmp:
+                    tmp.close()
                     country_gdf.to_file(tmp.name, driver="GeoJSON")
                     country_geojson_file = tmp.name
 
