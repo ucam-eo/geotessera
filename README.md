@@ -267,6 +267,11 @@ for lon, lat, embedding, crs, transform in embeddings:
     processed = your_analysis_function(embedding)
 ```
 
+Get a single pixel embedding
+```python
+gt.get_embedding_for_location(lon=0.15, lat=52.05, year=2024)
+```
+
 ### Visualization Functions
 
 ```python

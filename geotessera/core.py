@@ -11,6 +11,8 @@ import json
 import logging
 import numpy as np
 import geopandas as gpd
+import xarray as xr
+import rioxarray
 
 from .registry import (
     Registry,
@@ -1519,6 +1521,67 @@ class GeoTessera:
             )
 
         return str(output_path)
+
+    def get_embedding_for_location(
+            self,
+            lon: float,
+            lat: float,
+            year: int,
+    ) -> np.ndarray:
+        """Returns the cloasest embedding pixel for the given location.
+
+        Args:
+            lon: longitude of the coordinate
+            lat: latitude of the coordinate
+            year: Year of embeddings
+
+        Returns:
+            ndarray of the embedding pixel
+
+        Raises:
+            FileNotFoundError: If registry files are missing
+        """
+        offset = 0.0001
+        bbox = (lon - offset, lat - offset, lon + offset, lat + offset)  # (min_lon, min_lat, max_lon, max_lat)
+        tiles_to_fetch = self.registry.load_blocks_for_region(bounds=bbox, year=year)
+        tiles = list(self.fetch_embeddings(tiles_to_fetch))
+        if len(tiles) == 0:
+            error_msg = (
+                f"could not find file for lon: {lon}, lat: {lat}, year: {year}"
+            )
+            raise FileNotFoundError(error_msg)
+        year, tile_lon, tile_lat, embedding_array, crs, transform = tiles[0]
+        height, width, channels = embedding_array.shape
+
+        x_idx = np.arange(width) + 0.5
+        y_idx = np.arange(height) + 0.5
+
+        x0, y0 = transform * (0, 0)
+        dx = transform.a
+        dy = transform.e
+
+        x_coords = x0 + dx * x_idx
+        y_coords = y0 + dy * y_idx
+
+        data_array = xr.DataArray(
+            embedding_array,
+            dims=("y", "x", "band"),
+            coords={
+                "x": x_coords,
+                "y": y_coords,
+                "band": np.arange(channels),
+            },
+            name="embedding",
+        )
+
+        data_array = data_array.rio.write_crs(crs)
+        data_array = data_array.rio.write_transform(transform)
+
+        data_array = data_array.transpose('band', 'y', 'x')
+        data_array = data_array.rio.reproject("EPSG:4326")
+
+        return data_array.sel(x=lon, y=lat, method="nearest").values
+
 
     def export_embedding_geotiffs(
         self,
