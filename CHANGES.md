@@ -1,20 +1,65 @@
 ## Unreleased
 
+### New Features
+
+- **Remote zarr builds**: `zarr-init` and `zarr-fill` now take locations
+  rather than paths — both the tile source and the output store may be
+  fsspec URLs (`s3://bucket/prefix`), so a store on one S3 node can be
+  filled from tiles on another with no local mirror. Remote tiles are read
+  with byte-range GETs sized to the rows each shard needs (an `.npy` is a
+  header plus a flat C-ordered buffer), so no scratch disk is involved.
+  `--source-*` and `--store-*` flags configure the two endpoints
+  independently; credentials come from the environment, a named profile
+  (`--store-profile`), or an instance role rather than argv, and
+  `--store-acl` stamps a canned ACL such as `bucket-owner-full-control` on
+  every object written. `s3://` locations need the new optional
+  `s3` extra (`pip install 'geotessera[s3]'`), which is what pulls in
+  `s3fs` and `botocore`; the core install stays free of both and `https://`
+  sources work without it. (@avsm)
+- **Parallel per-zone fills**: `zarr-fill --zones N` is now safe to run as
+  one process per UTM zone against a shared store. Ingestion tracking is one
+  object per zone/year, each zone/year takes an advisory lock
+  (`--force-lock` to take over a dead run's), and root-metadata
+  consolidation is skipped by default for a zone-restricted fill. See
+  the architecture guide for the sweep recipe. (@avsm)
+- **The store now contains only Zarr**: build bookkeeping — the ingestion
+  registry, fill locks and global-preview resume markers — moved out of the
+  store into a sibling location, `<store>.build` by default and relocatable
+  with `--state-url`. Previously these sat at the store root, where every
+  hierarchy listing and `consolidate_metadata` call warned about
+  unrecognised objects and readers saw non-Zarr entries. A `_registry.parquet`
+  left inside an older store is still read, so existing stores resume
+  correctly; nothing is written back into them. (@avsm)
+- **`geotessera-registry zarr-extend`**: New subcommand that appends years
+  to an existing store's time axis, so a new year can be added without
+  rebuilding. Time is chunked one year per chunk, making this a
+  metadata-only edit — existing chunks are never rewritten — and the new
+  slice reads back with the same sentinels a freshly initialised year has.
+  Years may only be appended (inserting an earlier one would renumber every
+  chunk, so it is refused), and it will not run while a fill lock is held.
+  (@avsm)
+### Bug Fixes
+
+- **Incremental fills no longer erase neighbouring tiles**: a shard write
+  replaces the whole shard, so a fill that touched a shard already holding
+  data would zero out the tiles it did not re-read. Touched shards are now
+  rebuilt from every tile overlapping them. (@avsm)
+- **Failed shards are no longer recorded as written**: tiles are only added
+  to the ingestion registry once every shard covering them succeeded, so
+  re-running a fill retries exactly the unfinished work. A fill with any
+  failed shard now reports an error. (@avsm)
+- **`geotessera-registry` propagates exit status**: command return codes
+  were discarded, so failures reported success to the shell. (@avsm)
+
+
+## 0.10.0 (2026-08-20)
+
 ### Breaking Changes
 
 - All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
   Embeddings, landmasks and manifests are served from the public
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
   replacing the retired `tessera-embeddings` AWS S3 bucket.
-
-- `sphinx` and `cram` are no longer runtime dependencies.
-  Sphinx moved to a `docs` extra (`pip install geotessera[docs]`)
-  and cram to the `dev` dependency group (@avsm)
-
-- The Zarr read API drops `crs=`. The store is UTM-native, so 
-  `GeoTesseraZarr` takes lon/lat and routes to the `utm{NN}` group holding
-  the point, and the `.tessera` accessor takes eastings and northings in
-  that zone's own CRS. Project to lon/lat once up front, rather than per call.
 
 - `botocore` and `awscrt` are no longer required dependencies as `urllib3`
   is a new direct dependency (@avsm)
@@ -52,23 +97,6 @@
 - `geotessera-registry s3scan` scans Source Cooperative to list
   embeddings. This allows manifests and landmask registries to be
   regenerated directly from the Source Cooperative repository.  (@avsm)
-
-- `open_zone(lon=...)` and `GeoTesseraZarr.open_zone(lon=...)` accept a
-  whole-number longitude. `lon=-3` previously raised `TypeError`.  (@avsm)
-
-### Performance
-
-- Point sampling no longer rebuilds a pyproj transformer for every point.
-
-### Documentation
-
-- The `geotessera` package docstring now covers `GeoTesseraZarr` alongside the
-  GeoTIFF export path; it previously described only the latter (@avsm)
-
-### Internal
-
-- The globe viewer HTML embedded in `cli.py` moved to
-  `geotessera/templates/globe.html`, shipped as package data (@avsm)
 
 ## v0.9.0 (2026-06-09)
 

@@ -46,6 +46,7 @@ from .registry import (
     dataset_from_path,
     dataset_path,
     default_variant,
+    format_bytes,
     parse_grid_name,
     zarr_store_url,
 )
@@ -3371,32 +3372,362 @@ def _detect_dataset_metadata(
     return version, variant
 
 
+def _add_source_args(parser) -> None:
+    """Register the dataset-selection flags shared by zarr-init and zarr-fill."""
+    parser.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="Local directory containing manifest.parquet / landmasks.parquet "
+        "(default: auto-detected from base_dir and parents, or pulled from a "
+        "URL base_dir)",
+    )
+    parser.add_argument(
+        "--manifest-url",
+        type=str,
+        default=None,
+        help="Location of the embeddings manifest, for mirrors that do not "
+        "follow the npy/<version>/manifest.parquet layout",
+    )
+    parser.add_argument(
+        "--landmasks-url",
+        type=str,
+        default=None,
+        help="Location of the landmasks registry, for mirrors that do not "
+        "follow the landmasks/<version>/landmasks.parquet layout",
+    )
+    parser.add_argument(
+        "--dataset-version",
+        type=str,
+        default=None,
+        help="Tessera dataset version (e.g. v1, v1.1). "
+        "Default: read from tessera_metadata.json in base_dir, else v1.",
+    )
+    parser.add_argument(
+        "--dataset-variant",
+        type=str,
+        default=None,
+        help="Tessera dataset variant (e.g. vultr, cambridge). "
+        "Default: read from tessera_metadata.json in base_dir, else the "
+        "version's published variant.",
+    )
+
+
+def _add_state_arg(parser) -> None:
+    """Register ``--state-url`` for the commands that keep build bookkeeping."""
+    parser.add_argument(
+        "--state-url",
+        type=str,
+        default=None,
+        help="Where to keep build state (ingestion registry, fill locks). "
+        "Default: <store>.build alongside the store. Kept outside the store "
+        "so the published Zarr hierarchy contains only Zarr.",
+    )
+
+
+def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -> None:
+    """Register ``--{prefix}-*`` object-store flags on *parser*.
+
+    Access keys are deliberately absent: they come from the environment
+    (``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY``), a named profile, or an
+    instance role, so they never appear in a process listing.
+
+    Args:
+        writable: Also offer ``--{prefix}-acl``, which only affects writes.
+    """
+    group = parser.add_argument_group(f"{label} object-store options")
+    group.add_argument(
+        f"--{prefix}-endpoint-url",
+        type=str,
+        default=None,
+        help=f"S3-compatible endpoint for the {label.lower()} "
+        f"(default: $AWS_ENDPOINT_URL, else the AWS default)",
+    )
+    group.add_argument(
+        f"--{prefix}-anon",
+        action="store_true",
+        help=f"Access the {label.lower()} anonymously (public buckets)",
+    )
+    group.add_argument(
+        f"--{prefix}-region",
+        type=str,
+        default=None,
+        help=f"Region for the {label.lower()} (default: $AWS_DEFAULT_REGION)",
+    )
+    group.add_argument(
+        f"--{prefix}-profile",
+        type=str,
+        default=None,
+        help=f"Shared-config profile for the {label.lower()} "
+        f"(default: $AWS_PROFILE)",
+    )
+    group.add_argument(
+        f"--{prefix}-requester-pays",
+        action="store_true",
+        help=f"Send requester-pays headers to the {label.lower()}",
+    )
+    if writable:
+        from .remote import OBJECT_ACLS
+
+        group.add_argument(
+            f"--{prefix}-acl",
+            type=str,
+            default=None,
+            choices=OBJECT_ACLS,
+            metavar="ACL",
+            help=f"Canned ACL applied to every object written to the "
+            f"{label.lower()} (e.g. bucket-owner-full-control when the "
+            f"bucket belongs to another account)",
+        )
+
+
+def _object_store_errors() -> Tuple[type, ...]:
+    """Exception types worth reporting as a message rather than a traceback.
+
+    Empty when botocore is absent (i.e. the s3 extra is not installed), in
+    which case no such error can be raised anyway.
+    """
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        return (BotoCoreError, ClientError)
+    except ImportError:
+        return ()
+
+
+def _report_store_error(e: Exception, console: "Console") -> int:
+    """Print an object-store or missing-backend failure and return exit 1.
+
+    Error text is escaped: it routinely contains bracketed fragments (and
+    our own ``geotessera[s3]`` hint) that Rich would otherwise eat as markup.
+    """
+    from rich.markup import escape
+
+    console.print(f"[red]{emoji('❌ ')}{escape(str(e))}[/red]")
+    if isinstance(e, _object_store_errors() or ()):
+        console.print(
+            "Check the endpoint and credentials: --source-endpoint-url / "
+            "--store-endpoint-url, --*-profile, --*-anon, or the AWS_* "
+            "environment variables."
+        )
+    return 1
+
+
+def _storage_options_for(
+    args, prefix: str, location: str
+) -> Optional[Dict[str, Any]]:
+    """Build fsspec storage options from ``--{prefix}-*`` flags.
+
+    Returns None for local paths so plain filesystem access never picks up
+    stray ``AWS_*`` environment variables.
+    """
+    from .remote import build_storage_options, is_url
+
+    if not is_url(location):
+        return None
+
+    def opt(name):
+        return getattr(args, f"{prefix}_{name}", None)
+
+    return build_storage_options(
+        endpoint_url=opt("endpoint_url"),
+        anon=bool(opt("anon")),
+        region=opt("region"),
+        profile=opt("profile"),
+        requester_pays=bool(opt("requester_pays")),
+        acl=opt("acl"),
+    )
+
+
+def _remote_registry_cache_dir(root: str, version_path: str) -> Path:
+    """Local cache directory for registries pulled from a remote mirror.
+
+    Keyed by a digest of the source root so mirrors with different contents
+    never share a cached manifest.
+    """
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", "~")).expanduser()
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+    digest = hashlib.sha256(root.encode()).hexdigest()[:12]
+    return base / "geotessera" / "mirrors" / digest / version_path
+
+
+def _sync_remote_file(
+    loc: str,
+    dest: Path,
+    storage_options: Optional[Dict[str, Any]],
+    console: "Console",
+    optional: bool = False,
+) -> Optional[Path]:
+    """Download *loc* to *dest* unless the cached copy already matches.
+
+    Freshness is judged on the object's size and last-modified stamp, which
+    every S3-compatible endpoint reports on a HEAD — far cheaper than
+    re-pulling a multi-hundred-megabyte manifest each run.
+
+    A local path is used where it lies; only URLs are ever copied.
+    """
+    import json
+
+    from . import remote
+
+    if not remote.is_url(loc):
+        local = Path(loc)
+        if local.exists():
+            return local
+        if optional:
+            return None
+        raise FileNotFoundError(loc)
+
+    fs = remote.get_fs(loc, storage_options)
+    try:
+        info = fs.info(str(loc))
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    except Exception as e:
+        if optional:
+            console.print(f"[yellow]Could not stat {loc}: {e}[/yellow]")
+            return None
+        raise
+
+    stamp = {
+        "size": info.get("size"),
+        "mtime": str(info.get("LastModified") or info.get("mtime") or ""),
+    }
+    meta = dest.with_name(dest.name + ".meta.json")
+
+    if dest.exists() and meta.exists():
+        try:
+            if json.loads(meta.read_text()) == stamp:
+                console.print(f"[dim]Using cached {dest.name} ({loc})[/dim]")
+                return dest
+        except (OSError, ValueError):
+            pass
+
+    size_str = format_bytes(stamp["size"]) if stamp["size"] else "unknown size"
+    console.print(f"Downloading {loc} ({size_str})...")
+    remote.download(loc, dest, storage_options)
+    meta.write_text(json.dumps(stamp, default=str))
+    return dest
+
+
+def _resolve_source(args, console: "Console"):
+    """Resolve the tile source and its registry for a zarr-init/fill run.
+
+    ``args.base_dir`` is either a local mirror directory (the historical
+    behaviour) or a URL such as ``s3://bucket/prefix`` pointing at a
+    repository in the published layout.  In the remote case the manifest and
+    landmask registries are pulled from that same root — or from
+    ``--manifest-url``/``--landmasks-url`` when a mirror deviates — and
+    cached locally, so no local tile mirror is needed at all.
+
+    Returns ``(registry, source, dataset_version, dataset_variant)`` where
+    ``source`` is a :class:`~geotessera.zarr.TileSource`, or None to mean
+    "use the registry's local mirror".
+    """
+    from .registry import Registry, _parse_dataset_version
+    from .remote import is_url, join
+    from .zarr import TileSource
+
+    base_dir = args.base_dir
+
+    def override(loc, name, optional=False):
+        """Resolve an explicit --manifest-url / --landmasks-url, if given."""
+        if not loc:
+            return None
+        return _sync_remote_file(
+            loc,
+            _remote_registry_cache_dir(str(base_dir), "override") / name,
+            _storage_options_for(args, "source", loc),
+            console,
+            optional=optional,
+        )
+
+    if not is_url(base_dir):
+        base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+        dataset_version, dataset_variant = _detect_dataset_metadata(
+            base_dir, args.dataset_version, args.dataset_variant
+        )
+        console.print(
+            f"[cyan]Using dataset version={dataset_version}, "
+            f"variant={dataset_variant}[/cyan]"
+        )
+        registry = Registry(
+            version=dataset_version,
+            variant=dataset_variant,
+            embeddings_dir=base_dir,
+            registry_dir=registry_dir,
+            registry_path=override(args.manifest_url, "manifest.parquet"),
+            landmasks_registry_path=override(
+                args.landmasks_url, "landmasks.parquet", optional=True
+            ),
+        )
+        return registry, None, dataset_version, dataset_variant
+
+    # Remote mirror.
+    dataset_version = args.dataset_version or "v1"
+    version_path, version_norm = _parse_dataset_version(dataset_version)
+    dataset_variant = args.dataset_variant or default_variant(version_norm)
+    storage_options = _storage_options_for(args, "source", base_dir)
+
+    console.print(
+        f"[cyan]Streaming tiles from {base_dir} "
+        f"(version={version_path}, variant={dataset_variant})[/cyan]"
+    )
+
+    if args.registry_dir:
+        registry = Registry(
+            version=dataset_version,
+            variant=dataset_variant,
+            registry_dir=args.registry_dir,
+        )
+    else:
+        cache_dir = _remote_registry_cache_dir(base_dir, version_path)
+        manifest_loc = args.manifest_url or join(
+            base_dir, "npy", version_path, "manifest.parquet"
+        )
+        landmasks_loc = args.landmasks_url or join(
+            base_dir, "landmasks", version_path, "landmasks.parquet"
+        )
+        manifest_path = _sync_remote_file(
+            manifest_loc,
+            cache_dir / "manifest.parquet",
+            _storage_options_for(args, "source", manifest_loc),
+            console,
+        )
+        landmasks_path = _sync_remote_file(
+            landmasks_loc,
+            cache_dir / "landmasks.parquet",
+            _storage_options_for(args, "source", landmasks_loc),
+            console,
+            optional=True,
+        )
+        registry = Registry(
+            version=dataset_version,
+            variant=dataset_variant,
+            registry_path=manifest_path,
+            landmasks_registry_path=landmasks_path,
+        )
+
+    source = TileSource.for_url(base_dir, version_path, storage_options)
+    return registry, source, dataset_version, dataset_variant
+
+
 def zarr_init_command(args):
     """Create an empty tessera store with time dimension."""
     from rich.console import Console
-    from .registry import Registry
     from .zarr import init_store
 
     console = Console()
 
-    base_dir = args.base_dir
-    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
-    dataset_version, dataset_variant = _detect_dataset_metadata(
-        base_dir, args.dataset_version, args.dataset_variant
-    )
-    console.print(
-        f"[cyan]Using dataset version={dataset_version}, variant={dataset_variant}[/cyan]"
-    )
-
-    registry = Registry(
-        version=dataset_version,
-        variant=dataset_variant,
-        embeddings_dir=base_dir,
-        registry_dir=registry_dir,
-    )
+    registry, _source, _version, _variant = _resolve_source(args, console)
 
     years = _parse_int_range(args.years)
-    output = Path(args.output)
+    output = args.output
+    store_options = _storage_options_for(args, "store", output)
 
     try:
         import importlib.metadata
@@ -3421,10 +3752,14 @@ def zarr_init_command(args):
             geotessera_version=version,
             model_version=model_version,
             console=console,
+            storage_options=store_options,
+            state_url=args.state_url,
         )
     except FileExistsError as e:
         console.print(f"[red]Error:[/red] {e}")
         return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     return 0
 
@@ -3433,43 +3768,92 @@ def zarr_fill_command(args):
     """Incrementally fill a tessera store with tile data."""
     import warnings
     from rich.console import Console
-    from .registry import Registry
     from .zarr import fill_store
 
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
 
-    base_dir = args.base_dir
-    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
-    dataset_version, dataset_variant = _detect_dataset_metadata(
-        base_dir, args.dataset_version, args.dataset_variant
-    )
-    console.print(
-        f"[cyan]Using dataset version={dataset_version}, variant={dataset_variant}[/cyan]"
-    )
+    registry, source, _version, _variant = _resolve_source(args, console)
 
-    registry = Registry(
-        version=dataset_version,
-        variant=dataset_variant,
-        embeddings_dir=base_dir,
-        registry_dir=registry_dir,
-    )
-
-    store_path = Path(args.store_path)
+    store_path = args.store_path
+    store_options = _storage_options_for(args, "store", store_path)
     year = args.year
     zones = _parse_int_range(args.zones) if args.zones else None
 
-    n = fill_store(
-        registry,
-        store_path,
-        year=year,
-        zones=zones,
-        console=console,
-        workers=args.workers,
-    )
+    consolidate = None
+    if args.consolidate:
+        consolidate = True
+    elif args.no_consolidate:
+        consolidate = False
+
+    try:
+        n = fill_store(
+            registry,
+            store_path,
+            year=year,
+            zones=zones,
+            console=console,
+            workers=args.workers,
+            storage_options=store_options,
+            source=source,
+            consolidate=consolidate,
+            force_lock=args.force_lock,
+            state_url=args.state_url,
+        )
+    except RuntimeError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     console.print(f"\n{emoji('✅ ')}{n} shards written")
+    return 0
+
+
+def zarr_extend_command(args):
+    """Append new years to an existing store's time axis."""
+    import warnings
+    from rich.console import Console
+
+    from .zarr import extend_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    store_options = _storage_options_for(args, "store", args.store_path)
+    years = _parse_int_range(args.years)
+    zones = _parse_int_range(args.zones) if args.zones else None
+
+    try:
+        n = extend_store(
+            args.store_path,
+            years,
+            console=console,
+            storage_options=store_options,
+            zones=zones,
+            consolidate=not args.no_consolidate,
+            force=args.force,
+            state_url=args.state_url,
+        )
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    if n == 0:
+        console.print(
+            f"{emoji('✅ ')}Nothing to do — every zone already has "
+            f"{', '.join(str(y) for y in years)}"
+        )
+        return 0
+
+    console.print(
+        f"{emoji('✅ ')}{n} zone(s) extended. "
+        f"Fill them with: geotessera-registry zarr-fill <source> "
+        f"{args.store_path} --year {years[0]} --zones <n>"
+    )
     return 0
 
 
@@ -3480,20 +3864,42 @@ def zarr_consolidate_command(args):
     from .zarr import consolidate_store
 
     console = Console()
+    store_options = _storage_options_for(args, "store", args.store_path)
     try:
-        n = consolidate_store(args.store_path, console=console)
+        n = consolidate_store(
+            args.store_path,
+            console=console,
+            storage_options=store_options,
+            merge_registry=not args.no_merge_registry,
+            state_url=args.state_url,
+        )
     except FileNotFoundError as e:
         console.print(f"[red]{emoji('❌ ')}Error: {e}[/red]")
-        raise SystemExit(1)
-    except ImportError as e:
-        console.print(
-            f"[red]{emoji('❌ ')}Error: {e} "
-            f"(remote store URLs need the matching fsspec backend, "
-            f"e.g. s3fs for s3://)[/red]"
-        )
-        raise SystemExit(1)
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
     console.print(f"{emoji('✅ ')}Consolidated metadata for {n} nodes")
     return 0
+
+
+def _require_local_store(store_path: str, command: str, console: "Console") -> bool:
+    """Reject a URL store for the commands that still need a local path.
+
+    Without this the URL is silently mangled by ``Path()`` into something
+    like ``s3:/bucket/store`` and fails much later with a confusing error.
+    """
+    from .remote import is_url
+
+    if not is_url(store_path):
+        return True
+    console.print(
+        f"[red]{emoji('❌ ')}{command} needs a local store path; "
+        f"got {store_path}.[/red]\n"
+        f"Copy the store locally (or mount it) and run it there — only "
+        f"zarr-init, zarr-fill and zarr-consolidate work against remote "
+        f"locations."
+    )
+    return False
 
 
 def zarr_global_preview_command(args):
@@ -3505,6 +3911,8 @@ def zarr_global_preview_command(args):
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
+    if not _require_local_store(args.store_path, "zarr-global-preview", console):
+        return 1
     store_path = Path(args.store_path)
     zones = _parse_int_range(args.zones) if args.zones else None
 
@@ -3532,6 +3940,8 @@ def zarr_stretch_command(args):
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
+    if not _require_local_store(args.store_path, "zarr-stretch", console):
+        return 1
     store_path = Path(args.store_path)
     zones = _parse_int_range(args.zones) if args.zones else None
 
@@ -4320,7 +4730,8 @@ Directory Structure:
     )
     zarr_init_parser.add_argument(
         "base_dir",
-        help="Base directory containing downloaded tile data",
+        help="Base directory containing downloaded tile data, or a URL of a "
+        "repository in the published layout (e.g. s3://bucket/tessera)",
     )
     zarr_init_parser.add_argument(
         "--years",
@@ -4331,45 +4742,34 @@ Directory Structure:
         "--output",
         required=True,
         type=str,
-        help="Output store path (e.g. tessera.zarr)",
+        help="Output store path or URL (e.g. tessera.zarr, "
+        "s3://bucket/tessera.zarr)",
     )
-    zarr_init_parser.add_argument(
-        "--registry-dir",
-        type=str,
-        default=None,
-        help="Directory containing manifest.parquet / landmasks.parquet "
-        "(default: auto-detected from base_dir and parents)",
-    )
-    zarr_init_parser.add_argument(
-        "--dataset-version",
-        type=str,
-        default=None,
-        help="Tessera dataset version (e.g. v1, v1.1). "
-        "Default: read from tessera_metadata.json in base_dir, else v1.",
-    )
-    zarr_init_parser.add_argument(
-        "--dataset-variant",
-        type=str,
-        default=None,
-        help="Tessera dataset variant (e.g. vultr, cambridge). "
-        "Default: read from tessera_metadata.json in base_dir, else the "
-        "version's published variant.",
-    )
+    _add_source_args(zarr_init_parser)
+    _add_storage_args(zarr_init_parser, "source", "Tile source")
+    _add_state_arg(zarr_init_parser)
+    _add_storage_args(zarr_init_parser, "store", "Output store", writable=True)
     zarr_init_parser.set_defaults(func=zarr_init_command)
 
     # Zarr-fill command
     zarr_fill_parser = subparsers.add_parser(
         "zarr-fill",
         help="Incrementally fill a tessera store with tile data",
+        description="Fill a tessera store, optionally streaming tiles from a "
+        "remote bucket into a store on another. Restricting a run to one UTM "
+        "zone with --zones makes it safe to run many fills concurrently "
+        "against the same store: each zone owns its own group, tracking file "
+        "and lock. Run zarr-consolidate once after the sweep.",
     )
     zarr_fill_parser.add_argument(
         "base_dir",
-        help="Base directory containing downloaded tile data",
+        help="Base directory containing downloaded tile data, or a URL of a "
+        "repository in the published layout (e.g. s3://bucket/tessera)",
     )
     zarr_fill_parser.add_argument(
         "store_path",
         type=str,
-        help="Path to existing tessera store",
+        help="Path or URL of an existing tessera store",
     )
     zarr_fill_parser.add_argument(
         "--year",
@@ -4380,7 +4780,8 @@ Directory Structure:
     zarr_fill_parser.add_argument(
         "--zones",
         default=None,
-        help="Zone numbers to fill (e.g. 29-34). Default: all initialised zones",
+        help="Zone numbers to fill (e.g. 30 or 29-34). "
+        "Default: all initialised zones",
     )
     zarr_fill_parser.add_argument(
         "--workers",
@@ -4389,33 +4790,79 @@ Directory Structure:
         help="Number of parallel workers (default: 4)",
     )
     zarr_fill_parser.add_argument(
-        "--registry-dir",
-        type=str,
-        default=None,
-        help="Directory containing manifest.parquet / landmasks.parquet "
-        "(default: auto-detected from base_dir and parents)",
+        "--consolidate",
+        action="store_true",
+        help="Rewrite the root consolidated metadata when done. Unsafe while "
+        "sibling zone fills are running. Default: on for a whole-store fill, "
+        "off when --zones is given.",
     )
     zarr_fill_parser.add_argument(
-        "--dataset-version",
-        type=str,
-        default=None,
-        help="Tessera dataset version (e.g. v1, v1.1). "
-        "Default: read from tessera_metadata.json in base_dir, else v1.",
+        "--no-consolidate",
+        action="store_true",
+        help="Never rewrite the root consolidated metadata.",
     )
     zarr_fill_parser.add_argument(
-        "--dataset-variant",
-        type=str,
-        default=None,
-        help="Tessera dataset variant (e.g. vultr, cambridge). "
-        "Default: read from tessera_metadata.json in base_dir, else the "
-        "version's published variant.",
+        "--force-lock",
+        action="store_true",
+        help="Take over a zone/year lock left behind by a dead run. Only use "
+        "this when no other fill is touching the same zone.",
     )
+    _add_source_args(zarr_fill_parser)
+    _add_storage_args(zarr_fill_parser, "source", "Tile source")
+    _add_state_arg(zarr_fill_parser)
+    _add_storage_args(zarr_fill_parser, "store", "Output store", writable=True)
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-extend command
+    zarr_extend_parser = subparsers.add_parser(
+        "zarr-extend",
+        help="Append new years to an existing store's time axis",
+        description="Grow a store's time dimension so a new year can be "
+        "filled. The time axis is chunked one year per chunk, so this is a "
+        "metadata-only edit: existing data is never rewritten. Years may "
+        "only be appended to the end. Run it with no fills in flight, then "
+        "zarr-fill the new year.",
+    )
+    zarr_extend_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of an existing tessera store",
+    )
+    zarr_extend_parser.add_argument(
+        "--years",
+        required=True,
+        help="Year(s) to append (e.g. 2026 or 2026-2027)",
+    )
+    zarr_extend_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Restrict to these zones (e.g. 29-34). Default: every zone. "
+        "Leaving zones behind makes the store's time axes disagree, so only "
+        "use this to finish an interrupted run.",
+    )
+    zarr_extend_parser.add_argument(
+        "--no-consolidate",
+        action="store_true",
+        help="Skip re-consolidating the root metadata. Array metadata has "
+        "changed, so readers need a consolidate before they see the new year.",
+    )
+    zarr_extend_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Proceed even if fill locks are present (only when they are stale)",
+    )
+    _add_state_arg(zarr_extend_parser)
+    _add_storage_args(zarr_extend_parser, "store", "Store", writable=True)
+    zarr_extend_parser.set_defaults(func=zarr_extend_command)
 
     # Zarr-consolidate command
     zarr_consolidate_parser = subparsers.add_parser(
         "zarr-consolidate",
         help="Re-consolidate store metadata after in-place changes",
+        description="Rewrite a store's root consolidated metadata and merge "
+        "the per-zone ingestion registries. This is the single-writer step "
+        "that finishes a parallel zone sweep — run it once, with no fills in "
+        "flight.",
     )
     zarr_consolidate_parser.add_argument(
         "store_path",
@@ -4423,6 +4870,13 @@ Directory Structure:
         help="Path or URL of an existing tessera store "
         "(e.g. tessera.zarr or s3://bucket/store.zarr)",
     )
+    zarr_consolidate_parser.add_argument(
+        "--no-merge-registry",
+        action="store_true",
+        help="Skip merging _registry/ per-zone files into _registry.parquet",
+    )
+    _add_state_arg(zarr_consolidate_parser)
+    _add_storage_args(zarr_consolidate_parser, "store", "Store", writable=True)
     zarr_consolidate_parser.set_defaults(func=zarr_consolidate_command)
 
     # Zarr-global-preview command
@@ -4639,8 +5093,10 @@ Directory Structure:
         parser.print_help()
         return
 
-    # Execute the command
-    args.func(args)
+    # Execute the command. Commands return a shell exit status; propagate it
+    # so a failed zone in a parallel sweep is visible to the orchestrator
+    # rather than silently reported as success.
+    raise SystemExit(args.func(args) or 0)
 
 
 if __name__ == "__main__":

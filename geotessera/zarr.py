@@ -10,7 +10,15 @@ Layout:
             x                         # float64 (W,)
             y                         # float64 (H,)
             band                      # int32   (B,)
-        _registry.parquet             # tile ingestion tracking
+
+The store contains nothing but Zarr. Build-time bookkeeping lives in a
+sibling location, ``<store>.build`` by default:
+
+    tessera.zarr.build/
+        _registry/utm{zone:02d}_{year}.parquet   # per-zone ingestion tracking
+        _registry.parquet             # merged tracking (written by consolidate)
+        _locks/utm{zone:02d}_{year}.json         # advisory fill locks
+        _preview/zone_{zone}_done     # global-preview resume markers
 
 Dimension order: (time, band, y, x) — ML-standard NCHW.
 Inner chunks: (1, 128, 32, 32), Shards: (1, 128, 4096, 4096).
@@ -19,10 +27,28 @@ Scale sentinels:
     NaN   = water (permanent, from landmask)
     +inf  = land, no data yet (set at init, replaced by real scale on fill)
     finite = valid data
+
+Locations
+---------
+The store and the tile inputs are addressed as *locations*: either local
+filesystem paths or fsspec URLs (``s3://bucket/prefix``).  :mod:`geotessera.remote`
+resolves the difference, so a store on one S3 node can be filled from tiles on
+another without any local mirror.
+
+Parallel fills
+--------------
+A UTM zone's pixels live entirely within its own ``utm{zone}`` group, and
+shards never straddle zones, so one process per zone can fill the same store
+concurrently.  All per-fill state is keyed by (zone, year) — the ingestion
+registry and the advisory lock — so no two zone jobs touch the same object.
+The one shared object, the root ``zarr.json``, is only rewritten by
+consolidation, which a zone fill skips by default when ``zones`` is set;
+run ``zarr-consolidate`` once after the sweep instead.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
@@ -120,6 +146,272 @@ class ShardSpec:
 
 
 # ---------------------------------------------------------------------------
+# Locations: the store and the tile inputs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StoreLocation:
+    """A Zarr store addressed by local path or fsspec URL.
+
+    Wraps the handful of operations the build pipeline needs beyond the Zarr
+    API itself — existence checks and reading/writing build-state objects —
+    so callers never branch on local-vs-remote.
+    """
+
+    url: str
+    storage_options: Optional[Dict[str, Any]] = None
+    state_url: Optional[str] = None
+    state_storage_options: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def resolve(
+        cls,
+        store: "str | Path | StoreLocation",
+        storage_options: Optional[Dict[str, Any]] = None,
+        state_url: Optional[str] = None,
+        state_storage_options: Optional[Dict[str, Any]] = None,
+    ) -> "StoreLocation":
+        """Coerce a path, URL, or existing location into a StoreLocation."""
+        if isinstance(store, StoreLocation):
+            return store
+        return cls(str(store), storage_options, state_url, state_storage_options)
+
+    @property
+    def state(self) -> "StoreLocation":
+        """Where build-time state lives — a sibling of the store, not inside it.
+
+        The ingestion registry and fill locks are the builder's bookkeeping,
+        not published data. Keeping them out of the store leaves a clean Zarr
+        hierarchy: nothing for readers to trip over and nothing for
+        ``consolidate_metadata`` to warn about. Defaults to ``<store>.build``
+        alongside the store, so a sweep on another host still finds it.
+        """
+        return StoreLocation(
+            self.state_url or f"{self.url.rstrip('/')}.build",
+            self.state_storage_options
+            if self.state_storage_options is not None
+            else self.storage_options,
+        )
+
+    @property
+    def is_remote(self) -> bool:
+        from . import remote
+
+        return remote.is_url(self.url)
+
+    def join(self, *parts: str) -> str:
+        from . import remote
+
+        return remote.join(self.url, *parts)
+
+    def exists(self, *parts: str) -> bool:
+        from . import remote
+
+        return remote.exists(self.join(*parts), self.storage_options)
+
+    def read_bytes(self, *parts: str) -> bytes:
+        from . import remote
+
+        return remote.read_bytes(self.join(*parts), self.storage_options)
+
+    def write_bytes(self, data: bytes, *parts: str) -> None:
+        from . import remote
+
+        remote.write_bytes(self.join(*parts), data, self.storage_options)
+
+    def remove(self, *parts: str) -> None:
+        from . import remote
+
+        remote.remove(self.join(*parts), self.storage_options)
+
+    def listdir(self, *parts: str) -> List[str]:
+        from . import remote
+
+        return remote.listdir(self.join(*parts), self.storage_options)
+
+    def _ensure_backend(self) -> None:
+        """Fail early, with an actionable message, if the backend is missing.
+
+        zarr raises its own import error deep inside store construction; this
+        surfaces ours (which names the ``geotessera[s3]`` extra) first.
+        """
+        if self.is_remote:
+            from . import remote
+
+            remote.get_fs(self.url, self.storage_options)
+
+    def as_zarr_store(self, read_only: bool = False):
+        """Return something ``zarr`` accepts as a store.
+
+        Local paths pass through as strings; remote URLs become an
+        ``FsspecStore`` so credentials/endpoint reach APIs like
+        ``consolidate_metadata`` that take no ``storage_options``.
+        """
+        if not self.is_remote:
+            return self.url
+        self._ensure_backend()
+        from zarr.storage import FsspecStore
+
+        return FsspecStore.from_url(
+            self.url, storage_options=self.storage_options, read_only=read_only
+        )
+
+    def open_group(
+        self,
+        mode: str = "r",
+        path: Optional[str] = None,
+        zarr_format: Optional[int] = None,
+        use_consolidated: Optional[bool] = False,
+    ) -> "zarr.Group":
+        """Open the store (or a group within it) with the right backend."""
+        import zarr
+
+        self._ensure_backend()
+        kwargs: Dict[str, Any] = {
+            "mode": mode,
+            "use_consolidated": use_consolidated,
+        }
+        if path is not None:
+            kwargs["path"] = path
+        if zarr_format is not None:
+            kwargs["zarr_format"] = zarr_format
+        if self.storage_options:
+            kwargs["storage_options"] = self.storage_options
+        return zarr.open_group(self.url, **kwargs)
+
+    def __str__(self) -> str:
+        return self.url
+
+
+@dataclass
+class TileSource:
+    """Where the NPY tiles and landmask GeoTIFFs for a fill live.
+
+    ``embeddings_root`` contains ``{year}/grid_{lon}_{lat}/grid_{lon}_{lat}.npy``
+    and its ``_scales.npy`` sibling; ``landmasks_root`` contains
+    ``grid_{lon}_{lat}.tiff``.  Both are locations, so a fill can stream from a
+    remote bucket with no local mirror.
+    """
+
+    embeddings_root: str
+    landmasks_root: str
+    storage_options: Optional[Dict[str, Any]] = None
+
+    @property
+    def is_remote(self) -> bool:
+        from . import remote
+
+        return remote.is_url(self.embeddings_root)
+
+    def embedding_locations(self, lon: float, lat: float, year: int) -> Tuple[str, str]:
+        """Return (embedding, scales) locations for a tile."""
+        from . import remote
+        from .registry import tile_to_embedding_paths
+
+        emb_rel, scales_rel = tile_to_embedding_paths(lon, lat, year)
+        return (
+            remote.join(self.embeddings_root, emb_rel.as_posix()),
+            remote.join(self.embeddings_root, scales_rel.as_posix()),
+        )
+
+    def landmask_location(self, lon: float, lat: float) -> str:
+        """Return the landmask location for a tile."""
+        from . import remote
+        from .registry import tile_to_landmask_filename
+
+        return remote.join(self.landmasks_root, tile_to_landmask_filename(lon, lat))
+
+    @classmethod
+    def for_url(
+        cls,
+        root: str,
+        version_path: str,
+        storage_options: Optional[Dict[str, Any]] = None,
+    ) -> "TileSource":
+        """Build a source from a repository root in the published layout.
+
+        The Source Cooperative repository — and any mirror of it — lays tiles
+        out as ``{root}/npy/{version}/{year}/grid_.../`` with landmasks under
+        ``{root}/landmasks/{version}/``.  ``root`` may be an ``s3://`` URL for
+        a credentialed mirror or an ``https://`` URL for the public front.
+        """
+        from . import remote
+
+        return cls(
+            embeddings_root=remote.join(root, "npy", version_path),
+            landmasks_root=remote.join(root, "landmasks", version_path),
+            storage_options=storage_options,
+        )
+
+    @classmethod
+    def for_local_mirror(cls, registry: "Registry") -> "TileSource":
+        """Build a source from a registry's local ``embeddings_dir``.
+
+        The local mirror can be in two shapes:
+
+        * flat: ``<base_dir>/global_0.1_degree_representation/<year>/...`` (what
+          the geotessera-download CLI writes — variant info in a sidecar)
+        * S3-mirror: ``<base_dir>/<version_path>/global_0.1_degree_representation/
+          <year>/...`` (what ``aws s3 cp --recursive`` produces)
+
+        The S3-mirror layout is preferred when present so users keeping a
+        multi-version mirror under one root can point zarr-fill at the top.
+        Landmasks are STRICTLY per-version — no cross-version fallback. Each
+        Tessera version has its own landmask grid and mixing them silently
+        would corrupt water masking.
+        """
+        from .registry import (
+            EMBEDDINGS_DIR_NAME,
+            LANDMASKS_DIR_NAME,
+            TESSERA_MIRROR_ENDPOINT,
+            TESSERA_MIRROR_REPO,
+        )
+
+        def landmask_sync_hint(dest: Path) -> str:
+            return (
+                f"  aws s3 sync --no-sign-request "
+                f"--endpoint-url {TESSERA_MIRROR_ENDPOINT} "
+                f"s3://{TESSERA_MIRROR_REPO}/landmasks/"
+                f"{registry._version_path}/ {dest}/"
+            )
+
+        emb_candidate = (
+            registry._embeddings_dir / registry._version_path / EMBEDDINGS_DIR_NAME
+        )
+        lm_s3_mirror = (
+            registry._embeddings_dir / registry._version_path / LANDMASKS_DIR_NAME
+        )
+        lm_flat = registry._embeddings_dir / LANDMASKS_DIR_NAME
+
+        if emb_candidate.exists():
+            base_emb = str(emb_candidate)
+            # When embeddings are in S3-mirror layout, landmasks must match.
+            # Don't fall back to the flat layout — that would silently pick up
+            # the wrong version's landmasks.
+            if lm_s3_mirror.exists():
+                base_lm = str(lm_s3_mirror)
+            else:
+                raise FileNotFoundError(
+                    f"Landmask directory not found for {registry._version_path}: "
+                    f"expected {lm_s3_mirror}. Landmasks are per-version and "
+                    f"cannot be reused across versions. Fetch them with:\n"
+                    + landmask_sync_hint(lm_s3_mirror)
+                )
+        else:
+            base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
+            if lm_flat.exists():
+                base_lm = str(lm_flat)
+            else:
+                raise FileNotFoundError(
+                    f"Landmask directory not found: expected {lm_flat}. "
+                    f"Fetch them with:\n" + landmask_sync_hint(lm_flat)
+                )
+
+        return cls(embeddings_root=base_emb, landmasks_root=base_lm)
+
+
+# ---------------------------------------------------------------------------
 # UTM helpers
 # ---------------------------------------------------------------------------
 
@@ -161,23 +453,25 @@ def _load_landmask_slice(
     row_end: int,
     col_start: int,
     col_end: int,
+    storage_options: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
-    """Load a sub-region of a landmask GeoTIFF using a rasterio window.
+    """Load a sub-region of a landmask GeoTIFF, locally or from a remote store.
 
     Returns a 2D uint8 array where 0 = water.  If the landmask cannot be
     read (missing file, shape mismatch, etc.) returns all-ones (all land)
     so that no pixels are masked.
     """
-    import rasterio
-    from rasterio.windows import Window
+    from . import remote
 
     try:
-        with rasterio.open(landmask_path) as src:
-            window = Window.from_slices(
-                (row_start, row_end),
-                (col_start, col_end),
-            )
-            return src.read(1, window=window)
+        return remote.read_tiff_window(
+            landmask_path,
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+            storage_options=storage_options,
+        )
     except Exception as e:
         logger.warning(f"Failed to read landmask slice from {landmask_path}: {e}")
         return np.ones((row_end - row_start, col_end - col_start), dtype=np.uint8)
@@ -193,20 +487,18 @@ def gather_tile_infos(
     year: int,
     zones: Optional[List[int]] = None,
     console: Optional["rich.console.Console"] = None,
+    source: Optional[TileSource] = None,
 ) -> Dict[int, List[TileInfo]]:
     """Gather tile metadata and group by UTM zone.
 
     Computes grid info deterministically from coordinates (no file I/O).
+
+    Args:
+        source: Where the tile inputs live.  Defaults to the registry's local
+            mirror; pass a :class:`TileSource` built with
+            :meth:`TileSource.for_url` to stream from a remote bucket.
     """
     from rasterio.transform import Affine
-    from .registry import (
-        EMBEDDINGS_DIR_NAME,
-        LANDMASKS_DIR_NAME,
-        TESSERA_MIRROR_ENDPOINT,
-        TESSERA_MIRROR_REPO,
-        tile_to_embedding_paths,
-        tile_to_landmask_filename,
-    )
 
     # Get tiles for this year from MultiIndex, filtering to those with data
     gdf = registry._registry_gdf
@@ -247,66 +539,18 @@ def gather_tile_infos(
     # Build TileInfos using computed grid (no file I/O)
     from pyproj import Transformer as ProjTransformer
 
-    # The local mirror can be in two shapes:
-    #   * flat: <base_dir>/global_0.1_degree_representation/<year>/... (what
-    #     the geotessera-download CLI writes — variant info in sidecar)
-    #   * S3-mirror: <base_dir>/<version_path>/global_0.1_degree_representation/
-    #     <year>/... (what `aws s3 cp --recursive` produces)
-    # Prefer the S3-mirror layout when it exists so users who keep a
-    # multi-version mirror under one root can point zarr-fill at the top.
-    # Landmasks are STRICTLY per-version — no cross-version fallback. Each
-    # Tessera version has its own landmask grid and mixing them silently
-    # would corrupt water masking.
-    def landmask_sync_hint(dest: Path) -> str:
-        return (
-            f"  aws s3 sync --no-sign-request "
-            f"--endpoint-url {TESSERA_MIRROR_ENDPOINT} "
-            f"s3://{TESSERA_MIRROR_REPO}/landmasks/"
-            f"{registry._version_path}/ {dest}/"
-        )
+    if source is None:
+        source = TileSource.for_local_mirror(registry)
 
-    emb_candidate = (
-        registry._embeddings_dir / registry._version_path / EMBEDDINGS_DIR_NAME
-    )
-    lm_s3_mirror = (
-        registry._embeddings_dir / registry._version_path / LANDMASKS_DIR_NAME
-    )
-    lm_flat = registry._embeddings_dir / LANDMASKS_DIR_NAME
-
-    if emb_candidate.exists():
-        base_emb = str(emb_candidate)
-        # When embeddings are in S3-mirror layout, landmasks must match.
-        # Don't fall back to the flat layout — that would silently pick up
-        # the wrong version's landmasks.
-        if lm_s3_mirror.exists():
-            base_lm = str(lm_s3_mirror)
-        else:
-            raise FileNotFoundError(
-                f"Landmask directory not found for {registry._version_path}: "
-                f"expected {lm_s3_mirror}. Landmasks are per-version and "
-                f"cannot be reused across versions. Fetch them with:\n"
-                + landmask_sync_hint(lm_s3_mirror)
-            )
-    else:
-        base_emb = str(registry._embeddings_dir / EMBEDDINGS_DIR_NAME)
-        if lm_flat.exists():
-            base_lm = str(lm_flat)
-        else:
-            raise FileNotFoundError(
-                f"Landmask directory not found: expected {lm_flat}. "
-                f"Fetch them with:\n" + landmask_sync_hint(lm_flat)
-            )
     zones_dict: Dict[int, List[TileInfo]] = {}
     transformer_cache: Dict[int, ProjTransformer] = {}
     pixel_size = 10.0
 
     for tile_year, tile_lon, tile_lat in tiles:
-        emb_rel, scales_rel = tile_to_embedding_paths(tile_lon, tile_lat, tile_year)
-        emb_path = os.path.join(base_emb, emb_rel)
-        scales_path = os.path.join(base_emb, scales_rel)
-        landmask_path = os.path.join(
-            base_lm, tile_to_landmask_filename(tile_lon, tile_lat)
+        emb_path, scales_path = source.embedding_locations(
+            tile_lon, tile_lat, tile_year
         )
+        landmask_path = source.landmask_location(tile_lon, tile_lat)
 
         # Compute EPSG and zone from coordinates
         zone_num = int(math.floor((tile_lon + 180) / 6)) + 1
@@ -441,6 +685,18 @@ def _run_parallel(
 # ---------------------------------------------------------------------------
 # Global preview helpers
 # ---------------------------------------------------------------------------
+
+
+def _preview_marker_path(store_path: Path, zone_num: int) -> Path:
+    """Resume marker for a zone's global-preview reprojection.
+
+    Kept in the state sibling (``<store>.build/_preview/``) rather than the
+    store, for the same reason as the ingestion registry: the published Zarr
+    hierarchy should contain only Zarr.
+    """
+    return Path(f"{str(store_path).rstrip('/')}.build") / "_preview" / (
+        f"zone_{zone_num}_done"
+    )
 
 
 def _zone_output_bounds(
@@ -695,12 +951,36 @@ def _tile_pixel_offset(
 # ---------------------------------------------------------------------------
 
 
+def shard_coords_for_tiles(
+    tile_infos: List[TileInfo],
+    grid: UnifiedZoneGrid,
+) -> set:
+    """Return the set of (shard_row, shard_col) covered by these tiles."""
+    coords = set()
+    for ti in tile_infos:
+        row, col = _tile_pixel_offset(ti, grid)
+        for sr in range(row // SHARD_SIZE, (row + ti.height - 1) // SHARD_SIZE + 1):
+            for sc in range(col // SHARD_SIZE, (col + ti.width - 1) // SHARD_SIZE + 1):
+                coords.add((sr, sc))
+    return coords
+
+
 def build_shard_index(
     tile_infos: List[TileInfo],
     grid: UnifiedZoneGrid,
     time_index: int,
+    restrict_to: Optional[set] = None,
 ) -> List[ShardSpec]:
-    """Build shard index for one year's tiles against a unified zone grid."""
+    """Build shard index for one year's tiles against a unified zone grid.
+
+    Args:
+        restrict_to: Optional set of (shard_row, shard_col) to emit specs for.
+            A shard write replaces the whole shard, so an incremental fill has
+            to pass *every* tile overlapping the shards it rewrites — not just
+            the new ones — or previously written neighbours are zeroed out.
+            Callers get that by passing all of the zone's tiles here along with
+            the shard coordinates the new tiles touch.
+    """
     shard_map: Dict[Tuple[int, int], List[ShardTileOverlap]] = {}
 
     for ti in tile_infos:
@@ -714,6 +994,8 @@ def build_shard_index(
 
         for sr in range(sr_start, sr_end + 1):
             for sc in range(sc_start, sc_end + 1):
+                if restrict_to is not None and (sr, sc) not in restrict_to:
+                    continue
                 shard_top = sr * SHARD_SIZE
                 shard_left = sc * SHARD_SIZE
 
@@ -838,12 +1120,14 @@ def _compute_zone_grid_from_landmask(
 
 def init_store(
     registry: "Registry",
-    output_path: Path,
+    output_path: "str | Path | StoreLocation",
     years: List[int],
     geotessera_version: str = "unknown",
     model_version: str = "1.0",
     console: Optional["rich.console.Console"] = None,
-) -> Path:
+    storage_options: Optional[Dict[str, Any]] = None,
+    state_url: Optional[str] = None,
+) -> str:
     """Create a tessera store with time dimension from the landmask registry.
 
     Creates all UTM zones that have landmask coverage.  For each zone, the
@@ -855,18 +1139,22 @@ def init_store(
     - +inf = land, no data yet (replaced by real scale values during fill)
 
     No embedding data is written.  The embeddings array stays at fill_value (0).
+
+    ``output_path`` may be a local path or an fsspec URL such as
+    ``s3://bucket/tessera.zarr``; the whole store is metadata-only at this
+    point, so initialising directly on the target object store is cheap.
     """
     import zarr
 
-    output_path = Path(output_path)
-    if output_path.exists():
-        raise FileExistsError(f"Store already exists: {output_path}")
+    store = StoreLocation.resolve(output_path, storage_options, state_url)
+    if store.exists("zarr.json") or (not store.is_remote and Path(store.url).exists()):
+        raise FileExistsError(f"Store already exists: {store}")
 
     years = sorted(years)
     T = len(years)
 
     if console:
-        console.print(f"Initialising store at [bold]{output_path}[/bold]")
+        console.print(f"Initialising store at [bold]{store}[/bold]")
         console.print(f"  Years: {years[0]}-{years[-1]} ({T} time steps)")
 
     # Get landmask coverage grouped by UTM zone
@@ -880,7 +1168,7 @@ def init_store(
 
     # Create root group via zarr API (not manual JSON) so consolidation
     # preserves attributes correctly.
-    root = zarr.open_group(str(output_path), mode="w", zarr_format=3)
+    root = store.open_group(mode="w", zarr_format=3, use_consolidated=None)
     root.attrs.update(
         {
             "zarr_conventions": [GEOEMB_CONVENTION],
@@ -926,39 +1214,37 @@ def init_store(
                 f"{n_shards_x}x{n_shards_y} shards[/dim]"
             )
 
-        _create_zone_group(grid, output_path)
+        _create_zone_group(grid, store)
 
-    # Create empty tile registry
-    _init_tile_registry(output_path)
+    # Nothing else is written into the store: ingestion tracking and locks
+    # are build state and live in the state sibling, created on first fill.
 
     # Consolidate metadata so HTTP readers can discover the hierarchy
     import warnings
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Consolidated metadata")
-        zarr.consolidate_metadata(str(output_path))
+        warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+        zarr.consolidate_metadata(store.as_zarr_store())
 
     if console:
         console.print(
             "  [green]Store initialised (metadata only, no data written)[/green]"
         )
 
-    return output_path
+    return store.url
 
 
 def _create_zone_group(
     grid: UnifiedZoneGrid,
-    store_path: Path,
+    store_location: StoreLocation,
 ) -> "zarr.Group":
     """Create a zone group with empty (T, B, H, W) arrays."""
-    import zarr
     from zarr.codecs import BloscCodec
 
     zone_group = _zone_group_name(grid.zone)
 
-    root_reopen = zarr.open_group(
-        str(store_path), mode="r+", zarr_format=3, use_consolidated=False
-    )
+    root_reopen = store_location.open_group(mode="r+", zarr_format=3)
     store = root_reopen.create_group(zone_group)
 
     T = len(grid.years)
@@ -1054,18 +1340,32 @@ def _create_zone_group(
 # ---------------------------------------------------------------------------
 # Tile registry (GeoParquet tracking which tiles are written)
 # ---------------------------------------------------------------------------
+# This is build bookkeeping, so it lives in the state sibling rather than the
+# store: an incremental fill needs to know which tiles it already wrote, but a
+# reader of the published store never does. Tracking is sharded by (zone,
+# year) under ``_registry/`` so that concurrent per-zone fills never
+# read-modify-write the same object, and ``consolidate_store`` merges the
+# parts into one ``_registry.parquet``.
+#
+# Stores built before the split keep a single ``_registry.parquet`` at the
+# store root; it is still read so those stores resume correctly, but nothing
+# is written back into the store any more.
+
+REGISTRY_DIR_NAME = "_registry"
+MERGED_REGISTRY_NAME = "_registry.parquet"
+LEGACY_REGISTRY_NAME = MERGED_REGISTRY_NAME
 
 
-def _registry_path(store_path: Path) -> Path:
-    return store_path / "_registry.parquet"
+def _zone_registry_name(zone: int, year: int) -> str:
+    return f"{_zone_group_name(zone)}_{year}.parquet"
 
 
-def _init_tile_registry(store_path: Path) -> None:
-    """Create an empty tile registry parquet file."""
+def _empty_tile_registry() -> "geopandas.GeoDataFrame":
+    """An empty registry frame with the canonical schema."""
     import geopandas as gpd
     import pandas as pd
 
-    schema = gpd.GeoDataFrame(
+    return gpd.GeoDataFrame(
         {
             "year": pd.array([], dtype="int32"),
             "zone": pd.array([], dtype="int32"),
@@ -1075,35 +1375,229 @@ def _init_tile_registry(store_path: Path) -> None:
             "geometry": gpd.array.GeometryArray(
                 gpd.points_from_xy([], []),
             ),
-        }
+        },
+        crs="EPSG:4326",
     )
-    schema.to_parquet(str(_registry_path(store_path)))
 
 
-def _load_tile_registry(store_path: Path) -> "geopandas.GeoDataFrame":
-    """Load the tile registry, or create it if missing."""
+def _read_parquet_at(store: StoreLocation, *parts: str):
+    """Read a GeoParquet object from the store, or None if absent."""
     import geopandas as gpd
 
-    path = _registry_path(store_path)
-    if path.exists():
-        return gpd.read_parquet(str(path))
-    _init_tile_registry(store_path)
-    return gpd.read_parquet(str(path))
+    if not store.exists(*parts):
+        return None
+    try:
+        return gpd.read_parquet(io.BytesIO(store.read_bytes(*parts)))
+    except Exception as e:
+        logger.warning(f"Could not read {store.join(*parts)}: {e}")
+        return None
 
 
-def _save_tile_registry(store_path: Path, gdf: "geopandas.GeoDataFrame") -> None:
-    """Save the tile registry."""
-    gdf.to_parquet(str(_registry_path(store_path)))
+def _write_parquet_at(store: StoreLocation, gdf, *parts: str) -> None:
+    """Write a GeoParquet object into the store (local path or remote URL)."""
+    buf = io.BytesIO()
+    gdf.to_parquet(buf)
+    store.write_bytes(buf.getvalue(), *parts)
 
 
-def _get_written_tiles(store_path: Path, year: int, zone: int) -> set:
-    """Return set of (tile_lon, tile_lat) already written for a year/zone."""
-    gdf = _load_tile_registry(store_path)
-    if gdf.empty:
-        return set()
-    mask = (gdf["year"] == year) & (gdf["zone"] == zone)
-    subset = gdf[mask]
-    return set(zip(subset["tile_lon"], subset["tile_lat"]))
+_MERGED_UNSET = object()
+
+
+def load_merged_registry(store: StoreLocation):
+    """Read the merged ingestion registry, from the state dir or an old store.
+
+    Returns None when neither exists (a store nobody has filled yet).
+    """
+    merged = _read_parquet_at(store.state, MERGED_REGISTRY_NAME)
+    if merged is not None:
+        return merged
+    # Stores built before the split kept it inside the Zarr hierarchy.
+    return _read_parquet_at(store, LEGACY_REGISTRY_NAME)
+
+
+def _get_written_tiles(
+    store: StoreLocation,
+    year: int,
+    zone: int,
+    merged=_MERGED_UNSET,
+) -> set:
+    """Return set of (tile_lon, tile_lat) already written for a year/zone.
+
+    Reads this zone/year's own tracking file, then unions in any rows the
+    merged registry holds for the same zone/year — including one left inside
+    an older store, so those resume correctly too.
+
+    Args:
+        merged: A pre-loaded merged registry frame (or None if there isn't
+            one). It covers the whole store, so a multi-zone fill should read
+            it once and pass it in rather than re-fetching it per zone/year.
+    """
+    written: set = set()
+
+    zone_gdf = _read_parquet_at(
+        store.state, REGISTRY_DIR_NAME, _zone_registry_name(zone, year)
+    )
+    if zone_gdf is not None and not zone_gdf.empty:
+        written |= set(zip(zone_gdf["tile_lon"], zone_gdf["tile_lat"]))
+
+    if merged is _MERGED_UNSET:
+        merged = load_merged_registry(store)
+    if merged is not None and not merged.empty:
+        mask = (merged["year"] == year) & (merged["zone"] == zone)
+        subset = merged[mask]
+        written |= set(zip(subset["tile_lon"], subset["tile_lat"]))
+
+    return written
+
+
+def _record_written_tiles(
+    store: StoreLocation,
+    tile_infos: List[TileInfo],
+    year: int,
+    zone: int,
+) -> None:
+    """Append newly written tiles to this zone/year's tracking file.
+
+    Single-writer by construction: only the process filling (zone, year)
+    touches this object, so parallel zone sweeps need no locking here.
+    """
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import Point
+
+    now = pd.Timestamp.now(tz="UTC")
+    rows = [
+        {
+            "year": np.int32(year),
+            "zone": np.int32(zone),
+            "tile_lon": ti.lon,
+            "tile_lat": ti.lat,
+            "written_at": now,
+            "geometry": Point(ti.lon, ti.lat),
+        }
+        for ti in tile_infos
+    ]
+    if not rows:
+        return
+
+    new_gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    name = _zone_registry_name(zone, year)
+    existing = _read_parquet_at(store.state, REGISTRY_DIR_NAME, name)
+
+    if existing is not None and not existing.empty:
+        combined = gpd.GeoDataFrame(
+            pd.concat([existing, new_gdf], ignore_index=True), crs="EPSG:4326"
+        ).drop_duplicates(subset=["year", "zone", "tile_lon", "tile_lat"], keep="last")
+    else:
+        combined = new_gdf
+
+    _write_parquet_at(store.state, combined, REGISTRY_DIR_NAME, name)
+
+
+def merge_tile_registry(
+    store: StoreLocation,
+    console: Optional["rich.console.Console"] = None,
+) -> int:
+    """Merge every per-zone tracking file into one ``_registry.parquet``.
+
+    Both the parts and the result live in the state sibling, never inside the
+    Zarr hierarchy. Run this once after a parallel sweep, when no fill is in
+    flight — it is the only step that rewrites a store-wide object. Returns
+    the total row count in the merged registry.
+    """
+    import geopandas as gpd
+    import pandas as pd
+    from . import remote
+
+    state = store.state
+    frames = []
+    previous = load_merged_registry(store)
+    if previous is not None and not previous.empty:
+        frames.append(previous)
+
+    n_parts = 0
+    for entry in state.listdir(REGISTRY_DIR_NAME):
+        if not entry.endswith(".parquet"):
+            continue
+        try:
+            data = remote.read_bytes(entry, state.storage_options)
+            part = gpd.read_parquet(io.BytesIO(data))
+        except Exception as e:
+            logger.warning(f"Skipping unreadable registry part {entry}: {e}")
+            continue
+        n_parts += 1
+        if not part.empty:
+            frames.append(part)
+
+    if not frames:
+        merged = _empty_tile_registry()
+    else:
+        merged = gpd.GeoDataFrame(
+            pd.concat(frames, ignore_index=True), crs="EPSG:4326"
+        ).drop_duplicates(subset=["year", "zone", "tile_lon", "tile_lat"], keep="last")
+
+    _write_parquet_at(state, merged, MERGED_REGISTRY_NAME)
+
+    if console:
+        console.print(
+            f"  Merged {n_parts} per-zone registry file(s) into "
+            f"{state.join(MERGED_REGISTRY_NAME)}: {len(merged):,} tiles"
+        )
+    return len(merged)
+
+
+# ---------------------------------------------------------------------------
+# Advisory zone locks
+# ---------------------------------------------------------------------------
+# Two processes filling the same (zone, year) would each rewrite whole shards
+# from their own tile subset and silently erase each other's pixels. Object
+# stores give us no atomic create, so this is advisory only — it catches the
+# common accident (the same zone launched twice) rather than enforcing
+# mutual exclusion.
+
+LOCK_DIR_NAME = "_locks"
+
+
+def _lock_name(zone: int, year: int) -> str:
+    return f"{_zone_group_name(zone)}_{year}.json"
+
+
+def _acquire_zone_lock(
+    store: StoreLocation, zone: int, year: int, force: bool = False
+) -> None:
+    """Claim (zone, year) for this process, or raise if someone else holds it."""
+    import json
+    import socket
+    import pandas as pd
+
+    state = store.state
+    name = _lock_name(zone, year)
+    if not force and state.exists(LOCK_DIR_NAME, name):
+        try:
+            held = json.loads(state.read_bytes(LOCK_DIR_NAME, name))
+        except Exception:
+            held = {}
+        raise RuntimeError(
+            f"Zone {zone} year {year} is locked by "
+            f"{held.get('host', '?')}:{held.get('pid', '?')} "
+            f"since {held.get('acquired_at', 'unknown time')}. "
+            f"Another fill is in progress, or a previous one died. "
+            f"Re-run with --force-lock to take it over."
+        )
+
+    payload = {
+        "zone": zone,
+        "year": year,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "acquired_at": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
+    state.write_bytes(json.dumps(payload).encode(), LOCK_DIR_NAME, name)
+
+
+def _release_zone_lock(store: StoreLocation, zone: int, year: int) -> None:
+    """Drop this process's claim on (zone, year)."""
+    store.state.remove(LOCK_DIR_NAME, _lock_name(zone, year))
 
 
 # ---------------------------------------------------------------------------
@@ -1111,24 +1605,41 @@ def _get_written_tiles(store_path: Path, year: int, zone: int) -> set:
 # ---------------------------------------------------------------------------
 
 _worker_store = None
+_worker_source_options: Optional[Dict[str, Any]] = None
 
 
-def _init_shard_worker(store_path: str, zone_group: str) -> None:
-    """Process pool initializer: open the zone group once per worker."""
-    global _worker_store
-    import zarr
+def _init_shard_worker(
+    store_url: str,
+    zone_group: str,
+    store_options: Optional[Dict[str, Any]] = None,
+    source_options: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Process pool initializer: open the zone group once per worker.
 
-    _worker_store = zarr.open_group(
-        store_path,
-        mode="r+",
-        path=zone_group,
-        zarr_format=3,
-        use_consolidated=False,
+    Both option dicts are plain picklable mappings, so a worker rebuilds its
+    own filesystem connections rather than inheriting an unforkable client.
+    """
+    global _worker_store, _worker_source_options
+
+    _worker_store = StoreLocation(store_url, store_options).open_group(
+        mode="r+", path=zone_group, zarr_format=3
     )
+    _worker_source_options = source_options
 
 
-def _write_one_shard(spec: ShardSpec, store: "zarr.Group") -> bool:
-    """Write one shard in NCHW layout: (T, B, H, W)."""
+def _write_one_shard(
+    spec: ShardSpec,
+    store: "zarr.Group",
+    source_options: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Write one shard in NCHW layout: (T, B, H, W).
+
+    Tile reads go through :mod:`geotessera.remote`, so ``spec`` may reference
+    either local paths or remote URLs — a remote tile costs one ranged GET for
+    the rows this shard needs, not the whole 150 MB object.
+    """
+    from . import remote
+
     t = spec.time_index
     S = SHARD_SIZE
 
@@ -1141,12 +1652,14 @@ def _write_one_shard(spec: ShardSpec, store: "zarr.Group") -> bool:
     has_data = False
     for ov in spec.tiles:
         # Read HWB tile, transpose to BHW
-        emb = np.load(ov.embedding_path, mmap_mode="r")
-        tile_slice = emb[
-            ov.t_row_start : ov.t_row_end,
-            ov.t_col_start : ov.t_col_end,
-            :,
-        ]
+        tile_slice = remote.read_npy_window(
+            ov.embedding_path,
+            ov.t_row_start,
+            ov.t_row_end,
+            ov.t_col_start,
+            ov.t_col_end,
+            storage_options=source_options,
+        )
         emb_buf[
             :,
             ov.s_row_start : ov.s_row_end,
@@ -1154,11 +1667,17 @@ def _write_one_shard(spec: ShardSpec, store: "zarr.Group") -> bool:
         ] = tile_slice.transpose(2, 0, 1)
 
         # Scales
-        scales_mmap = np.load(ov.scales_path, mmap_mode="r")
-        s = scales_mmap[
-            ov.t_row_start : ov.t_row_end,
-            ov.t_col_start : ov.t_col_end,
-        ].copy()
+        s = np.array(
+            remote.read_npy_window(
+                ov.scales_path,
+                ov.t_row_start,
+                ov.t_row_end,
+                ov.t_col_start,
+                ov.t_col_end,
+                storage_options=source_options,
+            ),
+            dtype=np.float32,
+        )
 
         # Landmask
         lm = _load_landmask_slice(
@@ -1167,6 +1686,7 @@ def _write_one_shard(spec: ShardSpec, store: "zarr.Group") -> bool:
             ov.t_row_end,
             ov.t_col_start,
             ov.t_col_end,
+            storage_options=source_options,
         )
         s[lm == 0] = np.float32("nan")
         s[~np.isfinite(s)] = np.float32("nan")
@@ -1185,7 +1705,7 @@ def _write_one_shard(spec: ShardSpec, store: "zarr.Group") -> bool:
 
 def _write_one_shard_worker(spec: ShardSpec) -> bool:
     """Picklable wrapper for process pool."""
-    return _write_one_shard(spec, _worker_store)
+    return _write_one_shard(spec, _worker_store, _worker_source_options)
 
 
 # ---------------------------------------------------------------------------
@@ -1193,49 +1713,224 @@ def _write_one_shard_worker(spec: ShardSpec) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _store_years(store: StoreLocation, zones: Optional[List[int]] = None) -> List[int]:
+    """Read the store's year axis from a zone's ``time`` coordinate array.
+
+    Tries the requested zones first so a single-zone fill against a remote
+    store needs no listing of the whole hierarchy.
+    """
+    root = store.open_group(mode="r")
+
+    def years_from(name: str) -> Optional[List[int]]:
+        try:
+            return [int(v) for v in root[name]["time"][:]]
+        except Exception:
+            return None
+
+    tried = set()
+    for zone in zones or []:
+        name = _zone_group_name(zone)
+        tried.add(name)
+        years = years_from(name)
+        if years:
+            return years
+
+    # Fall back to a listing only if the requested zones told us nothing —
+    # enumerating the hierarchy is a round trip we can usually skip.
+    for name in _member_names(root):
+        if not name.startswith("utm") or name in tried:
+            continue
+        years = years_from(name)
+        if years:
+            return years
+    return []
+
+
+def _member_names(group: "zarr.Group") -> List[str]:
+    """Sorted member names of a group, without the sidecar warnings.
+
+    A Tessera store deliberately keeps non-Zarr objects at its root (the
+    ingestion registry, the lock directory), and zarr warns about each one
+    every time the hierarchy is enumerated. They are expected here.
+    """
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+        return sorted(group.keys())
+
+
+def _zone_group_names(
+    store: StoreLocation, zones: Optional[List[int]] = None
+) -> List[str]:
+    """Names of the store's UTM zone groups, optionally filtered."""
+    import re
+
+    root = store.open_group(mode="r")
+    pattern = re.compile(r"^utm(\d{2})$")
+    names = []
+    for name in _member_names(root):
+        m = pattern.match(name)
+        if m and (zones is None or int(m.group(1)) in zones):
+            names.append(name)
+    return names
+
+
+def extend_store(
+    store_path: "str | Path | StoreLocation",
+    years: List[int],
+    console: Optional["rich.console.Console"] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+    zones: Optional[List[int]] = None,
+    consolidate: bool = True,
+    force: bool = False,
+    state_url: Optional[str] = None,
+) -> int:
+    """Append new years to an existing store's time axis.
+
+    The time dimension is chunked one year per chunk, so growing it is a
+    metadata-only edit: existing chunks keep their keys and are never
+    rewritten, and the new slice reads back with the same sentinels a
+    freshly initialised year has (embeddings at 0, scales at +inf). Fill it
+    afterwards with ``zarr-fill --year <new>``.
+
+    Years must extend the axis at the end. Inserting an earlier year would
+    shift every existing chunk's time index — a full rewrite of the store —
+    so it is refused rather than done silently.
+
+    This is a single-writer operation: it rewrites array metadata for every
+    zone, so no fill may be in flight. Returns the number of zone groups
+    extended.
+    """
+    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    years = sorted(set(int(y) for y in years))
+    if not years:
+        raise ValueError("No years given to add")
+
+    held = [Path(p).name for p in store.state.listdir(LOCK_DIR_NAME)]
+    if held and not force:
+        raise RuntimeError(
+            f"{len(held)} fill lock(s) present ({', '.join(sorted(held)[:4])}"
+            f"{'...' if len(held) > 4 else ''}). Extending rewrites array "
+            f"metadata for every zone, so wait for the sweep to finish. "
+            f"Use --force if these are stale."
+        )
+
+    zone_names = _zone_group_names(store, zones)
+    if not zone_names:
+        raise ValueError(f"No UTM zone groups found in {store}")
+
+    if console:
+        console.print(f"Extending [bold]{store}[/bold] with years {years}")
+        console.print(f"  {len(zone_names)} zone group(s)")
+
+    extended = 0
+    skipped = 0
+    for name in zone_names:
+        group = store.open_group(mode="r+", path=name, zarr_format=3)
+        existing = [int(v) for v in group["time"][:]]
+
+        missing = [y for y in years if y not in existing]
+        if not missing:
+            skipped += 1
+            continue
+
+        earliest_new = min(missing)
+        if existing and earliest_new <= max(existing):
+            raise ValueError(
+                f"{name}: cannot add {earliest_new} to a time axis ending at "
+                f"{max(existing)}. Years may only be appended — inserting an "
+                f"earlier one would renumber every existing chunk."
+            )
+
+        old_t = len(existing)
+        new_t = old_t + len(missing)
+
+        # Order matters only for crash-safety: grow the data arrays before
+        # advertising the year on the time axis, so a run interrupted midway
+        # never leaves a year readers can select but not read.
+        emb = group["embeddings"]
+        scales = group["scales"]
+        emb.resize((new_t,) + tuple(emb.shape[1:]))
+        scales.resize((new_t,) + tuple(scales.shape[1:]))
+
+        time_arr = group["time"]
+        time_arr.resize((new_t,))
+        time_arr[old_t:new_t] = np.array(missing, dtype=time_arr.dtype)
+
+        extended += 1
+        if console:
+            console.print(
+                f"  {name}: {old_t} -> {new_t} time steps "
+                f"[dim](added {', '.join(str(y) for y in missing)})[/dim]"
+            )
+
+    if console and skipped:
+        console.print(f"  {skipped} zone(s) already had every year")
+
+    # Array metadata changed, so the consolidated root is now stale — unlike
+    # a fill, this step genuinely requires re-consolidation.
+    if consolidate and extended:
+        consolidate_store(store, console=console)
+
+    return extended
+
+
 def fill_store(
     registry: "Registry",
-    store_path: Path,
+    store_path: "str | Path | StoreLocation",
     year: Optional[int] = None,
     zones: Optional[List[int]] = None,
     console: Optional["rich.console.Console"] = None,
     workers: Optional[int] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+    source: Optional[TileSource] = None,
+    consolidate: Optional[bool] = None,
+    force_lock: bool = False,
+    state_url: Optional[str] = None,
 ) -> int:
     """Incrementally fill a store with tile data.
 
     Reads the tile registry to skip already-written tiles.
     Returns the number of shards written.
-    """
-    import warnings
-    import zarr
-    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-    store_path = Path(store_path)
+    Args:
+        store_path: Local path or fsspec URL of an initialised store.
+        zones: Restrict the fill to these UTM zones.  One process per zone
+            can run concurrently against the same store.
+        storage_options: fsspec options for the store (endpoint, credentials).
+        source: Where the tile inputs live; defaults to the registry's local
+            mirror.
+        consolidate: Rewrite the root consolidated metadata when done.
+            Defaults to True for a whole-store fill and False when ``zones``
+            is set, because the root object is the one thing parallel zone
+            jobs share — run ``zarr-consolidate`` once after the sweep.
+        force_lock: Take over a (zone, year) lock held by another process.
+    """
+    store = StoreLocation.resolve(store_path, storage_options, state_url)
     if workers is None:
         workers = DEFAULT_WORKERS
+    if consolidate is None:
+        consolidate = zones is None
 
-    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
-    # Derive years from the first zone's time coordinate array
-    all_years: list[int] = []
-    for member_name in sorted(root.keys()):
-        if member_name.startswith("utm"):
-            try:
-                time_arr = root[member_name]["time"][:]
-                all_years = [int(v) for v in time_arr]
-                break
-            except Exception:
-                continue
-
+    all_years = _store_years(store, zones)
     if not all_years:
-        raise ValueError("Store has no years (checked root attrs and zone time coords)")
+        raise ValueError("Store has no years (checked zone time coords)")
 
     fill_years = [year] if year is not None else all_years
 
     if console:
-        console.print(f"Filling store at [bold]{store_path}[/bold]")
+        console.print(f"Filling store at [bold]{store}[/bold]")
         console.print(f"  Years to fill: {fill_years}")
+        if source is not None and source.is_remote:
+            console.print(f"  Streaming tiles from [bold]{source.embeddings_root}[/bold]")
 
     total_shards_written = 0
+    total_shards_failed = 0
+
+    # The merged registry spans the whole store, so fetch it once rather
+    # than per zone and year.
+    merged_registry = load_merged_registry(store)
 
     for fill_year in fill_years:
         if fill_year not in all_years:
@@ -1245,21 +1940,19 @@ def fill_store(
                 )
             continue
 
-        time_index = all_years.index(fill_year)
-
         # Gather tiles for this year
         year_tiles = gather_tile_infos(
             registry,
             fill_year,
             zones=zones,
             console=console,
+            source=source,
         )
 
         for zone_num, tile_infos in sorted(year_tiles.items()):
             zone_group = _zone_group_name(zone_num)
-            zone_path = store_path / zone_group
 
-            if not zone_path.exists():
+            if not store.exists(zone_group):
                 if console:
                     console.print(
                         f"  [yellow]Zone {zone_num} not initialised, skipping[/yellow]"
@@ -1267,7 +1960,9 @@ def fill_store(
                 continue
 
             # Check which tiles are already written
-            written = _get_written_tiles(store_path, fill_year, zone_num)
+            written = _get_written_tiles(
+                store, fill_year, zone_num, merged=merged_registry
+            )
             remaining = [ti for ti in tile_infos if (ti.lon, ti.lat) not in written]
 
             if not remaining:
@@ -1285,12 +1980,22 @@ def fill_store(
                 )
 
             # Read the zone grid from store metadata
-            zone_store = zarr.open_group(
-                str(store_path),
-                mode="r",
-                path=zone_group,
-                use_consolidated=False,
-            )
+            zone_store = store.open_group(mode="r", path=zone_group)
+
+            # Resolve the time index against *this* zone's own axis. An
+            # interrupted zarr-extend can leave zones with different lengths,
+            # and a store-wide index would then address the wrong year.
+            zone_years = [int(v) for v in zone_store["time"][:]]
+            if fill_year not in zone_years:
+                if console:
+                    console.print(
+                        f"    [yellow]Zone {zone_num} has no {fill_year} on its "
+                        f"time axis ({zone_years}); run zarr-extend first. "
+                        f"Skipping.[/yellow]"
+                    )
+                continue
+            time_index = zone_years.index(fill_year)
+
             zone_attrs = dict(zone_store.attrs)
             transform = zone_attrs["spatial:transform"]
             shape = zone_attrs["spatial:shape"]
@@ -1305,173 +2010,211 @@ def fill_store(
                 height_px=shape[0],
             )
 
-            # Build shard index
-            shard_specs = build_shard_index(remaining, grid, time_index)
+            # A shard write replaces the whole shard, so every shard we touch
+            # must be rebuilt from all of its tiles — including ones an
+            # earlier run already wrote, which would otherwise be zeroed.
+            touched = shard_coords_for_tiles(remaining, grid)
+            shard_specs = build_shard_index(
+                tile_infos, grid, time_index, restrict_to=touched
+            )
 
             if console:
+                n_rewritten = sum(len(s.tiles) for s in shard_specs) - len(remaining)
+                extra = (
+                    f", {n_rewritten} previously-written tile(s) rewritten"
+                    if n_rewritten > 0
+                    else ""
+                )
                 console.print(
-                    f"    {len(shard_specs)} shards to write ({workers} workers)"
+                    f"    {len(shard_specs)} shards to write "
+                    f"({workers} workers{extra})"
                 )
 
-            # Write shards via process pool
-            zone_store_path = str(store_path)
-            written_count = 0
-            n_shards = len(shard_specs)
-
-            if console:
-                from rich.progress import (
-                    Progress,
-                    BarColumn,
-                    TextColumn,
-                    MofNCompleteColumn,
-                    TimeElapsedColumn,
-                    TimeRemainingColumn,
-                    SpinnerColumn,
-                )
-
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    MofNCompleteColumn(),
-                    TimeElapsedColumn(),
-                    TimeRemainingColumn(),
+            _acquire_zone_lock(store, zone_num, fill_year, force=force_lock)
+            try:
+                written_count, failed = _write_shards(
+                    store=store,
+                    zone_group=zone_group,
+                    shard_specs=shard_specs,
+                    workers=workers,
+                    source_options=source.storage_options if source else None,
+                    label=f"    Zone {zone_num} y{fill_year}",
                     console=console,
-                ) as progress:
-                    task = progress.add_task(
-                        f"    Zone {zone_num} y{fill_year}",
-                        total=n_shards,
-                    )
-                    with ProcessPoolExecutor(
-                        max_workers=workers,
-                        initializer=_init_shard_worker,
-                        initargs=(zone_store_path, zone_group),
-                    ) as pool:
-                        futures = {
-                            pool.submit(_write_one_shard_worker, spec): spec
-                            for spec in shard_specs
-                        }
-                        for future in as_completed(futures):
-                            try:
-                                if future.result():
-                                    written_count += 1
-                            except Exception as e:
-                                spec = futures[future]
-                                logger.warning(
-                                    f"Shard ({spec.sr},{spec.sc}) failed: {e}"
-                                )
-                            progress.advance(task)
-            else:
-                with ProcessPoolExecutor(
-                    max_workers=workers,
-                    initializer=_init_shard_worker,
-                    initargs=(zone_store_path, zone_group),
-                ) as pool:
-                    futures = {
-                        pool.submit(_write_one_shard_worker, spec): spec
-                        for spec in shard_specs
-                    }
-                    for future in as_completed(futures):
-                        try:
-                            if future.result():
-                                written_count += 1
-                        except Exception as e:
-                            spec = futures[future]
-                            logger.warning(f"Shard ({spec.sr},{spec.sc}) failed: {e}")
-
-            total_shards_written += written_count
-
-            if console:
-                console.print(
-                    f"    [green]{written_count}/{n_shards} shards written[/green]"
                 )
 
-            # Update tile registry
-            _record_written_tiles(store_path, remaining, fill_year, zone_num)
+                total_shards_written += written_count
+                total_shards_failed += len(failed)
 
-    # Re-consolidate metadata after filling
+                if console:
+                    console.print(
+                        f"    [green]{written_count}/{len(shard_specs)} "
+                        f"shards written[/green]"
+                    )
+                    if failed:
+                        console.print(
+                            f"    [red]{len(failed)} shard(s) failed[/red]"
+                        )
+
+                # Only record tiles whose shards all landed, so a retry picks
+                # up exactly the work a transient failure left behind.
+                if failed:
+                    recorded = [
+                        ti
+                        for ti in remaining
+                        if not (shard_coords_for_tiles([ti], grid) & failed)
+                    ]
+                else:
+                    recorded = remaining
+                _record_written_tiles(store, recorded, fill_year, zone_num)
+            finally:
+                _release_zone_lock(store, zone_num, fill_year)
+
+    # A failed shard leaves its tiles unrecorded, so re-running finishes the
+    # job. Surface it as an error rather than a quiet partial success — a
+    # sweep orchestrator has no other way to tell the zone needs a retry.
+    if total_shards_failed:
+        raise RuntimeError(
+            f"{total_shards_failed} shard(s) failed "
+            f"({total_shards_written} written). Re-run the same command to "
+            f"retry only the unfinished tiles."
+        )
+
+    # Re-consolidate metadata after filling. Skipped for a zone-restricted
+    # fill: the root object is shared with any sibling zone jobs.
     if total_shards_written > 0:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="Consolidated metadata")
-            zarr.consolidate_metadata(str(store_path))
+        if consolidate:
+            consolidate_store(store, console=console)
+        elif console:
+            console.print(
+                "  [dim]Skipped consolidation (zone-restricted fill). "
+                "Run `geotessera-registry zarr-consolidate` once the sweep "
+                "finishes.[/dim]"
+            )
 
     return total_shards_written
 
 
+def _write_shards(
+    store: StoreLocation,
+    zone_group: str,
+    shard_specs: List[ShardSpec],
+    workers: int,
+    source_options: Optional[Dict[str, Any]],
+    label: str,
+    console: Optional["rich.console.Console"],
+) -> Tuple[int, set]:
+    """Run the shard writes through a process pool.
+
+    Returns (shards written, set of (sr, sc) that failed).
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    written_count = 0
+    failed: set = set()
+    initargs = (store.url, zone_group, store.storage_options, source_options)
+
+    def _drain(pool, advance=None):
+        nonlocal written_count
+        futures = {
+            pool.submit(_write_one_shard_worker, spec): spec for spec in shard_specs
+        }
+        for future in as_completed(futures):
+            spec = futures[future]
+            try:
+                if future.result():
+                    written_count += 1
+            except Exception as e:
+                logger.warning(f"Shard ({spec.sr},{spec.sc}) failed: {e}")
+                failed.add((spec.sr, spec.sc))
+            if advance is not None:
+                advance()
+
+    if console:
+        from rich.progress import (
+            Progress,
+            BarColumn,
+            TextColumn,
+            MofNCompleteColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+            SpinnerColumn,
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(label, total=len(shard_specs))
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_shard_worker,
+                initargs=initargs,
+            ) as pool:
+                _drain(pool, advance=lambda: progress.advance(task))
+    else:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_shard_worker,
+            initargs=initargs,
+        ) as pool:
+            _drain(pool)
+
+    return written_count, failed
+
+
 def consolidate_store(
-    store_path: str | Path,
+    store_path: "str | Path | StoreLocation",
     console: Optional["rich.console.Console"] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+    merge_registry: bool = True,
+    state_url: Optional[str] = None,
 ) -> int:
     """Re-consolidate a store's root metadata after in-place changes.
 
-    ``fill_store`` only re-consolidates when it writes at least one shard,
-    so a metadata-only change to an existing store (e.g. rewriting an
-    array with a different compressor) leaves the consolidated metadata
-    in the root ``zarr.json`` stale.  HTTP readers cannot list a store and
-    trust consolidated metadata exclusively, so a stale root breaks them.
+    ``fill_store`` skips consolidation for zone-restricted fills so parallel
+    zone jobs never contend for the root ``zarr.json``, and a metadata-only
+    change to an existing store (e.g. rewriting an array with a different
+    compressor) leaves the consolidated metadata stale too.  HTTP readers
+    cannot list a store and trust consolidated metadata exclusively, so a
+    stale root breaks them.  This is the single-writer step that fixes both.
 
     Accepts a local store path or a remote fsspec URL such as
     ``s3://bucket/store.zarr``.  Remote URLs need the matching fsspec
     backend installed (``s3fs`` for S3) and write credentials for the
     final root ``zarr.json`` upload.
 
+    Args:
+        merge_registry: Also fold the per-zone ingestion files under
+            ``_registry/`` into the root ``_registry.parquet``.
+
     Returns the number of consolidated nodes.
     """
     import warnings
     import zarr
 
-    store = str(store_path)
-    if "://" not in store and not Path(store).exists():
-        raise FileNotFoundError(f"store not found: {store}")
+    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    if not store.is_remote and not Path(store.url).exists():
+        raise FileNotFoundError(f"store not found: {store.url}")
 
     if console:
         console.print(f"Consolidating metadata at [bold]{store}[/bold]")
+
+    if merge_registry:
+        merge_tile_registry(store, console=console)
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Consolidated metadata")
         # Tessera stores carry non-zarr marker objects (tile registry,
         # zone-completion flags) that the consolidation walk would warn about.
-        warnings.filterwarnings(
-            "ignore", message="Object at .* is not recognized"
-        )
-        group = zarr.consolidate_metadata(store)
+        warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+        group = zarr.consolidate_metadata(store.as_zarr_store())
 
     return len(group.metadata.consolidated_metadata.flattened_metadata)
-
-
-def _record_written_tiles(
-    store_path: Path,
-    tile_infos: List[TileInfo],
-    year: int,
-    zone: int,
-) -> None:
-    """Append newly written tiles to the registry."""
-    import geopandas as gpd
-    import pandas as pd
-    from shapely.geometry import Point
-
-    now = pd.Timestamp.now(tz="UTC")
-    rows = []
-    for ti in tile_infos:
-        rows.append(
-            {
-                "year": np.int32(year),
-                "zone": np.int32(zone),
-                "tile_lon": ti.lon,
-                "tile_lat": ti.lat,
-                "written_at": now,
-                "geometry": Point(ti.lon, ti.lat),
-            }
-        )
-
-    new_gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
-    existing = _load_tile_registry(store_path)
-
-    combined = gpd.GeoDataFrame(
-        pd.concat([existing, new_gdf], ignore_index=True),
-        crs="EPSG:4326",
-    )
-    _save_tile_registry(store_path, combined)
 
 
 # ---------------------------------------------------------------------------
@@ -1822,7 +2565,7 @@ def compute_global_stretch(
 
     # Find time_index for the requested year via the first zone's time coord.
     time_index = None
-    for member_name in sorted(root.keys()):
+    for member_name in _member_names(root):
         if member_name.startswith("utm"):
             try:
                 time_arr = root[member_name]["time"][:]
@@ -1839,7 +2582,7 @@ def compute_global_stretch(
     zone_pattern = re.compile(r"^utm(\d{2})$")
     all_shards: List[Tuple[str, int, int]] = []
     zones_visited = set()
-    for name in sorted(root.keys()):
+    for name in _member_names(root):
         m = zone_pattern.match(name)
         if not m:
             continue
@@ -2481,8 +3224,9 @@ def _reproject_zone(
     chunk_row_start = row_start // GLOBAL_CHUNK
     chunk_col_start = col_start // GLOBAL_CHUNK
 
-    # Resume check
-    marker = store_path / f".zone_{zone_num}_done"
+    # Resume check. The marker lives in the state sibling, not the store, so
+    # the published hierarchy stays free of non-Zarr objects.
+    marker = _preview_marker_path(store_path, zone_num)
     if marker.exists():
         if force:
             marker.unlink()
@@ -2572,6 +3316,7 @@ def _reproject_zone(
                 except Exception as e:
                     logger.warning(f"Reproject chunk failed: {e}")
 
+    marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(
         f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n"
     )
@@ -2617,7 +3362,7 @@ def build_global_preview(
 
     # Derive years from first zone's time coordinate
     all_years: list[int] = []
-    for member_name in sorted(root.keys()):
+    for member_name in _member_names(root):
         if member_name.startswith("utm"):
             try:
                 time_arr = root[member_name]["time"][:]
@@ -2647,7 +3392,7 @@ def build_global_preview(
     zone_pattern = re.compile(r"^utm(\d{2})$")
     zone_infos: Dict[int, dict] = {}
 
-    for name in sorted(root.keys()):
+    for name in _member_names(root):
         m = zone_pattern.match(name)
         if not m:
             continue
