@@ -1123,6 +1123,23 @@ CLI's ``--acl``::
 It applies to the store's Zarr chunks and metadata as well as the sidecar
 parquet and lock objects, and is filtered out of read requests.
 
+.. note::
+
+   **Source Cooperative reads and writes use different endpoints.**
+   ``https://data.source.coop`` is the read-only gateway: anonymous reads
+   work, but any write (and even a listing with write credentials) returns
+   ``AccessDenied``. Writes go directly to the backing AWS bucket with *no*
+   ``--endpoint-url`` at all::
+
+       # read from the gateway, write to the backing bucket
+       --source-endpoint-url https://data.source.coop --source-anon
+       --output s3://us-west-2.opendata.source.coop/<account>/<repo>/zarr/v1
+       --store-profile <writer> --store-region us-west-2
+       --store-acl bucket-owner-full-control
+
+   Passing ``--store-endpoint-url https://data.source.coop`` is the common
+   mistake and produces a 403 that looks like a credentials problem.
+
 ``s3://`` locations need the optional ``s3`` extra, which pulls in ``s3fs``
 and ``botocore``::
 

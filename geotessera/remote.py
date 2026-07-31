@@ -196,12 +196,36 @@ def get_fs(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None):
     return _filesystem_cached(protocol_of(loc), _options_key(storage_options))
 
 
-def exists(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None) -> bool:
-    """True if *loc* exists, locally or remotely."""
+def exists(
+    loc: str | Path,
+    storage_options: Optional[Dict[str, Any]] = None,
+    on_denied: Optional[bool] = None,
+) -> bool:
+    """True if *loc* exists, locally or remotely.
+
+    Args:
+        on_denied: What to answer when the store refuses to say. S3 returns
+            403, not 404, for a key that does not exist when the caller lacks
+            ``s3:ListBucket`` on the prefix — it will not reveal whether the
+            object is there. Write-scoped credentials hit this constantly, so
+            probes that can treat "don't know" as "absent" pass ``False``
+            here. ``None`` (the default) re-raises the PermissionError.
+    """
     fs = get_fs(loc, storage_options)
     if fs is None:
         return Path(loc).exists()
-    return bool(fs.exists(str(loc)))
+    try:
+        return bool(fs.exists(str(loc)))
+    except PermissionError:
+        if on_denied is None:
+            raise
+        logger.warning(
+            f"Permission denied probing {loc}; assuming "
+            f"{'present' if on_denied else 'absent'}. This usually means the "
+            f"credentials lack s3:ListBucket on the prefix, which makes a "
+            f"missing key answer 403 instead of 404."
+        )
+        return on_denied
 
 
 def read_bytes(
@@ -245,11 +269,17 @@ def remove(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None) ->
 
 
 def listdir(
-    loc: str | Path, storage_options: Optional[Dict[str, Any]] = None
+    loc: str | Path,
+    storage_options: Optional[Dict[str, Any]] = None,
+    on_denied: Optional[list] = None,
 ) -> list[str]:
     """List the immediate children of a directory/prefix, as full locations.
 
     Returns an empty list when the directory does not exist.
+
+    Args:
+        on_denied: Value to return when listing is refused (no
+            ``s3:ListBucket``). ``None`` re-raises.
     """
     fs = get_fs(loc, storage_options)
     if fs is None:
@@ -257,11 +287,23 @@ def listdir(
         if not path.is_dir():
             return []
         return [str(p) for p in sorted(path.iterdir())]
-    if not fs.exists(str(loc)):
+
+    try:
+        entries = sorted(fs.ls(str(loc), detail=False))
+    except FileNotFoundError:
         return []
+    except PermissionError:
+        if on_denied is None:
+            raise
+        logger.warning(
+            f"Permission denied listing {loc}; treating it as empty. The "
+            f"credentials need s3:ListBucket on this prefix."
+        )
+        return on_denied
+
     protocol = protocol_of(loc)
     out = []
-    for entry in sorted(fs.ls(str(loc), detail=False)):
+    for entry in entries:
         # fsspec strips the protocol from listing results; restore it so the
         # entries are usable as standalone locations. Both shapes round-trip:
         # "bucket/key" -> "s3://bucket/key", "/abs/path" -> "file:///abs/path".

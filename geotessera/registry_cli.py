@@ -3484,15 +3484,20 @@ def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -
 def _object_store_errors() -> Tuple[type, ...]:
     """Exception types worth reporting as a message rather than a traceback.
 
-    Empty when botocore is absent (i.e. the s3 extra is not installed), in
-    which case no such error can be raised anyway.
+    fsspec translates most S3 failures into builtin OSErrors — a 403 arrives
+    as PermissionError, a 404 as FileNotFoundError — so catching only
+    botocore's own types misses the common cases. botocore's are included for
+    the errors raised before fsspec gets a chance to translate them (bad
+    endpoint, unresolvable credentials); the tuple is short when the s3
+    extra is not installed.
     """
+    types: Tuple[type, ...] = (PermissionError, OSError)
     try:
         from botocore.exceptions import BotoCoreError, ClientError
 
-        return (BotoCoreError, ClientError)
+        return types + (BotoCoreError, ClientError)
     except ImportError:
-        return ()
+        return types
 
 
 def _report_store_error(e: Exception, console: "Console") -> int:
@@ -3503,12 +3508,22 @@ def _report_store_error(e: Exception, console: "Console") -> int:
     """
     from rich.markup import escape
 
-    console.print(f"[red]{emoji('❌ ')}{escape(str(e))}[/red]")
-    if isinstance(e, _object_store_errors() or ()):
+    detail = str(e) or type(e).__name__
+    console.print(f"[red]{emoji('❌ ')}{escape(detail)}[/red]")
+
+    if isinstance(e, ImportError):
+        return 1
+
+    console.print(
+        "Check the endpoint and credentials: --source-endpoint-url / "
+        "--store-endpoint-url, --*-profile, --*-anon, or the AWS_* "
+        "environment variables."
+    )
+    if isinstance(e, PermissionError):
         console.print(
-            "Check the endpoint and credentials: --source-endpoint-url / "
-            "--store-endpoint-url, --*-profile, --*-anon, or the AWS_* "
-            "environment variables."
+            "A 403 on a key that does not exist yet usually means the "
+            "credentials lack s3:ListBucket on the prefix — S3 then hides "
+            "whether the object is there rather than answering 404."
         )
     return 1
 

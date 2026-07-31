@@ -205,10 +205,12 @@ class StoreLocation:
 
         return remote.join(self.url, *parts)
 
-    def exists(self, *parts: str) -> bool:
+    def exists(self, *parts: str, on_denied: Optional[bool] = None) -> bool:
         from . import remote
 
-        return remote.exists(self.join(*parts), self.storage_options)
+        return remote.exists(
+            self.join(*parts), self.storage_options, on_denied=on_denied
+        )
 
     def read_bytes(self, *parts: str) -> bytes:
         from . import remote
@@ -225,10 +227,12 @@ class StoreLocation:
 
         remote.remove(self.join(*parts), self.storage_options)
 
-    def listdir(self, *parts: str) -> List[str]:
+    def listdir(self, *parts: str, on_denied: Optional[List[str]] = None) -> List[str]:
         from . import remote
 
-        return remote.listdir(self.join(*parts), self.storage_options)
+        return remote.listdir(
+            self.join(*parts), self.storage_options, on_denied=on_denied
+        )
 
     def _ensure_backend(self) -> None:
         """Fail early, with an actionable message, if the backend is missing.
@@ -1147,8 +1151,25 @@ def init_store(
     import zarr
 
     store = StoreLocation.resolve(output_path, storage_options, state_url)
-    if store.exists("zarr.json") or (not store.is_remote and Path(store.url).exists()):
-        raise FileExistsError(f"Store already exists: {store}")
+    if not store.is_remote:
+        if Path(store.url).exists():
+            raise FileExistsError(f"Store already exists: {store}")
+    else:
+        # Write-scoped credentials commonly cannot list the prefix, and S3
+        # then answers 403 rather than 404 for the key we are probing. That
+        # is not a reason to refuse to create a store — say so and carry on.
+        try:
+            if store.exists("zarr.json"):
+                raise FileExistsError(f"Store already exists: {store}")
+        except PermissionError:
+            if console:
+                console.print(
+                    "  [yellow]Could not check whether a store already exists "
+                    "here (permission denied on HEAD — credentials without "
+                    "s3:ListBucket get 403 instead of 404 for a missing key). "
+                    "Creating it; an existing store's root would be "
+                    "overwritten.[/yellow]"
+                )
 
     years = sorted(years)
     T = len(years)
@@ -1167,8 +1188,16 @@ def init_store(
         console.print(f"  {len(landmask_by_zone)} zone(s) with land coverage")
 
     # Create root group via zarr API (not manual JSON) so consolidation
-    # preserves attributes correctly.
-    root = store.open_group(mode="w", zarr_format=3, use_consolidated=None)
+    # preserves attributes correctly. Mode "w-" creates but never clobbers:
+    # "w" would delete the destination prefix first, which needs list and
+    # delete permissions and would destroy an existing store if our
+    # pre-check above could not see it.
+    from zarr.errors import ContainsArrayError, ContainsGroupError
+
+    try:
+        root = store.open_group(mode="w-", zarr_format=3, use_consolidated=None)
+    except (ContainsGroupError, ContainsArrayError) as e:
+        raise FileExistsError(f"Store already exists: {store}") from e
     root.attrs.update(
         {
             "zarr_conventions": [GEOEMB_CONVENTION],
@@ -1381,15 +1410,26 @@ def _empty_tile_registry() -> "geopandas.GeoDataFrame":
 
 
 def _read_parquet_at(store: StoreLocation, *parts: str):
-    """Read a GeoParquet object from the store, or None if absent."""
+    """Read a GeoParquet object from the store, or None if absent.
+
+    Reads straight through rather than probing first: it halves the round
+    trips, and an existence probe is unreliable anyway against credentials
+    without list permission, where a missing key answers 403 not 404.
+    """
     import geopandas as gpd
 
-    if not store.exists(*parts):
-        return None
     try:
-        return gpd.read_parquet(io.BytesIO(store.read_bytes(*parts)))
+        data = store.read_bytes(*parts)
+    except (FileNotFoundError, PermissionError):
+        return None
     except Exception as e:
         logger.warning(f"Could not read {store.join(*parts)}: {e}")
+        return None
+
+    try:
+        return gpd.read_parquet(io.BytesIO(data))
+    except Exception as e:
+        logger.warning(f"Could not parse {store.join(*parts)}: {e}")
         return None
 
 
@@ -1516,7 +1556,7 @@ def merge_tile_registry(
         frames.append(previous)
 
     n_parts = 0
-    for entry in state.listdir(REGISTRY_DIR_NAME):
+    for entry in state.listdir(REGISTRY_DIR_NAME, on_denied=[]):
         if not entry.endswith(".parquet"):
             continue
         try:
@@ -1572,7 +1612,7 @@ def _acquire_zone_lock(
 
     state = store.state
     name = _lock_name(zone, year)
-    if not force and state.exists(LOCK_DIR_NAME, name):
+    if not force and state.exists(LOCK_DIR_NAME, name, on_denied=False):
         try:
             held = json.loads(state.read_bytes(LOCK_DIR_NAME, name))
         except Exception:
@@ -1807,7 +1847,7 @@ def extend_store(
     if not years:
         raise ValueError("No years given to add")
 
-    held = [Path(p).name for p in store.state.listdir(LOCK_DIR_NAME)]
+    held = [Path(p).name for p in store.state.listdir(LOCK_DIR_NAME, on_denied=[])]
     if held and not force:
         raise RuntimeError(
             f"{len(held)} fill lock(s) present ({', '.join(sorted(held)[:4])}"
@@ -1952,7 +1992,12 @@ def fill_store(
         for zone_num, tile_infos in sorted(year_tiles.items()):
             zone_group = _zone_group_name(zone_num)
 
-            if not store.exists(zone_group):
+            # Open the group rather than probing for the prefix: reading
+            # utm{n}/zarr.json needs only GetObject, whereas an existence
+            # check on a prefix needs list permission the writer may lack.
+            try:
+                zone_store = store.open_group(mode="r", path=zone_group)
+            except Exception:
                 if console:
                     console.print(
                         f"  [yellow]Zone {zone_num} not initialised, skipping[/yellow]"
@@ -1978,9 +2023,6 @@ def fill_store(
                     f"  Zone {zone_num} year {fill_year}: "
                     f"{len(remaining)}/{len(tile_infos)} tiles to write"
                 )
-
-            # Read the zone grid from store metadata
-            zone_store = store.open_group(mode="r", path=zone_group)
 
             # Resolve the time index against *this* zone's own axis. An
             # interrupted zarr-extend can leave zones with different lengths,
