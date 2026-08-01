@@ -3815,6 +3815,7 @@ def zarr_fill_command(args):
             consolidate=consolidate,
             force_lock=args.force_lock,
             state_url=args.state_url,
+            skip_existing_shards=args.skip_existing_shards,
         )
     except RuntimeError as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -3823,6 +3824,44 @@ def zarr_fill_command(args):
         return _report_store_error(e, console)
 
     console.print(f"\n{emoji('✅ ')}{n} shards written")
+    return 0
+
+
+def zarr_scan_command(args):
+    """Report how much of a store still needs filling."""
+    import warnings
+    from rich.console import Console
+
+    from .zarr import scan_store, summarise_scan
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    registry, source, _version, _variant = _resolve_source(args, console)
+
+    store_options = _storage_options_for(args, "store", args.store_path)
+    years = _parse_int_range(args.years) if args.years else None
+    zones = _parse_int_range(args.zones) if args.zones else None
+
+    try:
+        df = scan_store(
+            registry,
+            args.store_path,
+            years=years,
+            zones=zones,
+            console=console if args.verbose else None,
+            storage_options=store_options,
+            source=source,
+            state_url=args.state_url,
+            output=args.output,
+        )
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    summarise_scan(df, console)
     return 0
 
 
@@ -4817,6 +4856,14 @@ Directory Structure:
         help="Never rewrite the root consolidated metadata.",
     )
     zarr_fill_parser.add_argument(
+        "--skip-existing-shards",
+        action="store_true",
+        help="Treat a shard that is already in the store as done. Recovers a "
+        "run killed before it recorded progress, since the shard objects "
+        "outlive the bookkeeping. Assumes the tile inventory has not grown "
+        "since those shards were written.",
+    )
+    zarr_fill_parser.add_argument(
         "--force-lock",
         action="store_true",
         help="Take over a zone/year lock left behind by a dead run. Only use "
@@ -4827,6 +4874,55 @@ Directory Structure:
     _add_state_arg(zarr_fill_parser)
     _add_storage_args(zarr_fill_parser, "store", "Output store", writable=True)
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-scan command
+    zarr_scan_parser = subparsers.add_parser(
+        "zarr-scan",
+        help="Report how much of a store still needs filling",
+        description="Inventory a store's shards against the manifest without "
+        "writing anything. Each shard is classified written, missing, or "
+        "empty (no manifest tiles fall in it — ocean or outside coverage), "
+        "so the percentages are over land rather than over the zone's "
+        "bounding box. Prints per-zone/year and per-year summaries and can "
+        "write the full index as parquet.",
+    )
+    zarr_scan_parser.add_argument(
+        "base_dir",
+        help="Base directory containing downloaded tile data, or a URL of a "
+        "repository in the published layout (used for the manifest)",
+    )
+    zarr_scan_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of an existing tessera store",
+    )
+    zarr_scan_parser.add_argument(
+        "--years",
+        default=None,
+        help="Years to scan (e.g. 2024 or 2017-2025). Default: every year "
+        "on the store's time axis",
+    )
+    zarr_scan_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Zones to scan (e.g. 30 or 29-34). Default: every zone",
+    )
+    zarr_scan_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Write the per-shard index here as parquet (path or URL)",
+    )
+    zarr_scan_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress for each zone/year as it is scanned",
+    )
+    _add_source_args(zarr_scan_parser)
+    _add_state_arg(zarr_scan_parser)
+    _add_storage_args(zarr_scan_parser, "source", "Tile source")
+    _add_storage_args(zarr_scan_parser, "store", "Store")
+    zarr_scan_parser.set_defaults(func=zarr_scan_command)
 
     # Zarr-extend command
     zarr_extend_parser = subparsers.add_parser(

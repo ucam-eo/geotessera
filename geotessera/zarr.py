@@ -60,6 +60,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     import geopandas
+    import pandas
     import rich.console
     import zarr
     from rasterio.transform import Affine
@@ -918,6 +919,47 @@ SHARD_SIZE = 4096  # spatial pixels per shard side
 INNER_CHUNK = 32  # spatial pixels per inner chunk side
 DEFAULT_WORKERS = 4  # fewer workers due to larger shard buffers (~2GB each)
 
+# Each shard worker holds a full (N_BANDS, SHARD_SIZE, SHARD_SIZE) int8
+# buffer plus its float32 scales — the dominant cost of a fill, and the
+# reason the worker count is bounded by RAM rather than by cores.
+WORKER_BUFFER_BYTES = N_BANDS * SHARD_SIZE * SHARD_SIZE + 4 * SHARD_SIZE * SHARD_SIZE
+
+
+def _total_memory_bytes() -> Optional[int]:
+    """Physical RAM, or None where it cannot be determined."""
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def _warn_worker_memory(workers: int, console=None) -> None:
+    """Warn when the requested worker count cannot fit in RAM.
+
+    A fill that is OOM-killed leaves no traceback, so the cause is easy to
+    miss; say it up front instead.
+    """
+    needed = workers * WORKER_BUFFER_BYTES
+    total = _total_memory_bytes()
+    gib = 2**30
+    message = (
+        f"{workers} workers need at least {needed / gib:.0f} GiB "
+        f"({WORKER_BUFFER_BYTES / gib:.1f} GiB of shard buffer each)"
+    )
+    if total is None:
+        logger.info(message)
+        return
+    if needed > 0.8 * total:
+        safe = max(1, int(0.8 * total // WORKER_BUFFER_BYTES))
+        text = (
+            f"{message}, but this machine has {total / gib:.0f} GiB. "
+            f"The fill will likely be OOM-killed — consider --workers {safe}."
+        )
+        if console:
+            console.print(f"  [yellow]{text}[/yellow]")
+        else:
+            logger.warning(text)
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -1753,6 +1795,59 @@ def _write_one_shard_worker(spec: ShardSpec) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _existing_shards(
+    store: StoreLocation,
+    zone_group: str,
+    time_index: int,
+    wanted: set,
+    console: Optional["rich.console.Console"] = None,
+) -> set:
+    """Which of *wanted* shard coordinates already exist in the store.
+
+    A written shard is a single object under the array's chunk prefix, so its
+    presence is proof the shard landed — bookkeeping that survives a ``kill
+    -9`` and needs no state file. Zarr v3's default chunk key encoding puts
+    the (time, band, row, col) chunk grid indices in the key, and the band
+    dimension is one chunk wide, so the shard for (sr, sc) at time t is
+    ``embeddings/c/{t}/0/{sr}/{sc}``.
+
+    Prefers one listing of the time slice's prefix; falls back to probing
+    each wanted shard when listing is refused, which credentials without
+    ``s3:ListBucket`` will be.
+    """
+    prefix = f"{zone_group}/embeddings/c/{time_index}/0"
+
+    try:
+        rows = store.listdir(prefix)
+    except PermissionError:
+        # Credentials without s3:ListBucket. Probe each shard this fill would
+        # touch instead — bounded by the work in hand, not the whole zone.
+        if console:
+            console.print(
+                f"    [dim]Cannot list the store; probing {len(wanted)} "
+                f"shard(s) individually[/dim]"
+            )
+        return {
+            (sr, sc)
+            for sr, sc in sorted(wanted)
+            if store.exists(prefix, str(sr), str(sc), on_denied=False)
+        }
+
+    # An empty listing means nothing has been written for this time slice,
+    # which is the common case on a fresh zone — no probing needed.
+    present = set()
+    for row_entry in rows:
+        sr_name = row_entry.rstrip("/").rsplit("/", 1)[-1]
+        if not sr_name.isdigit():
+            continue
+        sr = int(sr_name)
+        for col_entry in store.listdir(prefix, sr_name, on_denied=[]):
+            sc_name = col_entry.rstrip("/").rsplit("/", 1)[-1]
+            if sc_name.isdigit() and (sr, int(sc_name)) in wanted:
+                present.add((sr, int(sc_name)))
+    return present
+
+
 def _store_years(store: StoreLocation, zones: Optional[List[int]] = None) -> List[int]:
     """Read the store's year axis from a zone's ``time`` coordinate array.
 
@@ -1916,6 +2011,199 @@ def extend_store(
     return extended
 
 
+def scan_store(
+    registry: "Registry",
+    store_path: "str | Path | StoreLocation",
+    years: Optional[List[int]] = None,
+    zones: Optional[List[int]] = None,
+    console: Optional["rich.console.Console"] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+    source: Optional[TileSource] = None,
+    state_url: Optional[str] = None,
+    output: Optional[str] = None,
+) -> "pandas.DataFrame":
+    """Inventory a store's shards against the manifest, without writing data.
+
+    Answers "how much is left to fill" from the store itself rather than from
+    bookkeeping, by listing the shard objects that exist and comparing them
+    with the shards the manifest says should exist. Each shard is classified:
+
+    ``written``
+        The shard object is in the store.
+    ``missing``
+        The manifest has tiles here but no shard object exists — the work
+        still to do.
+    ``empty``
+        No manifest tiles fall in this shard, so it is ocean or outside the
+        data's coverage and will never be filled. Reported separately so the
+        percentages are over land, not over the zone's bounding box.
+
+    Returns a DataFrame with one row per (zone, year, shard), also written to
+    *output* as parquet when given.
+    """
+    import pandas as pd
+
+    store = StoreLocation.resolve(store_path, storage_options, state_url)
+
+    all_years = _store_years(store, zones)
+    if not all_years:
+        raise ValueError("Store has no years (checked zone time coords)")
+    scan_years = [y for y in (years or all_years) if y in all_years]
+
+    if console:
+        console.print(f"Scanning [bold]{store}[/bold]")
+        console.print(f"  Years: {scan_years}")
+
+    rows: List[Dict[str, Any]] = []
+
+    for scan_year in scan_years:
+        year_tiles = gather_tile_infos(
+            registry, scan_year, zones=zones, console=None, source=source
+        )
+
+        for zone_num, tile_infos in sorted(year_tiles.items()):
+            zone_group = _zone_group_name(zone_num)
+            try:
+                zone_store = store.open_group(mode="r", path=zone_group)
+                zone_years = [int(v) for v in zone_store["time"][:]]
+            except Exception:
+                continue
+            if scan_year not in zone_years:
+                continue
+            time_index = zone_years.index(scan_year)
+
+            attrs = dict(zone_store.attrs)
+            transform = attrs["spatial:transform"]
+            shape = attrs["spatial:shape"]
+            grid = UnifiedZoneGrid(
+                zone=zone_num,
+                years=all_years,
+                canonical_epsg=int(attrs["proj:code"].split(":")[1]),
+                origin_x=transform[2],
+                origin_y=transform[5],
+                width_px=shape[1],
+                height_px=shape[0],
+            )
+
+            # Tiles per shard, so the index records how much work each holds.
+            per_shard: Dict[Tuple[int, int], int] = {}
+            for ti in tile_infos:
+                for coord in shard_coords_for_tiles([ti], grid):
+                    per_shard[coord] = per_shard.get(coord, 0) + 1
+
+            expected = set(per_shard)
+            present = _existing_shards(
+                store, zone_group, time_index, expected, console=console
+            )
+
+            n_rows_grid = math.ceil(grid.height_px / SHARD_SIZE)
+            n_cols_grid = math.ceil(grid.width_px / SHARD_SIZE)
+            for sr in range(n_rows_grid):
+                for sc in range(n_cols_grid):
+                    coord = (sr, sc)
+                    n_tiles = per_shard.get(coord, 0)
+                    if n_tiles == 0:
+                        status = "empty"
+                    elif coord in present:
+                        status = "written"
+                    else:
+                        status = "missing"
+                    rows.append(
+                        {
+                            "zone": zone_num,
+                            "year": scan_year,
+                            "shard_row": sr,
+                            "shard_col": sc,
+                            "n_tiles": n_tiles,
+                            "status": status,
+                        }
+                    )
+
+            if console:
+                n_exp = len(expected)
+                n_have = len(present & expected)
+                pct = 100.0 * (n_exp - n_have) / n_exp if n_exp else 0.0
+                console.print(
+                    f"  utm{zone_num:02d} {scan_year}: "
+                    f"{n_have}/{n_exp} shards written, {pct:.1f}% to fill"
+                )
+
+    df = pd.DataFrame(
+        rows,
+        columns=["zone", "year", "shard_row", "shard_col", "n_tiles", "status"],
+    )
+
+    if output:
+        from . import remote
+
+        buf = io.BytesIO()
+        df.to_parquet(buf, index=False)
+        remote.write_bytes(output, buf.getvalue(), storage_options)
+        if console:
+            console.print(f"  Wrote shard index to [bold]{output}[/bold]")
+
+    return df
+
+
+def summarise_scan(df: "pandas.DataFrame", console: "rich.console.Console") -> None:
+    """Print per-zone/year and per-year fill summaries from a scan."""
+    from rich.table import Table
+
+    if df.empty:
+        console.print("[yellow]Nothing scanned.[/yellow]")
+        return
+
+    def _pct(sub) -> float:
+        expected = int((sub["status"] != "empty").sum())
+        missing = int((sub["status"] == "missing").sum())
+        return 100.0 * missing / expected if expected else 0.0
+
+    detail = Table(title="Fill needed by zone and year")
+    for col in ("Zone", "Year", "Land shards", "Written", "Missing", "% to fill"):
+        detail.add_column(col, justify="right" if col != "Zone" else "left")
+
+    for (zone, year), sub in df.groupby(["zone", "year"], sort=True):
+        expected = int((sub["status"] != "empty").sum())
+        written = int((sub["status"] == "written").sum())
+        missing = int((sub["status"] == "missing").sum())
+        if expected == 0:
+            continue
+        detail.add_row(
+            f"utm{int(zone):02d}",
+            str(int(year)),
+            f"{expected:,}",
+            f"{written:,}",
+            f"{missing:,}",
+            f"{_pct(sub):.1f}%",
+        )
+    console.print(detail)
+
+    by_year = Table(title="Fill needed by year (all scanned zones)")
+    for col in ("Year", "Land shards", "Written", "Missing", "% to fill"):
+        by_year.add_column(col, justify="right" if col != "Year" else "left")
+    for year, sub in df.groupby("year", sort=True):
+        expected = int((sub["status"] != "empty").sum())
+        if expected == 0:
+            continue
+        by_year.add_row(
+            str(int(year)),
+            f"{expected:,}",
+            f"{int((sub['status'] == 'written').sum()):,}",
+            f"{int((sub['status'] == 'missing').sum()):,}",
+            f"{_pct(sub):.1f}%",
+        )
+    console.print(by_year)
+
+    total_expected = int((df["status"] != "empty").sum())
+    total_missing = int((df["status"] == "missing").sum())
+    total_empty = int((df["status"] == "empty").sum())
+    overall = 100.0 * total_missing / total_expected if total_expected else 0.0
+    console.print(
+        f"Overall: {total_missing:,}/{total_expected:,} land shards to fill "
+        f"({overall:.1f}%); {total_empty:,} shard(s) are water/no-coverage."
+    )
+
+
 def fill_store(
     registry: "Registry",
     store_path: "str | Path | StoreLocation",
@@ -1928,6 +2216,7 @@ def fill_store(
     consolidate: Optional[bool] = None,
     force_lock: bool = False,
     state_url: Optional[str] = None,
+    skip_existing_shards: bool = False,
 ) -> int:
     """Incrementally fill a store with tile data.
 
@@ -1946,6 +2235,12 @@ def fill_store(
             is set, because the root object is the one thing parallel zone
             jobs share — run ``zarr-consolidate`` once after the sweep.
         force_lock: Take over a (zone, year) lock held by another process.
+        skip_existing_shards: Treat a shard object that already exists as
+            done. Recovers a run killed before it could record progress,
+            since the objects outlive the bookkeeping. Assumes the tile
+            inventory has not grown since those shards were written — a tile
+            added to the manifest afterwards falls inside an existing shard
+            and would be skipped rather than merged in.
     """
     store = StoreLocation.resolve(store_path, storage_options, state_url)
     if workers is None:
@@ -1958,6 +2253,8 @@ def fill_store(
         raise ValueError("Store has no years (checked zone time coords)")
 
     fill_years = [year] if year is not None else all_years
+
+    _warn_worker_memory(workers, console)
 
     if console:
         console.print(f"Filling store at [bold]{store}[/bold]")
@@ -2060,11 +2357,40 @@ def fill_store(
                 tile_infos, grid, time_index, restrict_to=touched
             )
 
+            # The shard objects in the store are the ground truth for what
+            # landed — unlike the ingestion registry they survive a kill -9,
+            # so a crashed run can be resumed by scanning for them.
+            skipped_specs: List[ShardSpec] = []
+            if skip_existing_shards:
+                present = _existing_shards(
+                    store,
+                    zone_group,
+                    time_index,
+                    {(s.sr, s.sc) for s in shard_specs},
+                    console=console,
+                )
+                if present:
+                    skipped_specs = [
+                        s for s in shard_specs if (s.sr, s.sc) in present
+                    ]
+                    shard_specs = [
+                        s for s in shard_specs if (s.sr, s.sc) not in present
+                    ]
+                    if console:
+                        console.print(
+                            f"    [cyan]{len(skipped_specs)} shard(s) already "
+                            f"written, skipping[/cyan]"
+                        )
+
             if console:
-                n_rewritten = sum(len(s.tiles) for s in shard_specs) - len(remaining)
+                pending = {(ti.lon, ti.lat) for ti in remaining}
+                rebuilt = {
+                    (ov.embedding_path) for s in shard_specs for ov in s.tiles
+                }
+                n_rebuilt = max(0, len(rebuilt) - len(pending))
                 extra = (
-                    f", {n_rewritten} previously-written tile(s) rewritten"
-                    if n_rewritten > 0
+                    f", {n_rebuilt} already-written tile(s) rebuilt"
+                    if n_rebuilt > 0
                     else ""
                 )
                 console.print(
@@ -2097,16 +2423,17 @@ def fill_store(
                             f"    [red]{len(failed)} shard(s) failed[/red]"
                         )
 
-                # Only record tiles whose shards all landed, so a retry picks
-                # up exactly the work a transient failure left behind.
-                if failed:
-                    recorded = [
-                        ti
-                        for ti in remaining
-                        if not (shard_coords_for_tiles([ti], grid) & failed)
-                    ]
-                else:
-                    recorded = remaining
+                # Record tiles whose shards all landed — counting the ones we
+                # skipped as landed, since they are already in the store — so
+                # a retry picks up exactly the work still outstanding.
+                done = {(s.sr, s.sc) for s in skipped_specs} | (
+                    {(s.sr, s.sc) for s in shard_specs} - failed
+                )
+                recorded = [
+                    ti
+                    for ti in remaining
+                    if shard_coords_for_tiles([ti], grid) <= done
+                ]
                 _record_written_tiles(store, recorded, fill_year, zone_num)
             finally:
                 _release_zone_lock(store, zone_num, fill_year)

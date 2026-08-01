@@ -30,6 +30,23 @@
   unrecognised objects and readers saw non-Zarr entries. A `_registry.parquet`
   left inside an older store is still read, so existing stores resume
   correctly; nothing is written back into them. (@avsm)
+- **`geotessera-registry zarr-scan`**: New subcommand that inventories a
+  store's shards against the manifest without writing anything, classifying
+  each as `written`, `missing`, or `empty` (no manifest tiles fall in it, so
+  it is ocean or outside coverage and will never be filled). Prints
+  per-zone/year and per-year summaries of how much is left to fill —
+  percentages are over land, not over each zone's bounding box — and
+  optionally writes the per-shard index as parquet. (@avsm)
+- **`zarr-fill --skip-existing-shards`**: Resume from the store itself. The
+  ingestion registry is only written when a (zone, year) finishes, so a run
+  killed partway loses that year's bookkeeping even though its shards are
+  safely written; the shard objects survive anything. This scans for them,
+  skips them and records their tiles. Assumes the tile inventory has not
+  grown since. Falls back to probing just the shards in hand where the
+  credentials cannot list the store. (@avsm)
+- **`zarr-fill` warns when the worker count will not fit in RAM**: each
+  worker holds a ~2.1 GiB shard buffer, so `--workers 16` needs 33 GiB and
+  an OOM kill leaves no traceback to diagnose. (@avsm)
 - **`geotessera-registry zarr-extend`**: New subcommand that appends years
   to an existing store's time axis, so a new year can be added without
   rebuilding. Time is chunked one year per chunk, making this a

@@ -1223,6 +1223,40 @@ published hierarchy contains only Zarr:
 * **Consolidation is skipped** by default when ``--zones`` is given, since
   the root ``zarr.json`` is the one object all jobs share.
 
+Resuming After a Crash
+~~~~~~~~~~~~~~~~~~~~~~
+
+The ingestion registry is written when a (zone, year) finishes, so a run
+that dies partway — an OOM kill leaves no traceback — loses that year's
+bookkeeping even though the shards it wrote are safely in the store.
+
+The shard objects are the ground truth, and they survive anything::
+
+    geotessera-registry zarr-fill <source> <store> --zones 30 \
+        --skip-existing-shards
+
+This lists the shard objects already present for each (zone, year), skips
+them, and records their tiles so subsequent runs need no flag. It assumes
+the tile inventory has not grown since those shards were written: a tile
+added to the manifest afterwards falls inside an existing shard and would
+be skipped rather than merged in. Where the credentials cannot list the
+store, it falls back to probing only the shards the run would touch.
+
+To see what is outstanding before committing to a sweep::
+
+    geotessera-registry zarr-scan <source> <store> --output index.parquet
+
+Every shard is classified ``written``, ``missing``, or ``empty`` — the last
+meaning no manifest tiles fall in it, so it is ocean or outside coverage and
+will never be filled. Keeping those separate means the percentages are over
+land, not over each zone's bounding box. The command prints per-zone/year
+and per-year summaries and writes the full per-shard index as parquet.
+
+Note that worker memory, not cores, bounds the fill: each holds a full
+``(128, 4096, 4096)`` int8 shard buffer plus its scales, about 2.1 GiB, so
+``--workers 16`` needs 33 GiB resident. ``zarr-fill`` warns when the
+requested count will not fit.
+
 A sweep therefore looks like::
 
     # fan out — one process per zone, in parallel

@@ -50,6 +50,30 @@ A dead sibling job's lock can be taken over explicitly:
   $ geotessera-registry zarr-fill --help | grep -o '\-\-force-lock' | sort -u
   --force-lock
 
+Test: resume from the store itself
+-----------------------------------
+
+Shard objects outlive the bookkeeping, so a killed run can be recovered by
+scanning for them:
+
+  $ geotessera-registry zarr-fill --help | grep -o '\-\-skip-existing-shards' | sort -u
+  --skip-existing-shards
+
+Test: zarr-scan reports outstanding work
+-----------------------------------------
+
+  $ geotessera-registry zarr-scan --help | grep -c 'written, missing, or'
+  1
+
+Shards with no manifest tiles are counted separately, so percentages are
+over land rather than over the zone's bounding box:
+
+  $ geotessera-registry zarr-scan --help | grep -c 'ocean or outside coverage'
+  1
+
+  $ geotessera-registry zarr-scan --help | grep -o '\-\-output OUTPUT' | sort -u
+  --output OUTPUT
+
 Test: zarr-extend grows the time axis
 --------------------------------------
 
