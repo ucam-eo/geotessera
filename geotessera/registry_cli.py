@@ -4519,6 +4519,12 @@ def main():
         else [logging.StreamHandler()],
     )
 
+    # The object-store libraries log at INFO on every client build; left on,
+    # they interleave with the progress bars during a fill.
+    from .remote import quieten_dependency_logging
+
+    quieten_dependency_logging()
+
     parser = argparse.ArgumentParser(
         description="GeoTessera Registry Management Tool - Generate and maintain Pooch registry files",
         formatter_class=argparse.RawDescriptionHelpFormatter,

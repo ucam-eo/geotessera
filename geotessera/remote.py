@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
 from functools import lru_cache
@@ -39,6 +40,82 @@ logger = logging.getLogger(__name__)
 # Protocols we can read/write through fsspec. Anything else without a
 # scheme is treated as a local filesystem path.
 _URL_MARKER = "://"
+
+
+# Chatty at INFO and of no interest to a user watching a fill. botocore in
+# particular logs "Found credentials in shared credentials file" every time
+# a client is built — once per worker process, which shreds a progress bar
+# the workers share a terminal with.
+_NOISY_LOGGERS = (
+    "botocore",
+    "boto3",
+    "aiobotocore",
+    "s3fs",
+    "urllib3",
+    "aiohttp",
+)
+
+
+def quieten_dependency_logging(level: int = logging.WARNING) -> None:
+    """Raise the log level of the object-store libraries.
+
+    Call in the parent before a progress bar starts, and again in each worker
+    process, since a worker that did not inherit the parent's configuration
+    would otherwise start logging into the shared terminal.
+    """
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+
+def reset_after_fork() -> None:
+    """Drop inherited fsspec/asyncio state in a freshly started worker.
+
+    ``s3fs`` drives its client from a background event-loop thread and
+    ``fsspec`` caches both the loop and its filesystem instances globally. A
+    forked child inherits those objects but not the thread running the loop,
+    so the next call deadlocks: the worker's main thread waits on a future
+    the loop will never service (main in ``futex_do_wait``, loop thread idle
+    in ``ep_poll``). Workers are started with "spawn" to avoid this outright;
+    this is the belt-and-braces reset for anything that still leaks in.
+    """
+    try:
+        import fsspec.asyn
+
+        fsspec.asyn.reset_lock()
+        fsspec.asyn.iothread[0] = None
+        fsspec.asyn.loop[0] = None
+    except Exception as e:  # pragma: no cover - best effort
+        logger.debug(f"Could not reset fsspec event loop: {e}")
+
+    try:
+        import fsspec
+
+        fsspec.AbstractFileSystem.clear_instance_cache()
+    except Exception as e:  # pragma: no cover - best effort
+        logger.debug(f"Could not clear fsspec instance cache: {e}")
+
+    _filesystem_cached.cache_clear()
+
+
+def die_with_parent() -> None:
+    """Ask the kernel to kill this process when its parent goes away.
+
+    Without it, a fill that is killed outright leaves its workers running:
+    each holds gigabytes and keeps writing, and they accumulate across runs
+    until the machine is out of memory. Linux only; a no-op elsewhere.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        import ctypes
+        import signal
+
+        PR_SET_PDEATHSIG = 1
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+            PR_SET_PDEATHSIG, signal.SIGKILL
+        )
+    except Exception as e:  # pragma: no cover - best effort
+        logger.debug(f"Could not set parent-death signal: {e}")
 
 
 def is_url(loc: str | Path) -> bool:

@@ -945,9 +945,28 @@ DEFAULT_WORKERS = 4  # fewer workers due to larger shard buffers (~2GB each)
 # reason the worker count is bounded by RAM rather than by cores.
 WORKER_BUFFER_BYTES = N_BANDS * SHARD_SIZE * SHARD_SIZE + 4 * SHARD_SIZE * SHARD_SIZE
 
+# Peak is several times that buffer, and planning against the raw figure
+# gets fills OOM-killed. On top of the buffer, zarr's sharding codec
+# compresses every inner chunk and assembles the shard, and s3fs holds the
+# upload body. Measured 4.3 GiB per worker on a sparse three-tile shard; a
+# dense one on a loaded host was killed holding 12 GiB.
+WORKER_PEAK_BYTES = 3 * WORKER_BUFFER_BYTES
+
 
 def _total_memory_bytes() -> Optional[int]:
-    """Physical RAM, or None where it cannot be determined."""
+    """Memory a fill can realistically use, or None if undeterminable.
+
+    Prefers MemAvailable over physical RAM: these hosts are often shared,
+    and what is free right now is what decides whether the kernel starts
+    killing workers.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
     try:
         return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
     except (ValueError, OSError, AttributeError):
@@ -960,20 +979,22 @@ def _warn_worker_memory(workers: int, console=None) -> None:
     A fill that is OOM-killed leaves no traceback, so the cause is easy to
     miss; say it up front instead.
     """
-    needed = workers * WORKER_BUFFER_BYTES
+    needed = workers * WORKER_PEAK_BYTES
     total = _total_memory_bytes()
     gib = 2**30
     message = (
-        f"{workers} workers need at least {needed / gib:.0f} GiB "
-        f"({WORKER_BUFFER_BYTES / gib:.1f} GiB of shard buffer each)"
+        f"{workers} workers can peak around {needed / gib:.0f} GiB "
+        f"(~{WORKER_PEAK_BYTES / gib:.1f} GiB each: a "
+        f"{WORKER_BUFFER_BYTES / gib:.1f} GiB shard buffer plus compression "
+        f"and the upload body)"
     )
     if total is None:
         logger.info(message)
         return
     if needed > 0.8 * total:
-        safe = max(1, int(0.8 * total // WORKER_BUFFER_BYTES))
+        safe = max(1, int(0.8 * total // WORKER_PEAK_BYTES))
         text = (
-            f"{message}, but this machine has {total / gib:.0f} GiB. "
+            f"{message}, but only {total / gib:.0f} GiB is available here. "
             f"The fill will likely be OOM-killed — consider --workers {safe}."
         )
         if console:
@@ -1723,6 +1744,12 @@ def _init_shard_worker(
     own filesystem connections rather than inheriting an unforkable client.
     """
     global _worker_store, _worker_source_options
+
+    from . import remote
+
+    remote.quieten_dependency_logging()
+    remote.reset_after_fork()
+    remote.die_with_parent()
 
     _worker_store = StoreLocation(store_url, store_options).open_group(
         mode="r+", path=zone_group, zarr_format=3
@@ -2479,26 +2506,20 @@ def fill_store(
                     shard_specs = [
                         s for s in shard_specs if (s.sr, s.sc) not in present
                     ]
-                    if console:
-                        console.print(
-                            f"    [cyan]{len(skipped_specs)} shard(s) already "
-                            f"written, skipping[/cyan]"
-                        )
 
             if console:
-                pending = {(ti.lon, ti.lat) for ti in remaining}
-                rebuilt = {
-                    (ov.embedding_path) for s in shard_specs for ov in s.tiles
-                }
-                n_rebuilt = max(0, len(rebuilt) - len(pending))
-                extra = (
-                    f", {n_rebuilt} already-written tile(s) rebuilt"
-                    if n_rebuilt > 0
-                    else ""
-                )
+                # Spell the arithmetic out. The count of shards to write is
+                # otherwise hard to reconcile with zarr-scan, which counts
+                # every land shard, whereas a fill only considers those
+                # covering tiles the registry has not already recorded.
+                n_land = len(shard_coords_for_tiles(tile_infos, grid))
+                n_recorded = n_land - len(touched)
                 console.print(
-                    f"    {len(shard_specs)} shards to write "
-                    f"({workers} workers{extra})"
+                    f"    Shards: {n_land:,} land, "
+                    f"{n_recorded:,} recorded done, "
+                    f"{len(skipped_specs):,} found in store, "
+                    f"[bold]{len(shard_specs):,} to write[/bold] "
+                    f"({workers} workers)"
                 )
 
             _acquire_zone_lock(store, zone_num, fill_year, force=force_lock)
@@ -2579,11 +2600,17 @@ def _write_shards(
 
     Returns (shards written, set of (sr, sc) that failed).
     """
+    import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     written_count = 0
     failed: set = set()
     initargs = (store.url, zone_group, store.storage_options, source_options)
+
+    # "spawn", not the Linux default of "fork": a forked worker inherits the
+    # parent's fsspec event-loop object without the thread that runs it, and
+    # deadlocks the first time it talks to the store.
+    mp_context = multiprocessing.get_context("spawn")
 
     def _drain(pool, advance=None):
         nonlocal written_count
@@ -2609,6 +2636,7 @@ def _write_shards(
         max_workers=workers,
         initializer=_init_shard_worker,
         initargs=initargs,
+        mp_context=mp_context,
     )
     try:
         if console:

@@ -52,14 +52,42 @@
   tile inventory has grown, since a newly-added tile falls inside an
   existing shard. `--skip-existing-shards` is still accepted as a no-op.
   (@avsm)
+- **`zarr-fill` reports the shard arithmetic**: `Shards: 1,373 land, 48
+  recorded done, 43 found in store, 1,282 to write`. The previous line
+  showed only the last figure, which could not be reconciled with
+  `zarr-scan` — that counts every land shard, whereas a fill considers only
+  those covering tiles the registry has not already recorded. (@avsm)
+- **Object-store libraries no longer log over the progress bar**: botocore
+  logs "Found credentials in shared credentials file" at INFO every time a
+  client is built, once per worker process, and the workers share a
+  terminal with the progress bar. botocore, boto3, aiobotocore, s3fs,
+  urllib3 and aiohttp are now capped at WARNING in both the parent and the
+  workers. (@avsm)
+- **Fills no longer deadlock against an object store.** `s3fs` runs its
+  client on a background event-loop thread and `fsspec` caches both the loop
+  and its filesystem instances globally; a forked worker inherits those
+  objects but not the thread running the loop, so its first call to the
+  store waits forever (main thread in `futex_do_wait`, loop thread idle in
+  `ep_poll`). Workers are now started with "spawn" rather than the Linux
+  default of "fork", and reset any inherited fsspec state on startup.
+  (@avsm)
+- **Workers die with their parent.** A fill killed outright left its
+  workers running, each holding gigabytes and accumulating across runs —
+  19 orphans holding 8 GB were observed on one host. Workers now set
+  `PR_SET_PDEATHSIG` on Linux. (@avsm)
 - **Ctrl-C during a fill exits cleanly** with status 130 instead of two
   tracebacks. The process pool was shut down with `wait=True`, so an
   interrupt blocked until every in-flight shard finished — with
   multi-gigabyte workers that looks like a hang and invites a second
   Ctrl-C. (@avsm)
-- **`zarr-fill` warns when the worker count will not fit in RAM**: each
-  worker holds a ~2.1 GiB shard buffer, so `--workers 16` needs 33 GiB and
-  an OOM kill leaves no traceback to diagnose. (@avsm)
+- **`zarr-fill` warns when the worker count will not fit in memory**, using
+  `MemAvailable` rather than physical RAM since these hosts are usually
+  shared. The estimate covers the real peak — a worker holds a 2.1 GiB
+  shard buffer, then zarr's sharding codec compresses every inner chunk and
+  assembles the shard while s3fs holds the upload body, measured at 4.3 GiB
+  and observed being OOM-killed at 12 GiB — so it budgets ~6.2 GiB each
+  rather than the raw buffer. An OOM kill leaves no traceback, so the
+  warning is the only diagnosis. (@avsm)
 - **`geotessera-registry zarr-extend`**: New subcommand that appends years
   to an existing store's time axis, so a new year can be added without
   rebuilding. Time is chunked one year per chunk, making this a
