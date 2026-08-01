@@ -74,6 +74,15 @@ over land rather than over the zone's bounding box:
   $ geotessera-registry zarr-scan --help | grep -o '\-\-output OUTPUT' | sort -u
   --output OUTPUT
 
+The tile mirror is optional -- scanning a remote store needs only the
+landmask registry for its land denominator:
+
+  $ geotessera-registry zarr-scan --help | grep -c 'Optional tile mirror'
+  1
+
+  $ geotessera-registry zarr-scan --help | grep -oE 'store_path \[base_dir\]'
+  store_path [base_dir]
+
 Test: zarr-extend grows the time axis
 --------------------------------------
 

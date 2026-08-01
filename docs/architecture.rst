@@ -1242,15 +1242,24 @@ added to the manifest afterwards falls inside an existing shard and would
 be skipped rather than merged in. Where the credentials cannot list the
 store, it falls back to probing only the shards the run would touch.
 
-To see what is outstanding before committing to a sweep::
+To see what is outstanding before committing to a sweep, point ``zarr-scan``
+at the store on its own::
 
-    geotessera-registry zarr-scan <source> <store> --output index.parquet
+    geotessera-registry zarr-scan s3://bucket/tessera.zarr --output index.parquet
 
 Every shard is classified ``written``, ``missing``, or ``empty`` — the last
-meaning no manifest tiles fall in it, so it is ocean or outside coverage and
-will never be filled. Keeping those separate means the percentages are over
-land, not over each zone's bounding box. The command prints per-zone/year
-and per-year summaries and writes the full per-shard index as parquet.
+meaning no land falls in it, so it is ocean or outside coverage and will
+never be filled. Keeping those separate means the percentages are over land,
+not over each zone's bounding box, which for a coastal zone is mostly sea.
+The command prints per-zone/year and per-year summaries and writes the full
+per-shard index as parquet.
+
+No tile mirror or manifest is needed: the land denominator comes from the
+landmask registry (~19 MB, fetched and cached), which is all that decides
+whether a shard can ever hold data. Supplying a tile mirror as an optional
+second argument switches the denominator to each year's actual embedding
+coverage from the manifest (~200 MB) — worth it only where a year covers
+less than the full land area.
 
 Note that worker memory, not cores, bounds the fill: each holds a full
 ``(128, 4096, 4096)`` int8 shard buffer plus its scales, about 2.1 GiB, so

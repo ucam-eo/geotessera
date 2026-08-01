@@ -3837,7 +3837,14 @@ def zarr_scan_command(args):
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
-    registry, source, _version, _variant = _resolve_source(args, console)
+
+    # The manifest is optional: land coverage alone says which shards can
+    # ever hold data, and that comes from the much smaller landmask registry.
+    if args.base_dir:
+        registry, source, dataset_version, _variant = _resolve_source(args, console)
+    else:
+        registry, source = None, None
+        dataset_version = args.dataset_version or "v1"
 
     store_options = _storage_options_for(args, "store", args.store_path)
     years = _parse_int_range(args.years) if args.years else None
@@ -3854,6 +3861,8 @@ def zarr_scan_command(args):
             source=source,
             state_url=args.state_url,
             output=args.output,
+            dataset_version=dataset_version,
+            landmasks_path=args.landmasks_url,
         )
     except ValueError as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -4887,14 +4896,18 @@ Directory Structure:
         "write the full index as parquet.",
     )
     zarr_scan_parser.add_argument(
-        "base_dir",
-        help="Base directory containing downloaded tile data, or a URL of a "
-        "repository in the published layout (used for the manifest)",
-    )
-    zarr_scan_parser.add_argument(
         "store_path",
         type=str,
         help="Path or URL of an existing tessera store",
+    )
+    zarr_scan_parser.add_argument(
+        "base_dir",
+        nargs="?",
+        default=None,
+        help="Optional tile mirror or repository URL. Without it, land "
+        "coverage comes from the landmask registry, which is all that is "
+        "needed and far smaller than the manifest. Give it to measure "
+        "against each year's actual embedding coverage instead.",
     )
     zarr_scan_parser.add_argument(
         "--years",

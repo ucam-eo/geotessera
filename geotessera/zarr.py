@@ -447,6 +447,65 @@ def _zone_group_name(zone: int) -> str:
     return f"utm{zone:02d}"
 
 
+def tile_zone(lon: float) -> int:
+    """UTM zone number (1-60) containing a longitude."""
+    return max(1, min(60, int(math.floor((lon + 180) / 6)) + 1))
+
+
+def project_tile(
+    lon: float,
+    lat: float,
+    year: int = 0,
+    transformer_cache: Optional[Dict[int, Any]] = None,
+    landmask_path: str = "",
+    embedding_path: str = "",
+    scales_path: str = "",
+    pixel_size: float = 10.0,
+) -> TileInfo:
+    """Compute a tile's UTM footprint from its centre coordinates alone.
+
+    Deterministic — no file is opened — so it works for a landmask tile whose
+    embeddings do not exist as readily as for one that has data.
+    """
+    from pyproj import Transformer as ProjTransformer
+    from rasterio.transform import Affine
+
+    if transformer_cache is None:
+        transformer_cache = {}
+
+    zone_num = tile_zone(lon)
+    epsg = (32700 if lat < 0 else 32600) + zone_num
+
+    if epsg not in transformer_cache:
+        transformer_cache[epsg] = ProjTransformer.from_crs(
+            "EPSG:4326", f"EPSG:{epsg}", always_xy=True
+        )
+    proj = transformer_cache[epsg]
+
+    west, east = lon - 0.05, lon + 0.05
+    south, north = lat - 0.05, lat + 0.05
+    ul_e, ul_n = proj.transform(west, north)
+    ur_e, ur_n = proj.transform(east, north)
+    ll_e, ll_n = proj.transform(west, south)
+    lr_e, lr_n = proj.transform(east, south)
+
+    origin_e = min(ul_e, ll_e)
+    origin_n = max(ul_n, ur_n)
+
+    return TileInfo(
+        lon=lon,
+        lat=lat,
+        year=year,
+        epsg=epsg,
+        transform=Affine(pixel_size, 0.0, origin_e, 0.0, -pixel_size, origin_n),
+        height=round((origin_n - min(ll_n, lr_n)) / pixel_size),
+        width=round((max(ur_e, lr_e) - origin_e) / pixel_size),
+        landmask_path=landmask_path,
+        embedding_path=embedding_path,
+        scales_path=scales_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Landmask handling
 # ---------------------------------------------------------------------------
@@ -503,8 +562,6 @@ def gather_tile_infos(
             mirror; pass a :class:`TileSource` built with
             :meth:`TileSource.for_url` to stream from a remote bucket.
     """
-    from rasterio.transform import Affine
-
     # Get tiles for this year from MultiIndex, filtering to those with data
     gdf = registry._registry_gdf
     try:
@@ -542,62 +599,26 @@ def gather_tile_infos(
             )
 
     # Build TileInfos using computed grid (no file I/O)
-    from pyproj import Transformer as ProjTransformer
-
     if source is None:
         source = TileSource.for_local_mirror(registry)
 
     zones_dict: Dict[int, List[TileInfo]] = {}
-    transformer_cache: Dict[int, ProjTransformer] = {}
-    pixel_size = 10.0
+    transformer_cache: Dict[int, Any] = {}
 
     for tile_year, tile_lon, tile_lat in tiles:
+        zone_num = tile_zone(tile_lon)
+        if zone_set is not None and zone_num not in zone_set:
+            continue
+
         emb_path, scales_path = source.embedding_locations(
             tile_lon, tile_lat, tile_year
         )
-        landmask_path = source.landmask_location(tile_lon, tile_lat)
-
-        # Compute EPSG and zone from coordinates
-        zone_num = int(math.floor((tile_lon + 180) / 6)) + 1
-        zone_num = max(1, min(60, zone_num))
-        if zone_set is not None and zone_num not in zone_set:
-            continue
-        is_south = tile_lat < 0
-        epsg = 32700 + zone_num if is_south else 32600 + zone_num
-
-        # Reuse cached transformer for this EPSG
-        if epsg not in transformer_cache:
-            transformer_cache[epsg] = ProjTransformer.from_crs(
-                "EPSG:4326", f"EPSG:{epsg}", always_xy=True
-            )
-        proj = transformer_cache[epsg]
-
-        # Project tile corners to UTM
-        west, east = tile_lon - 0.05, tile_lon + 0.05
-        south, north = tile_lat - 0.05, tile_lat + 0.05
-        ul_e, ul_n = proj.transform(west, north)
-        ur_e, ur_n = proj.transform(east, north)
-        ll_e, ll_n = proj.transform(west, south)
-        lr_e, lr_n = proj.transform(east, south)
-
-        origin_e = min(ul_e, ll_e)
-        origin_n = max(ul_n, ur_n)
-        max_e = max(ur_e, lr_e)
-        min_n = min(ll_n, lr_n)
-
-        width = round((max_e - origin_e) / pixel_size)
-        height = round((origin_n - min_n) / pixel_size)
-        tf_tuple = (pixel_size, 0.0, origin_e, 0.0, -pixel_size, origin_n)
-
-        ti = TileInfo(
-            lon=tile_lon,
-            lat=tile_lat,
-            year=tile_year,
-            epsg=epsg,
-            transform=Affine(*tf_tuple),
-            height=height,
-            width=width,
-            landmask_path=landmask_path,
+        ti = project_tile(
+            tile_lon,
+            tile_lat,
+            tile_year,
+            transformer_cache,
+            landmask_path=source.landmask_location(tile_lon, tile_lat),
             embedding_path=emb_path,
             scales_path=scales_path,
         )
@@ -2011,8 +2032,62 @@ def extend_store(
     return extended
 
 
+def load_landmask_tiles(
+    dataset_version: str = "v1",
+    landmasks_path: Optional[str] = None,
+    cache_dir: Optional[Path] = None,
+) -> List[Tuple[float, float]]:
+    """Land tile centres for a dataset version, without touching the manifest.
+
+    Land coverage is all that is needed to say which shards can ever hold
+    data, and the landmask registry is ~19 MB against the manifest's ~200 MB.
+    Fetched from the public mirror and cached unless *landmasks_path* points
+    at a local copy.
+    """
+    import pandas as pd
+
+    from .registry import _parse_dataset_version, download_file_to_temp
+    from .registry import landmasks_parquet_url
+
+    version_path, _ = _parse_dataset_version(dataset_version)
+
+    if landmasks_path and Path(landmasks_path).exists():
+        path = Path(landmasks_path)
+    else:
+        if cache_dir is None:
+            if os.name == "nt":
+                base = Path(os.environ.get("LOCALAPPDATA", "~")).expanduser()
+            else:
+                base = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+            cache_dir = base / "geotessera" / version_path
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = Path(
+            download_file_to_temp(
+                landmasks_parquet_url(version_path),
+                cache_path=cache_dir / "landmasks.parquet",
+            )
+        )
+
+    df = pd.read_parquet(path, columns=["lon", "lat"])
+    return list(zip(df["lon"].astype(float), df["lat"].astype(float)))
+
+
+def _shards_from_tiles(
+    tile_coords: List[Tuple[float, float]],
+    grid: UnifiedZoneGrid,
+    transformer_cache: Dict[int, Any],
+) -> Dict[Tuple[int, int], int]:
+    """Map tile centres to the shards they touch, with a tile count each."""
+    per_shard: Dict[Tuple[int, int], int] = {}
+    for lon, lat in tile_coords:
+        ti = project_tile(lon, lat, transformer_cache=transformer_cache)
+        for coord in shard_coords_for_tiles([ti], grid):
+            per_shard[coord] = per_shard.get(coord, 0) + 1
+    return per_shard
+
+
 def scan_store(
-    registry: "Registry",
+    registry: Optional["Registry"],
     store_path: "str | Path | StoreLocation",
     years: Optional[List[int]] = None,
     zones: Optional[List[int]] = None,
@@ -2021,22 +2096,30 @@ def scan_store(
     source: Optional[TileSource] = None,
     state_url: Optional[str] = None,
     output: Optional[str] = None,
+    dataset_version: str = "v1",
+    landmasks_path: Optional[str] = None,
 ) -> "pandas.DataFrame":
-    """Inventory a store's shards against the manifest, without writing data.
+    """Inventory a store's shards, without writing data.
 
     Answers "how much is left to fill" from the store itself rather than from
     bookkeeping, by listing the shard objects that exist and comparing them
-    with the shards the manifest says should exist. Each shard is classified:
+    with the shards that could hold data. Each shard is classified:
 
     ``written``
         The shard object is in the store.
     ``missing``
-        The manifest has tiles here but no shard object exists — the work
-        still to do.
+        Land falls here but no shard object exists — the work still to do.
     ``empty``
-        No manifest tiles fall in this shard, so it is ocean or outside the
-        data's coverage and will never be filled. Reported separately so the
-        percentages are over land, not over the zone's bounding box.
+        No land falls in this shard, so it is ocean or outside coverage and
+        will never be filled. Reported separately so the percentages are
+        over land, not over the zone's bounding box.
+
+    The land denominator comes from the landmask registry (~19 MB, fetched
+    and cached automatically), so no tile mirror or manifest is needed —
+    scanning a remote store on its own is enough. Passing *registry* instead
+    narrows it to the tiles that version's manifest lists **for each year**,
+    which is exact where a year's embedding coverage is smaller than the land
+    area, at the cost of loading the much larger manifest.
 
     Returns a DataFrame with one row per (zone, year, shard), also written to
     *output* as parquet when given.
@@ -2054,14 +2137,28 @@ def scan_store(
         console.print(f"Scanning [bold]{store}[/bold]")
         console.print(f"  Years: {scan_years}")
 
+    transformer_cache: Dict[int, Any] = {}
+    land_by_zone: Dict[int, List[Tuple[float, float]]] = {}
+    if registry is None:
+        if console:
+            console.print("  Land coverage from the landmask registry")
+        for lon, lat in load_landmask_tiles(dataset_version, landmasks_path):
+            zone_num = tile_zone(lon)
+            if zones is None or zone_num in zones:
+                land_by_zone.setdefault(zone_num, []).append((lon, lat))
+
     rows: List[Dict[str, Any]] = []
 
     for scan_year in scan_years:
-        year_tiles = gather_tile_infos(
-            registry, scan_year, zones=zones, console=None, source=source
-        )
+        if registry is not None:
+            year_tiles = gather_tile_infos(
+                registry, scan_year, zones=zones, console=None, source=source
+            )
+            zone_items: List[Tuple[int, Any]] = sorted(year_tiles.items())
+        else:
+            zone_items = sorted(land_by_zone.items())
 
-        for zone_num, tile_infos in sorted(year_tiles.items()):
+        for zone_num, coverage in zone_items:
             zone_group = _zone_group_name(zone_num)
             try:
                 zone_store = store.open_group(mode="r", path=zone_group)
@@ -2086,10 +2183,13 @@ def scan_store(
             )
 
             # Tiles per shard, so the index records how much work each holds.
-            per_shard: Dict[Tuple[int, int], int] = {}
-            for ti in tile_infos:
-                for coord in shard_coords_for_tiles([ti], grid):
-                    per_shard[coord] = per_shard.get(coord, 0) + 1
+            if registry is not None:
+                per_shard = {}
+                for ti in coverage:
+                    for coord in shard_coords_for_tiles([ti], grid):
+                        per_shard[coord] = per_shard.get(coord, 0) + 1
+            else:
+                per_shard = _shards_from_tiles(coverage, grid, transformer_cache)
 
             expected = set(per_shard)
             present = _existing_shards(

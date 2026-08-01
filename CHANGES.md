@@ -31,12 +31,15 @@
   left inside an older store is still read, so existing stores resume
   correctly; nothing is written back into them. (@avsm)
 - **`geotessera-registry zarr-scan`**: New subcommand that inventories a
-  store's shards against the manifest without writing anything, classifying
-  each as `written`, `missing`, or `empty` (no manifest tiles fall in it, so
-  it is ocean or outside coverage and will never be filled). Prints
-  per-zone/year and per-year summaries of how much is left to fill —
-  percentages are over land, not over each zone's bounding box — and
-  optionally writes the per-shard index as parquet. (@avsm)
+  store's shards without writing anything, classifying each as `written`,
+  `missing`, or `empty` (no land falls in it, so it is ocean or outside
+  coverage and will never be filled). Prints per-zone/year and per-year
+  summaries of how much is left to fill — percentages are over land, not
+  over each zone's bounding box — and optionally writes the per-shard index
+  as parquet. Takes the store alone: the land denominator comes from the
+  landmask registry (~19 MB, cached), so no tile mirror or manifest is
+  needed. An optional tile mirror switches the denominator to each year's
+  actual embedding coverage from the manifest. (@avsm)
 - **`zarr-fill --skip-existing-shards`**: Resume from the store itself. The
   ingestion registry is only written when a (zone, year) finishes, so a run
   killed partway loses that year's bookkeeping even though its shards are
