@@ -2316,7 +2316,7 @@ def fill_store(
     consolidate: Optional[bool] = None,
     force_lock: bool = False,
     state_url: Optional[str] = None,
-    skip_existing_shards: bool = False,
+    skip_existing_shards: bool = True,
 ) -> int:
     """Incrementally fill a store with tile data.
 
@@ -2335,12 +2335,15 @@ def fill_store(
             is set, because the root object is the one thing parallel zone
             jobs share — run ``zarr-consolidate`` once after the sweep.
         force_lock: Take over a (zone, year) lock held by another process.
-        skip_existing_shards: Treat a shard object that already exists as
-            done. Recovers a run killed before it could record progress,
-            since the objects outlive the bookkeeping. Assumes the tile
-            inventory has not grown since those shards were written — a tile
-            added to the manifest afterwards falls inside an existing shard
-            and would be skipped rather than merged in.
+        skip_existing_shards: Scan for shards already in the store and skip
+            them (the default). A shard is always written from every tile
+            covering it, so its presence means it is complete, and the
+            objects outlive the ingestion registry — which makes this both
+            the cheapest resume and the only one that survives a kill -9.
+            Set False to rebuild them, which is needed only when the tile
+            inventory has grown: a tile added to the manifest afterwards
+            falls inside an existing shard and would otherwise be skipped
+            rather than merged in.
     """
     store = StoreLocation.resolve(store_path, storage_options, state_url)
     if workers is None:
@@ -2598,40 +2601,45 @@ def _write_shards(
             if advance is not None:
                 advance()
 
-    if console:
-        from rich.progress import (
-            Progress,
-            BarColumn,
-            TextColumn,
-            MofNCompleteColumn,
-            TimeElapsedColumn,
-            TimeRemainingColumn,
-            SpinnerColumn,
-        )
+    # Not a `with` block: on Ctrl-C the context manager's shutdown(wait=True)
+    # blocks until every in-flight shard finishes, which with a pool of
+    # multi-gigabyte workers looks like a hang and invites a second Ctrl-C
+    # (and a second traceback). Cancel what has not started and leave.
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_shard_worker,
+        initargs=initargs,
+    )
+    try:
+        if console:
+            from rich.progress import (
+                Progress,
+                BarColumn,
+                TextColumn,
+                MofNCompleteColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+                SpinnerColumn,
+            )
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(label, total=len(shard_specs))
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_shard_worker,
-                initargs=initargs,
-            ) as pool:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(label, total=len(shard_specs))
                 _drain(pool, advance=lambda: progress.advance(task))
-    else:
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_shard_worker,
-            initargs=initargs,
-        ) as pool:
+        else:
             _drain(pool)
+    except KeyboardInterrupt:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
     return written_count, failed
 

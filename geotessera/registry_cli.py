@@ -3847,7 +3847,7 @@ def zarr_fill_command(args):
             consolidate=consolidate,
             force_lock=args.force_lock,
             state_url=args.state_url,
-            skip_existing_shards=args.skip_existing_shards,
+            skip_existing_shards=not args.rewrite_existing_shards,
         )
     except RuntimeError as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -4907,10 +4907,15 @@ Directory Structure:
     zarr_fill_parser.add_argument(
         "--skip-existing-shards",
         action="store_true",
-        help="Treat a shard that is already in the store as done. Recovers a "
-        "run killed before it recorded progress, since the shard objects "
-        "outlive the bookkeeping. Assumes the tile inventory has not grown "
-        "since those shards were written.",
+        help="Deprecated and now the default; accepted so existing scripts "
+        "keep working.",
+    )
+    zarr_fill_parser.add_argument(
+        "--rewrite-existing-shards",
+        action="store_true",
+        help="Rebuild shards that are already in the store instead of "
+        "skipping them. Needed only when the tile inventory has grown, since "
+        "a newly-added tile falls inside an existing shard.",
     )
     zarr_fill_parser.add_argument(
         "--force-lock",
@@ -5264,7 +5269,13 @@ Directory Structure:
     # Execute the command. Commands return a shell exit status; propagate it
     # so a failed zone in a parallel sweep is visible to the orchestrator
     # rather than silently reported as success.
-    raise SystemExit(args.func(args) or 0)
+    try:
+        raise SystemExit(args.func(args) or 0)
+    except KeyboardInterrupt:
+        # A long fill is routinely interrupted; report it as the shell
+        # convention rather than as two pages of traceback.
+        console.print(f"\n[yellow]{emoji('⚠️  ')}Interrupted.[/yellow]")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

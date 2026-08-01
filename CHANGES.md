@@ -40,13 +40,23 @@
   landmask registry (~19 MB, cached), so no tile mirror or manifest is
   needed. An optional tile mirror switches the denominator to each year's
   actual embedding coverage from the manifest. (@avsm)
-- **`zarr-fill --skip-existing-shards`**: Resume from the store itself. The
-  ingestion registry is only written when a (zone, year) finishes, so a run
-  killed partway loses that year's bookkeeping even though its shards are
-  safely written; the shard objects survive anything. This scans for them,
-  skips them and records their tiles. Assumes the tile inventory has not
-  grown since. Falls back to probing just the shards in hand where the
-  credentials cannot list the store. (@avsm)
+- **`zarr-fill` scans before writing and uploads only what is missing.**
+  The ingestion registry is written only when a (zone, year) finishes, so a
+  run killed partway loses that year's bookkeeping and would re-upload
+  everything — for a zone that is 97% done, rebuilding 1,398 shards to add
+  48. The shard objects survive anything and a shard is always written from
+  every tile covering it, so their presence is proof of completeness. Fills
+  now scan for them by default and skip what is there; falls back to
+  probing just the shards in hand where the credentials cannot list the
+  store. `--rewrite-existing-shards` forces a rebuild, needed only when the
+  tile inventory has grown, since a newly-added tile falls inside an
+  existing shard. `--skip-existing-shards` is still accepted as a no-op.
+  (@avsm)
+- **Ctrl-C during a fill exits cleanly** with status 130 instead of two
+  tracebacks. The process pool was shut down with `wait=True`, so an
+  interrupt blocked until every in-flight shard finished — with
+  multi-gigabyte workers that looks like a hang and invites a second
+  Ctrl-C. (@avsm)
 - **`zarr-fill` warns when the worker count will not fit in RAM**: each
   worker holds a ~2.1 GiB shard buffer, so `--workers 16` needs 33 GiB and
   an OOM kill leaves no traceback to diagnose. (@avsm)

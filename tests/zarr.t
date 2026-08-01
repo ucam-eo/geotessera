@@ -53,11 +53,16 @@ A dead sibling job's lock can be taken over explicitly:
 Test: resume from the store itself
 -----------------------------------
 
-Shard objects outlive the bookkeeping, so a killed run can be recovered by
-scanning for them:
+Shard objects outlive the bookkeeping, so a fill scans for them and skips
+what is already there. Rebuilding is the opt-in:
 
-  $ geotessera-registry zarr-fill --help | grep -o '\-\-skip-existing-shards' | sort -u
-  --skip-existing-shards
+  $ geotessera-registry zarr-fill --help | grep -o '\-\-rewrite-existing-shards' | sort -u
+  --rewrite-existing-shards
+
+The old flag stays accepted so existing scripts keep working:
+
+  $ geotessera-registry zarr-fill --help | grep -c 'now the default'
+  1
 
 Test: zarr-scan reports outstanding work
 -----------------------------------------

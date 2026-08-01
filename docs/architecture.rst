@@ -1230,17 +1230,20 @@ The ingestion registry is written when a (zone, year) finishes, so a run
 that dies partway — an OOM kill leaves no traceback — loses that year's
 bookkeeping even though the shards it wrote are safely in the store.
 
-The shard objects are the ground truth, and they survive anything::
+The shard objects are the ground truth and they survive anything, so a fill
+scans for them before doing any work and skips what is already there. That
+is the default: re-running an interrupted fill uploads only what is missing.
+
+A shard is always written from every tile covering it, so its presence means
+it is complete. The exception is a tile inventory that has grown since —
+a newly-added tile falls inside an existing shard, which would then be
+skipped rather than merged in. Force those shards to be rebuilt with::
 
     geotessera-registry zarr-fill <source> <store> --zones 30 \
-        --skip-existing-shards
+        --rewrite-existing-shards
 
-This lists the shard objects already present for each (zone, year), skips
-them, and records their tiles so subsequent runs need no flag. It assumes
-the tile inventory has not grown since those shards were written: a tile
-added to the manifest afterwards falls inside an existing shard and would
-be skipped rather than merged in. Where the credentials cannot list the
-store, it falls back to probing only the shards the run would touch.
+Where the credentials cannot list the store, the scan falls back to probing
+only the shards the run would touch.
 
 To see what is outstanding before committing to a sweep, point ``zarr-scan``
 at the store on its own::
