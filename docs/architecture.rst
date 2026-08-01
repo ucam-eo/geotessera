@@ -1257,7 +1257,7 @@ per-shard index as parquet.
 No tile mirror or manifest is needed: the land denominator comes from the
 landmask registry (~19 MB, fetched and cached), which is all that decides
 whether a shard can ever hold data. Supplying a tile mirror as an optional
-second argument switches the denominator to each year's actual embedding
+first argument switches the denominator to each year's actual embedding
 coverage from the manifest (~200 MB) — worth it only where a year covers
 less than the full land area.
 

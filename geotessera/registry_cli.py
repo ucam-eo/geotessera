@@ -3649,6 +3649,26 @@ def _resolve_source(args, console: "Console"):
 
     base_dir = args.base_dir
 
+    # A Zarr store passed where the tile source belongs otherwise fails much
+    # later, looking for a manifest inside the store and often with the wrong
+    # credentials. Say what happened instead.
+    from .remote import exists as _loc_exists
+
+    try:
+        looks_like_store = _loc_exists(
+            join(base_dir, "zarr.json"),
+            _storage_options_for(args, "source", base_dir),
+            on_denied=False,
+        )
+    except Exception:
+        looks_like_store = False
+    if looks_like_store:
+        raise ValueError(
+            f"{base_dir} looks like a Zarr store, not a tile source — it has "
+            f"a zarr.json. The tile source comes first and the store second: "
+            f"<source> <store>."
+        )
+
     def override(loc, name, optional=False):
         """Resolve an explicit --manifest-url / --landmasks-url, if given."""
         if not loc:
@@ -3738,7 +3758,13 @@ def zarr_init_command(args):
 
     console = Console()
 
-    registry, _source, _version, _variant = _resolve_source(args, console)
+    try:
+        registry, _source, _version, _variant = _resolve_source(args, console)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     years = _parse_int_range(args.years)
     output = args.output
@@ -3789,7 +3815,13 @@ def zarr_fill_command(args):
 
     console = Console()
 
-    registry, source, _version, _variant = _resolve_source(args, console)
+    try:
+        registry, source, _version, _variant = _resolve_source(args, console)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     store_path = args.store_path
     store_options = _storage_options_for(args, "store", store_path)
@@ -3841,7 +3873,15 @@ def zarr_scan_command(args):
     # The manifest is optional: land coverage alone says which shards can
     # ever hold data, and that comes from the much smaller landmask registry.
     if args.base_dir:
-        registry, source, dataset_version, _variant = _resolve_source(args, console)
+        try:
+            registry, source, dataset_version, _variant = _resolve_source(
+                args, console
+            )
+        except ValueError as e:
+            console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+            return 1
+        except (ImportError, *_object_store_errors()) as e:
+            return _report_store_error(e, console)
     else:
         registry, source = None, None
         dataset_version = args.dataset_version or "v1"
@@ -4895,11 +4935,10 @@ Directory Structure:
         "bounding box. Prints per-zone/year and per-year summaries and can "
         "write the full index as parquet.",
     )
-    zarr_scan_parser.add_argument(
-        "store_path",
-        type=str,
-        help="Path or URL of an existing tessera store",
-    )
+    # Same positional order as zarr-init/zarr-fill — source first, store
+    # second — with the source optional. argparse binds a lone argument to
+    # store_path, so `zarr-scan <store>` and `zarr-scan <mirror> <store>`
+    # both do the obvious thing.
     zarr_scan_parser.add_argument(
         "base_dir",
         nargs="?",
@@ -4908,6 +4947,11 @@ Directory Structure:
         "coverage comes from the landmask registry, which is all that is "
         "needed and far smaller than the manifest. Give it to measure "
         "against each year's actual embedding coverage instead.",
+    )
+    zarr_scan_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of an existing tessera store",
     )
     zarr_scan_parser.add_argument(
         "--years",

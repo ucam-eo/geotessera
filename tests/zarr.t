@@ -80,8 +80,8 @@ landmask registry for its land denominator:
   $ geotessera-registry zarr-scan --help | grep -c 'Optional tile mirror'
   1
 
-  $ geotessera-registry zarr-scan --help | grep -oE 'store_path \[base_dir\]'
-  store_path [base_dir]
+  $ geotessera-registry zarr-scan --help | grep -oE '\[base_dir\] store_path'
+  [base_dir] store_path
 
 Test: zarr-extend grows the time axis
 --------------------------------------
