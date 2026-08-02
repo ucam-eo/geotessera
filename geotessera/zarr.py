@@ -1434,7 +1434,13 @@ def _create_zone_group(
     # Per-zone stretch statistics, populated by zarr-fill (see
     # docs/specs/zarr-stretch-stats.md). Plain arrays: zone groups carry no
     # geoemb: attributes.
-    create_stretch_arrays(store, T, stretch_sample_size)
+    create_stretch_arrays(
+        store,
+        T,
+        stretch_sample_size,
+        math.ceil(H / SHARD_SIZE),
+        math.ceil(W / SHARD_SIZE),
+    )
 
     # Use geozarr-toolkit for proj: and spatial: convention metadata
     from geozarr_toolkit import create_geozarr_attrs
@@ -1495,15 +1501,27 @@ STRETCH_ARRAY_NAMES = (
     "stretch_sample",
     "stretch_sample_scales",
     "stretch_sample_count",
+    "stretch_stats_shards",
 )
 
 
-def create_stretch_arrays(group: "zarr.Group", n_years: int, k: int) -> None:
+def create_stretch_arrays(
+    group: "zarr.Group",
+    n_years: int,
+    k: int,
+    n_shard_rows: int,
+    n_shard_cols: int,
+) -> None:
     """Create the per-zone stretch-statistics arrays in *group*.
 
     One chunk per year on the time axis, so a (zone, year) update touches
     exactly one chunk per array and ``zarr-extend`` grows them the same way
     it grows ``embeddings``.
+
+    ``stretch_stats_shards`` is the coverage mask: 1 where a shard's pixels
+    are folded into the sums. It is what lets a fill know, from its normal
+    store scan, which existing shards the statistics have not yet seen — so
+    catch-up is automatic and no separate backfill pass is needed.
     """
     from zarr.codecs import BloscCodec
 
@@ -1523,6 +1541,9 @@ def create_stretch_arrays(group: "zarr.Group", n_years: int, k: int) -> None:
         ("stretch_sample_scales", (T, k), (1, k), np.float32,
          np.float32("inf"), ["time", "sample"]),
         ("stretch_sample_count", (T,), (1,), np.int64, 0, ["time"]),
+        ("stretch_stats_shards", (T, n_shard_rows, n_shard_cols),
+         (1, n_shard_rows, n_shard_cols), np.uint8, np.uint8(0),
+         ["time", "shard_row", "shard_col"]),
     ]
     for name, shape, chunks, dtype, fill, dims in specs:
         group.create_array(
@@ -1533,6 +1554,81 @@ def create_stretch_arrays(group: "zarr.Group", n_years: int, k: int) -> None:
             fill_value=fill,
             compressors=comp,
             dimension_names=dims,
+        )
+
+
+def ensure_stretch_arrays(
+    group: "zarr.Group",
+    console: Optional["rich.console.Console"] = None,
+    sample_k: int = STRETCH_SAMPLE_K,
+) -> None:
+    """Create any missing stretch arrays on an existing zone group.
+
+    Called by the fill, so stores initialised before the feature (or before
+    the coverage mask) heal themselves on their next fill. If the coverage
+    mask is missing but the sums are non-zero, the sums' provenance is
+    unknowable — they were collected without shard tracking — so they are
+    reset and the fill's automatic catch-up recomputes them from the store.
+    """
+    absent = [a for a in STRETCH_ARRAY_NAMES if a not in group]
+    if not absent:
+        return
+
+    T = group["time"].shape[0]
+    H, W = group["embeddings"].shape[2], group["embeddings"].shape[3]
+    n_sr, n_sc = math.ceil(H / SHARD_SIZE), math.ceil(W / SHARD_SIZE)
+    k = (
+        group["stretch_sample"].shape[1]
+        if "stretch_sample" in group
+        else sample_k
+    )
+
+    had_untracked_sums = (
+        "stretch_stats_shards" in absent
+        and "stretch_stats_count" in group
+        and int(np.asarray(group["stretch_stats_count"][:]).sum()) > 0
+    )
+
+    from zarr.codecs import BloscCodec
+
+    comp = BloscCodec(cname="zstd", clevel=3)
+    all_specs = {
+        "stretch_stats_count": ((T,), (1,), np.int64, 0, ["time"]),
+        "stretch_stats_sum": ((T, N_BANDS), (1, N_BANDS), np.float64, 0.0,
+                              ["time", "band"]),
+        "stretch_stats_prod": ((T, N_BANDS, N_BANDS), (1, N_BANDS, N_BANDS),
+                               np.float64, 0.0, ["time", "band", "band2"]),
+        "stretch_sample": ((T, k, N_BANDS), (1, k, N_BANDS), np.int8,
+                           np.int8(0), ["time", "sample", "band"]),
+        "stretch_sample_scales": ((T, k), (1, k), np.float32,
+                                  np.float32("inf"), ["time", "sample"]),
+        "stretch_sample_count": ((T,), (1,), np.int64, 0, ["time"]),
+        "stretch_stats_shards": ((T, n_sr, n_sc), (1, n_sr, n_sc), np.uint8,
+                                 np.uint8(0), ["time", "shard_row",
+                                               "shard_col"]),
+    }
+    for name in absent:
+        shape, chunks, dtype, fill, dims = all_specs[name]
+        group.create_array(
+            name, shape=shape, chunks=chunks, dtype=dtype, fill_value=fill,
+            compressors=comp, dimension_names=dims,
+        )
+
+    if had_untracked_sums:
+        for t in range(T):
+            group["stretch_stats_count"][t] = 0
+            group["stretch_stats_sum"][t] = np.zeros(N_BANDS)
+            group["stretch_stats_prod"][t] = np.zeros((N_BANDS, N_BANDS))
+            group["stretch_sample_count"][t] = 0
+        if console:
+            console.print(
+                "    [yellow]Existing stretch sums predate shard tracking; "
+                "reset — the fill recomputes them from the store as it "
+                "goes.[/yellow]"
+            )
+    if console:
+        console.print(
+            f"    [dim]Created stretch array(s): {', '.join(absent)}[/dim]"
         )
 
 
@@ -1647,15 +1743,17 @@ def update_zone_stretch_stats(
     s: np.ndarray,
     m: np.ndarray,
     sample_candidates: List[Tuple[np.ndarray, np.ndarray, float]],
+    seen_coords: Optional[List[Tuple[int, int]]] = None,
     seed: Optional[int] = None,
 ) -> None:
-    """Fold one fill run's statistics into a zone's arrays (read-modify-write).
+    """Fold one run's statistics into a zone's arrays (read-modify-write).
 
     The additive triple is summed onto what is stored; the sample is re-drawn
     from the stored sample and the new candidates together, weighted so the
     result still approximates a uniform draw over all pixels either has seen.
-    Caller must hold the (zone, year) fill lock — this is the same
-    single-writer context the shard writes ran under.
+    ``seen_coords`` marks those shards in the coverage mask — written after
+    the sums, so a crash in between re-folds rather than silently drops.
+    One fill per (zone, year) at a time remains the operating contract.
     """
     t = time_index
     count_arr = zone_group["stretch_stats_count"]
@@ -1686,7 +1784,13 @@ def update_zone_stretch_stats(
     if filled:
         zone_group["stretch_sample"][t, :filled] = emb
         zone_group["stretch_sample_scales"][t, :filled] = scales
-    zone_group["stretch_sample_count"][t] = filled
+        zone_group["stretch_sample_count"][t] = filled
+
+    if seen_coords:
+        mask = np.asarray(zone_group["stretch_stats_shards"][t])
+        for sr, sc in seen_coords:
+            mask[sr, sc] = 1
+        zone_group["stretch_stats_shards"][t] = mask
 
 
 # ---------------------------------------------------------------------------
@@ -1893,11 +1997,16 @@ def merge_tile_registry(
             frames.append(part)
 
     if not frames:
-        merged = _empty_tile_registry()
-    else:
-        merged = gpd.GeoDataFrame(
-            pd.concat(frames, ignore_index=True), crs="EPSG:4326"
-        ).drop_duplicates(subset=["year", "zone", "tile_lon", "tile_lat"], keep="last")
+        # Lock-free fills keep no ingestion registry, so a store built
+        # entirely by them has nothing here — do not conjure a state dir
+        # just to hold an empty parquet.
+        if console:
+            console.print("  No legacy ingestion registry to merge")
+        return 0
+
+    merged = gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True), crs="EPSG:4326"
+    ).drop_duplicates(subset=["year", "zone", "tile_lon", "tile_lat"], keep="last")
 
     _write_parquet_at(state, merged, MERGED_REGISTRY_NAME)
 
@@ -1910,60 +2019,6 @@ def merge_tile_registry(
 
 
 # ---------------------------------------------------------------------------
-# Advisory zone locks
-# ---------------------------------------------------------------------------
-# Two processes filling the same (zone, year) would each rewrite whole shards
-# from their own tile subset and silently erase each other's pixels. Object
-# stores give us no atomic create, so this is advisory only — it catches the
-# common accident (the same zone launched twice) rather than enforcing
-# mutual exclusion.
-
-LOCK_DIR_NAME = "_locks"
-
-
-def _lock_name(zone: int, year: int) -> str:
-    return f"{_zone_group_name(zone)}_{year}.json"
-
-
-def _acquire_zone_lock(
-    store: StoreLocation, zone: int, year: int, force: bool = False
-) -> None:
-    """Claim (zone, year) for this process, or raise if someone else holds it."""
-    import json
-    import socket
-    import pandas as pd
-
-    state = store.state
-    name = _lock_name(zone, year)
-    if not force and state.exists(LOCK_DIR_NAME, name, on_denied=False):
-        try:
-            held = json.loads(state.read_bytes(LOCK_DIR_NAME, name))
-        except Exception:
-            held = {}
-        raise RuntimeError(
-            f"Zone {zone} year {year} is locked by "
-            f"{held.get('host', '?')}:{held.get('pid', '?')} "
-            f"since {held.get('acquired_at', 'unknown time')}. "
-            f"Another fill is in progress, or a previous one died. "
-            f"Re-run with --force-lock to take it over."
-        )
-
-    payload = {
-        "zone": zone,
-        "year": year,
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "acquired_at": pd.Timestamp.now(tz="UTC").isoformat(),
-    }
-    state.write_bytes(json.dumps(payload).encode(), LOCK_DIR_NAME, name)
-
-
-def _release_zone_lock(store: StoreLocation, zone: int, year: int) -> None:
-    """Drop this process's claim on (zone, year)."""
-    store.state.remove(LOCK_DIR_NAME, _lock_name(zone, year))
-
-
-# ---------------------------------------------------------------------------
 # Shard writing (NCHW layout)
 # ---------------------------------------------------------------------------
 
@@ -1971,6 +2026,7 @@ _worker_store = None
 _worker_source_options: Optional[Dict[str, Any]] = None
 _worker_spill_dir: Optional[str] = None
 _worker_sample_cap: int = 0  # 0 = stats collection off
+_worker_time_index: int = 0
 
 
 def _init_shard_worker(
@@ -1980,6 +2036,7 @@ def _init_shard_worker(
     source_options: Optional[Dict[str, Any]] = None,
     spill_dir: Optional[str] = None,
     sample_cap: int = 0,
+    time_index: int = 0,
 ) -> None:
     """Process pool initializer: open the zone group once per worker.
 
@@ -1987,7 +2044,7 @@ def _init_shard_worker(
     own filesystem connections rather than inheriting an unforkable client.
     """
     global _worker_store, _worker_source_options, _worker_spill_dir
-    global _worker_sample_cap
+    global _worker_sample_cap, _worker_time_index
 
     from . import remote
 
@@ -2001,6 +2058,7 @@ def _init_shard_worker(
     _worker_source_options = source_options
     _worker_spill_dir = spill_dir
     _worker_sample_cap = sample_cap
+    _worker_time_index = time_index
 
 
 def _write_one_shard(
@@ -2132,8 +2190,10 @@ def _fill_and_write_shard(
 
     if sample_cap > 0:
         stats = shard_stretch_stats(emb_buf, scales_buf, sample_cap)
-        if stats is not None:
-            return stats
+        if stats is None:
+            stats = _empty_shard_stats()
+        stats["coord"] = (spec.sr, spec.sc)
+        return stats
     return True
 
 
@@ -2146,6 +2206,47 @@ def _write_one_shard_worker(spec: ShardSpec) -> "bool | Dict[str, Any]":
         _worker_spill_dir,
         _worker_sample_cap,
     )
+
+
+def _empty_shard_stats() -> Dict[str, Any]:
+    """Zero-contribution statistics for a shard with no valid pixels.
+
+    Folding zeros is harmless, and returning them (rather than nothing)
+    lets the parent mark the shard seen so it is never re-read.
+    """
+    return {
+        "n": 0,
+        "sum": np.zeros(N_BANDS, dtype=np.float64),
+        "prod": np.zeros((N_BANDS, N_BANDS), dtype=np.float64),
+        "sample_emb": np.zeros((0, N_BANDS), dtype=np.int8),
+        "sample_scales": np.zeros(0, dtype=np.float32),
+        "sample_weight": 1.0,
+    }
+
+
+def _stats_catchup_worker(coord: Tuple[int, int]) -> Dict[str, Any]:
+    """Compute stretch statistics for a shard already in the store.
+
+    The catch-up half of automatic collection: reads the shard back from the
+    zone arrays (one full-shard read — the price of a shard written before
+    its statistics were) and returns the same result shape as a write task.
+    """
+    sr, sc = coord
+    emb_arr = _worker_store["embeddings"]
+    H, W = emb_arr.shape[2], emb_arr.shape[3]
+    r0, c0 = sr * SHARD_SIZE, sc * SHARD_SIZE
+    r1, c1 = min(r0 + SHARD_SIZE, H), min(c0 + SHARD_SIZE, W)
+    t = _worker_time_index
+
+    stats = shard_stretch_stats(
+        np.asarray(emb_arr[t, :, r0:r1, c0:c1]),
+        np.asarray(_worker_store["scales"][t, r0:r1, c0:c1]),
+        max(_worker_sample_cap, 1),
+    )
+    if stats is None:
+        stats = _empty_shard_stats()
+    stats["coord"] = coord
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -2276,8 +2377,6 @@ def extend_store(
     storage_options: Optional[Dict[str, Any]] = None,
     zones: Optional[List[int]] = None,
     consolidate: bool = True,
-    force: bool = False,
-    state_url: Optional[str] = None,
 ) -> int:
     """Append new years to an existing store's time axis.
 
@@ -2295,19 +2394,10 @@ def extend_store(
     zone, so no fill may be in flight. Returns the number of zone groups
     extended.
     """
-    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    store = StoreLocation.resolve(store_path, storage_options)
     years = sorted(set(int(y) for y in years))
     if not years:
         raise ValueError("No years given to add")
-
-    held = [Path(p).name for p in store.state.listdir(LOCK_DIR_NAME, on_denied=[])]
-    if held and not force:
-        raise RuntimeError(
-            f"{len(held)} fill lock(s) present ({', '.join(sorted(held)[:4])}"
-            f"{'...' if len(held) > 4 else ''}). Extending rewrites array "
-            f"metadata for every zone, so wait for the sweep to finish. "
-            f"Use --force if these are stale."
-        )
 
     zone_names = _zone_group_names(store, zones)
     if not zone_names:
@@ -2663,8 +2753,6 @@ def fill_store(
     storage_options: Optional[Dict[str, Any]] = None,
     source: Optional[TileSource] = None,
     consolidate: Optional[bool] = None,
-    force_lock: bool = False,
-    state_url: Optional[str] = None,
     skip_existing_shards: bool = True,
     spill_dir: Optional[str] = None,
     collect_stretch_stats: bool = True,
@@ -2685,7 +2773,6 @@ def fill_store(
             Defaults to True for a whole-store fill and False when ``zones``
             is set, because the root object is the one thing parallel zone
             jobs share — run ``zarr-consolidate`` once after the sweep.
-        force_lock: Take over a (zone, year) lock held by another process.
         skip_existing_shards: Scan for shards already in the store and skip
             them (the default). A shard is always written from every tile
             covering it, so its presence means it is complete, and the
@@ -2696,7 +2783,7 @@ def fill_store(
             falls inside an existing shard and would otherwise be skipped
             rather than merged in.
     """
-    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    store = StoreLocation.resolve(store_path, storage_options)
     if workers is None:
         workers = DEFAULT_WORKERS
     if consolidate is None:
@@ -2718,10 +2805,6 @@ def fill_store(
 
     total_shards_written = 0
     total_shards_failed = 0
-
-    # The merged registry spans the whole store, so fetch it once rather
-    # than per zone and year.
-    merged_registry = load_merged_registry(store)
 
     for fill_year in fill_years:
         if fill_year not in all_years:
@@ -2755,26 +2838,6 @@ def fill_store(
                     )
                 continue
 
-            # Check which tiles are already written
-            written = _get_written_tiles(
-                store, fill_year, zone_num, merged=merged_registry
-            )
-            remaining = [ti for ti in tile_infos if (ti.lon, ti.lat) not in written]
-
-            if not remaining:
-                if console:
-                    console.print(
-                        f"  Zone {zone_num} year {fill_year}: "
-                        f"all {len(tile_infos)} tiles already written"
-                    )
-                continue
-
-            if console:
-                console.print(
-                    f"  Zone {zone_num} year {fill_year}: "
-                    f"{len(remaining)}/{len(tile_infos)} tiles to write"
-                )
-
             # Resolve the time index against *this* zone's own axis. An
             # interrupted zarr-extend can leave zones with different lengths,
             # and a store-wide index would then address the wrong year.
@@ -2803,18 +2866,17 @@ def fill_store(
                 height_px=shape[0],
             )
 
-            # A shard write replaces the whole shard, so every shard we touch
-            # must be rebuilt from all of its tiles — including ones an
-            # earlier run already wrote, which would otherwise be zeroed.
-            touched = shard_coords_for_tiles(remaining, grid)
-            shard_specs = build_shard_index(
-                tile_infos, grid, time_index, restrict_to=touched
-            )
+            # Every shard the manifest implies, rebuilt from all of its
+            # tiles. A shard write replaces the whole shard, so a spec always
+            # carries every overlapping tile — never a delta.
+            shard_specs = build_shard_index(tile_infos, grid, time_index)
+            n_land = len(shard_specs)
 
-            # The shard objects in the store are the ground truth for what
-            # landed — unlike the ingestion registry they survive a kill -9,
-            # so a crashed run can be resumed by scanning for them.
-            skipped_specs: List[ShardSpec] = []
+            # The store is the only state: shard objects that exist are done.
+            # No registry, no locks — a spot instance that dies mid-run left
+            # nothing that needs cleaning up, and the next run's scan resumes
+            # exactly where the objects stop.
+            present: set = set()
             if skip_existing_shards:
                 present = _existing_shards(
                     store,
@@ -2823,106 +2885,97 @@ def fill_store(
                     {(s.sr, s.sc) for s in shard_specs},
                     console=console,
                 )
-                if present:
-                    skipped_specs = [
-                        s for s in shard_specs if (s.sr, s.sc) in present
-                    ]
-                    shard_specs = [
-                        s for s in shard_specs if (s.sr, s.sc) not in present
-                    ]
+                shard_specs = [
+                    s for s in shard_specs if (s.sr, s.sc) not in present
+                ]
+
+            # Stretch statistics. The coverage mask says which store shards
+            # are already folded into the sums; anything present but unseen
+            # is a catch-up read. That makes stats collection idempotent and
+            # crash-safe by the same scan that drives the fill itself:
+            # a crash between shard write and stats fold just leaves the
+            # shard present-but-unseen, and the next run reads it back.
+            sample_cap = 0
+            catch_up: List[Tuple[int, int]] = []
+            if collect_stretch_stats:
+                zone_rw = store.open_group(mode="r+", path=zone_group)
+                ensure_stretch_arrays(zone_rw, console=console)
+                seen = {
+                    (int(r), int(c))
+                    for r, c in zip(
+                        *np.nonzero(
+                            np.asarray(zone_rw["stretch_stats_shards"][time_index])
+                        )
+                    )
+                }
+                writing = {(s.sr, s.sc) for s in shard_specs}
+                catch_up = sorted(present - seen - writing)
+                k_slots = zone_rw["stretch_sample"].shape[1]
+                sample_cap = _shard_sample_cap(
+                    k_slots, len(shard_specs) + len(catch_up)
+                )
 
             if console:
-                # Spell the arithmetic out. The count of shards to write is
-                # otherwise hard to reconcile with zarr-scan, which counts
-                # every land shard, whereas a fill only considers those
-                # covering tiles the registry has not already recorded.
-                n_land = len(shard_coords_for_tiles(tile_infos, grid))
-                n_recorded = n_land - len(touched)
                 console.print(
                     f"    Shards: {n_land:,} land, "
-                    f"{n_recorded:,} recorded done, "
-                    f"{len(skipped_specs):,} found in store, "
-                    f"[bold]{len(shard_specs):,} to write[/bold] "
-                    f"({workers} workers)"
-                )
-
-            # Stretch statistics: collect only when the zone has the arrays
-            # (stores initialised before the feature lack them; repair with
-            # --backfill-stretch-stats). Per-shard cap sized so the expected
-            # candidate pool is a few times K without ballooning the result
-            # queue.
-            sample_cap = 0
-            if collect_stretch_stats and "stretch_sample" in zone_store:
-                k_slots = zone_store["stretch_sample"].shape[1]
-                sample_cap = _shard_sample_cap(k_slots, len(shard_specs))
-            elif collect_stretch_stats and console:
-                console.print(
-                    f"    [yellow]Zone {zone_num} has no stretch-statistics "
-                    f"arrays (store predates them); skipping collection. "
-                    f"Backfill later with --backfill-stretch-stats.[/yellow]"
-                )
-
-            _acquire_zone_lock(store, zone_num, fill_year, force=force_lock)
-            try:
-                written_count, failed, shard_stats = _write_shards(
-                    store=store,
-                    zone_group=zone_group,
-                    shard_specs=shard_specs,
-                    workers=workers,
-                    source_options=source.storage_options if source else None,
-                    label=f"    Zone {zone_num} y{fill_year}",
-                    console=console,
-                    spill_dir=spill_dir,
-                    sample_cap=sample_cap,
-                )
-
-                total_shards_written += written_count
-                total_shards_failed += len(failed)
-
-                if shard_stats:
-                    zone_rw = store.open_group(mode="r+", path=zone_group)
-                    update_zone_stretch_stats(
-                        zone_rw,
-                        time_index,
-                        n=sum(st["n"] for st in shard_stats),
-                        s=sum(st["sum"] for st in shard_stats),
-                        m=sum(st["prod"] for st in shard_stats),
-                        sample_candidates=[
-                            (st["sample_emb"], st["sample_scales"], st["sample_weight"])
-                            for st in shard_stats
-                        ],
+                    f"{len(present):,} in store, "
+                    f"[bold]{len(shard_specs):,} to write[/bold]"
+                    + (
+                        f", {len(catch_up):,} stats catch-up read(s)"
+                        if catch_up
+                        else ""
                     )
-                    if console:
-                        console.print(
-                            f"    [dim]Stretch stats: "
-                            f"{sum(st['n'] for st in shard_stats):,} pixels "
-                            f"folded in[/dim]"
-                        )
+                    + f" ({workers} workers)"
+                )
 
+            written_count, failed, shard_stats = _write_shards(
+                store=store,
+                zone_group=zone_group,
+                shard_specs=shard_specs,
+                workers=workers,
+                source_options=source.storage_options if source else None,
+                label=f"    Zone {zone_num} y{fill_year}",
+                console=console,
+                spill_dir=spill_dir,
+                sample_cap=sample_cap,
+                stats_coords=catch_up,
+                time_index=time_index,
+            )
+
+            total_shards_written += written_count
+            total_shards_failed += len(failed)
+
+            if collect_stretch_stats and shard_stats:
+                # Sums before mask: a crash in between re-folds those shards
+                # next run (double count, drift-detectable and repairable)
+                # rather than silently dropping them.
+                update_zone_stretch_stats(
+                    zone_rw,
+                    time_index,
+                    n=sum(st["n"] for st in shard_stats),
+                    s=sum(st["sum"] for st in shard_stats),
+                    m=sum(st["prod"] for st in shard_stats),
+                    sample_candidates=[
+                        (st["sample_emb"], st["sample_scales"], st["sample_weight"])
+                        for st in shard_stats
+                        if st["n"] > 0
+                    ],
+                    seen_coords=[st["coord"] for st in shard_stats],
+                )
                 if console:
                     console.print(
-                        f"    [green]{written_count}/{len(shard_specs)} "
-                        f"shards written[/green]"
+                        f"    [dim]Stretch stats: "
+                        f"{sum(st['n'] for st in shard_stats):,} pixels "
+                        f"folded in[/dim]"
                     )
-                    if failed:
-                        console.print(
-                            f"    [red]{len(failed)} shard(s) failed[/red]"
-                        )
 
-                # Record tiles whose shards all landed — counting the ones we
-                # skipped as landed, since they are already in the store — so
-                # a retry picks up exactly the work still outstanding.
-                done = {(s.sr, s.sc) for s in skipped_specs} | (
-                    {(s.sr, s.sc) for s in shard_specs} - failed
+            if console:
+                console.print(
+                    f"    [green]{written_count}/{len(shard_specs)} "
+                    f"shards written[/green]"
                 )
-                recorded = [
-                    ti
-                    for ti in remaining
-                    if shard_coords_for_tiles([ti], grid) <= done
-                ]
-                _record_written_tiles(store, recorded, fill_year, zone_num)
-            finally:
-                _release_zone_lock(store, zone_num, fill_year)
+                if failed:
+                    console.print(f"    [red]{len(failed)} shard(s) failed[/red]")
 
     # A failed shard leaves its tiles unrecorded, so re-running finishes the
     # job. Surface it as an error rather than a quiet partial success — a
@@ -2959,11 +3012,18 @@ def _write_shards(
     console: Optional["rich.console.Console"],
     spill_dir: Optional[str] = None,
     sample_cap: int = 0,
+    stats_coords: Optional[List[Tuple[int, int]]] = None,
+    time_index: int = 0,
 ) -> Tuple[int, set, List[Dict[str, Any]]]:
-    """Run the shard writes through a process pool.
+    """Run shard writes — and stats catch-up reads — through a process pool.
 
-    Returns (shards written, set of (sr, sc) that failed, per-shard stretch
-    statistics — empty when collection is off or no shard had valid pixels).
+    ``stats_coords`` are shards already in the store whose statistics the
+    coverage mask has not seen; they are read back and folded alongside the
+    writes. A failed catch-up is only a warning (the mask stays unset, so
+    the next run retries it); a failed write is a hard error as before.
+
+    Returns (shards written, set of (sr, sc) writes that failed, per-shard
+    stretch statistics from both task kinds).
     """
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -2971,6 +3031,7 @@ def _write_shards(
     written_count = 0
     failed: set = set()
     stats_results: List[Dict[str, Any]] = []
+    stats_coords = stats_coords or []
     initargs = (
         store.url,
         zone_group,
@@ -2978,6 +3039,7 @@ def _write_shards(
         source_options,
         spill_dir,
         sample_cap,
+        time_index,
     )
 
     # "spawn", not the Linux default of "fork": a forked worker inherits the
@@ -2988,19 +3050,29 @@ def _write_shards(
     def _drain(pool, advance=None):
         nonlocal written_count
         futures = {
-            pool.submit(_write_one_shard_worker, spec): spec for spec in shard_specs
+            pool.submit(_write_one_shard_worker, spec): ("write", spec)
+            for spec in shard_specs
         }
+        futures.update(
+            {
+                pool.submit(_stats_catchup_worker, coord): ("stats", coord)
+                for coord in stats_coords
+            }
+        )
         for future in as_completed(futures):
-            spec = futures[future]
+            kind, item = futures[future]
             try:
                 result = future.result()
-                if result:
+                if kind == "write" and result:
                     written_count += 1
                 if isinstance(result, dict):
                     stats_results.append(result)
             except Exception as e:
-                logger.warning(f"Shard ({spec.sr},{spec.sc}) failed: {e}")
-                failed.add((spec.sr, spec.sc))
+                if kind == "write":
+                    logger.warning(f"Shard ({item.sr},{item.sc}) failed: {e}")
+                    failed.add((item.sr, item.sc))
+                else:
+                    logger.warning(f"Stats catch-up for shard {item} failed: {e}")
             if advance is not None:
                 advance()
 
@@ -3035,7 +3107,9 @@ def _write_shards(
                 TimeRemainingColumn(),
                 console=console,
             ) as progress:
-                task = progress.add_task(label, total=len(shard_specs))
+                task = progress.add_task(
+                label, total=len(shard_specs) + len(stats_coords)
+            )
                 _drain(pool, advance=lambda: progress.advance(task))
         else:
             _drain(pool)
@@ -3569,21 +3643,19 @@ def backfill_stretch_stats(
     sample_k: int = STRETCH_SAMPLE_K,
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
-    state_url: Optional[str] = None,
-    force_lock: bool = False,
 ) -> int:
     """Rebuild a zone's stretch statistics by scanning its existing shards.
 
-    The repair path for stores filled before fill-time collection existed,
-    for interrupted fills, and for suspected double-counting: it re-reads
-    the zone's shards once (the only stats path that touches embeddings) and
-    *sets* the arrays from what is actually in the store. Creates the arrays
-    if the zone predates them. Per-zone, so it composes with fills of other
-    zones; takes the same (zone, year) lock a fill would.
+    Normally unnecessary — fills create the arrays and catch up on unseen
+    shards automatically via the coverage mask. This is the explicit repair
+    for suspected double-counting (the drift check pointing here): it
+    re-reads the zone's shards once and *sets* the arrays and mask from what
+    is actually in the store, discarding the running sums. Do not run it
+    while a fill is writing the same zone.
 
     Returns the number of (zone, year) slots rebuilt.
     """
-    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    store = StoreLocation.resolve(store_path, storage_options)
     zone_names = _zone_group_names(store, zones)
     if not zone_names:
         raise ValueError(f"No UTM zone groups found in {store}")
@@ -3592,12 +3664,8 @@ def backfill_stretch_stats(
     for name in zone_names:
         group = store.open_group(mode="r+", path=name, zarr_format=3)
         zone_years = [int(v) for v in group["time"][:]]
-        T = len(zone_years)
 
-        if "stretch_sample" not in group:
-            create_stretch_arrays(group, T, sample_k)
-            if console:
-                console.print(f"  {name}: created stretch-statistics arrays")
+        ensure_stretch_arrays(group, console=console, sample_k=sample_k)
         k_slots = group["stretch_sample"].shape[1]
 
         emb_arr = group["embeddings"]
@@ -3618,56 +3686,55 @@ def backfill_stretch_stats(
                 continue
 
             cap = _shard_sample_cap(k_slots, len(present))
-            zone_num = int(name[3:])
-            _acquire_zone_lock(store, zone_num, fill_year, force=force_lock)
-            try:
-                n_total, s_total = 0, np.zeros(N_BANDS, dtype=np.float64)
-                m_total = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
-                candidates: List[Tuple[np.ndarray, np.ndarray, float]] = []
-                for i, (sr, sc) in enumerate(sorted(present)):
-                    r0, c0 = sr * SHARD_SIZE, sc * SHARD_SIZE
-                    r1, c1 = min(r0 + SHARD_SIZE, H), min(c0 + SHARD_SIZE, W)
-                    st = shard_stretch_stats(
-                        np.asarray(emb_arr[t, :, r0:r1, c0:c1]),
-                        np.asarray(scales_arr[t, r0:r1, c0:c1]),
-                        cap,
-                    )
-                    if st is None:
-                        continue
-                    n_total += st["n"]
-                    s_total += st["sum"]
-                    m_total += st["prod"]
-                    candidates.append(
-                        (st["sample_emb"], st["sample_scales"], st["sample_weight"])
-                    )
-                    if console:
-                        console.print(
-                            f"  {name} {fill_year}: shard {i + 1}/{len(present)} "
-                            f"({st['n']:,} px)",
-                            end="\r",
-                        )
-
-                emb_s, scales_s = merge_stretch_samples(candidates, k_slots)
-                # Backfill SETS from actual contents (it is the repair for
-                # double-counting), unlike the fill's additive fold.
-                group["stretch_stats_count"][t] = n_total
-                group["stretch_stats_sum"][t] = s_total
-                group["stretch_stats_prod"][t] = m_total
-                full_emb = np.zeros((k_slots, N_BANDS), dtype=np.int8)
-                full_sc = np.full(k_slots, np.float32("inf"), dtype=np.float32)
-                full_emb[: len(emb_s)] = emb_s
-                full_sc[: len(emb_s)] = scales_s
-                group["stretch_sample"][t] = full_emb
-                group["stretch_sample_scales"][t] = full_sc
-                group["stretch_sample_count"][t] = len(emb_s)
-                rebuilt += 1
+            n_total, s_total = 0, np.zeros(N_BANDS, dtype=np.float64)
+            m_total = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
+            candidates: List[Tuple[np.ndarray, np.ndarray, float]] = []
+            for i, (sr, sc) in enumerate(sorted(present)):
+                r0, c0 = sr * SHARD_SIZE, sc * SHARD_SIZE
+                r1, c1 = min(r0 + SHARD_SIZE, H), min(c0 + SHARD_SIZE, W)
+                st = shard_stretch_stats(
+                    np.asarray(emb_arr[t, :, r0:r1, c0:c1]),
+                    np.asarray(scales_arr[t, r0:r1, c0:c1]),
+                    cap,
+                )
+                if st is None:
+                    continue
+                n_total += st["n"]
+                s_total += st["sum"]
+                m_total += st["prod"]
+                candidates.append(
+                    (st["sample_emb"], st["sample_scales"], st["sample_weight"])
+                )
                 if console:
                     console.print(
-                        f"  {name} {fill_year}: rebuilt from "
-                        f"{len(present)} shard(s), {n_total:,} pixels      "
+                        f"  {name} {fill_year}: shard {i + 1}/{len(present)} "
+                        f"({st['n']:,} px)",
+                        end="\r",
                     )
-            finally:
-                _release_zone_lock(store, zone_num, fill_year)
+
+            emb_s, scales_s = merge_stretch_samples(candidates, k_slots)
+            # Backfill SETS from actual contents (it is the repair for
+            # double-counting), unlike the fill's additive fold.
+            group["stretch_stats_count"][t] = n_total
+            group["stretch_stats_sum"][t] = s_total
+            group["stretch_stats_prod"][t] = m_total
+            full_emb = np.zeros((k_slots, N_BANDS), dtype=np.int8)
+            full_sc = np.full(k_slots, np.float32("inf"), dtype=np.float32)
+            full_emb[: len(emb_s)] = emb_s
+            full_sc[: len(emb_s)] = scales_s
+            group["stretch_sample"][t] = full_emb
+            group["stretch_sample_scales"][t] = full_sc
+            group["stretch_sample_count"][t] = len(emb_s)
+            mask = np.zeros(group["stretch_stats_shards"].shape[1:], np.uint8)
+            for sr, sc in present:
+                mask[sr, sc] = 1
+            group["stretch_stats_shards"][t] = mask
+            rebuilt += 1
+            if console:
+                console.print(
+                    f"  {name} {fill_year}: rebuilt from "
+                    f"{len(present)} shard(s), {n_total:,} pixels      "
+                )
 
     return rebuilt
 

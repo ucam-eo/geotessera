@@ -52,6 +52,19 @@
   tile inventory has grown, since a newly-added tile falls inside an
   existing shard. `--skip-existing-shards` is still accepted as a no-op.
   (@avsm)
+- **Fills are stateless and stretch statistics collect themselves.** The
+  ingestion registry and advisory locks are gone from `zarr-fill`: the
+  store's shard objects are the only record of progress, so a preemptible
+  (spot) instance that dies mid-run leaves nothing to clean up or take
+  over — relaunching the same command scans and continues. A per-zone
+  coverage mask (`stretch_stats_shards`) records which shards are folded
+  into the stretch sums; the fill diffs it against the same scan and reads
+  back any shard whose statistics are missing, so interrupted runs and
+  stores from older builds converge automatically — no separate backfill
+  step, which now exists only as the explicit repair for suspected
+  double-counting. `--state-url` and `--force-lock` are accepted as no-ops
+  for existing scripts; `zarr-consolidate` still reads `--state-url` to
+  merge registries written by older builds. (@avsm)
 - **Per-zone stretch statistics, collected at fill time** (see
   `docs/specs/zarr-stretch-stats.md`): each zone group gains six arrays —
   exact mean/covariance sufficient statistics per (zone, year), additive

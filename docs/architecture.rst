@@ -1120,8 +1120,8 @@ CLI's ``--acl``::
 
     --store-profile sc-writer --store-acl bucket-owner-full-control
 
-It applies to the store's Zarr chunks and metadata as well as the sidecar
-parquet and lock objects, and is filtered out of read requests.
+It applies to every object written to the store and is filtered out of
+read requests.
 
 .. note::
 
@@ -1181,7 +1181,7 @@ Two constraints:
   renumber every existing chunk's time index, i.e. rewrite the store. It is
   refused rather than done silently.
 * **Single writer.** Unlike a fill, this rewrites array metadata for every
-  zone, so it refuses to run while any fill lock is held, and it *does*
+  zone — do not run it while fills are in flight — and it *does*
   re-consolidate afterwards (readers cannot see the new year until it has).
 
 .. _zarr-parallel-sweep:
@@ -1193,51 +1193,54 @@ A UTM zone's pixels live entirely within its own ``utm{zone}`` group, and
 shards never straddle zones. That makes ``--zones N`` the natural unit of
 parallelism: one process per zone, all writing to the same store.
 
-Everything a fill mutates is keyed by ``(zone, year)``, and none of it lives
-inside the store — build bookkeeping goes to a sibling location so the
-published hierarchy contains only Zarr:
+Fills are **stateless**: the store's own shard objects are the only record
+of progress, so there is no registry to update, no lock to hold, and no
+build directory at all. A zone job on a preemptible (spot) instance that
+dies mid-run leaves nothing to clean up — relaunching the same command
+scans the store and continues from wherever the objects stop:
 
 .. code-block:: text
 
     tessera.zarr/
         zarr.json                              # shared — consolidation only
-        utm30/, utm31/, ...                    # one zone per process
+        utm30/, utm31/, ...                    # one zone per process; each
+                                               # holds its own stretch_* stats
 
-    tessera.zarr.build/                        # --state-url to relocate
-        _registry/utm30_2024.parquet           # per-zone ingestion tracking
-        _registry.parquet                      # merged view, written by consolidate
-        _locks/utm30_2024.json                 # advisory fill lock
-
-* **Ingestion tracking** is one object per zone/year, so no two jobs
-  read-modify-write the same file. It records which tiles have already been
-  written, which is what makes a fill resumable and lets a later run pick up
-  tiles the manifest has gained since. It is build state, not published
-  data — a reader of the store never needs it — so it lives in the state
-  sibling. Stores built before this split kept a ``_registry.parquet``
-  inside the hierarchy; that is still read, so they resume correctly.
-* **An advisory lock** is taken for the duration of a zone/year fill. It
-  catches the same zone being launched twice — the case that would silently
-  corrupt data, because a shard write replaces the whole shard. Object
-  stores offer no atomic create, so the lock is advisory; ``--force-lock``
-  takes over one left behind by a dead run.
+* **Resume is the scan**: a shard is always written from every tile
+  covering it, so its presence in the store is proof of completion; the
+  fill lists what exists and writes only what is missing.
+* **Stretch statistics are self-catching-up**: each zone's coverage mask
+  records which shards are folded into its statistics, so the same scan
+  also finds shards whose stats are missing (a crash between write and
+  fold, or shards written by older builds) and reads them back. Statistics
+  converge without any separate backfill step.
+* **One fill per (zone, year) at a time remains the operating contract**,
+  but it is no longer enforced by locks: two identical concurrent fills
+  write identical shards (wasted work, not corruption), and a stats
+  double-fold is caught by the drift check and repaired by
+  ``--backfill-stretch-stats``. ``--force-lock`` is accepted as a no-op
+  for older scripts.
 * **Consolidation is skipped** by default when ``--zones`` is given, since
   the root ``zarr.json`` is the one object all jobs share.
+* ``--state-url`` is legacy: only ``zarr-consolidate`` still reads it, to
+  merge ingestion registries written by pre-stateless builds.
 
 Resuming After a Crash
 ~~~~~~~~~~~~~~~~~~~~~~
 
-The ingestion registry is written when a (zone, year) finishes, so a run
-that dies partway — an OOM kill leaves no traceback — loses that year's
-bookkeeping even though the shards it wrote are safely in the store.
+There is nothing to resume *from* except the store itself, which is the
+point: a fill keeps no state of its own, so a run killed at any moment —
+including a spot-instance preemption — is continued by running the same
+command again. The scan finds the shard objects that landed and writes the
+rest; the stretch statistics' coverage mask finds any shard whose pixels
+were written but not yet folded in and reads it back. Worst case for a
+crash between a shard write and its stats fold is one re-read of that
+shard.
 
-The shard objects are the ground truth and they survive anything, so a fill
-scans for them before doing any work and skips what is already there. That
-is the default: re-running an interrupted fill uploads only what is missing.
-
-A shard is always written from every tile covering it, so its presence means
-it is complete. The exception is a tile inventory that has grown since —
-a newly-added tile falls inside an existing shard, which would then be
-skipped rather than merged in. Force those shards to be rebuilt with::
+The one assumption resume makes is that the tile inventory has not grown
+under an existing shard: a shard is complete with respect to the manifest
+it was written from, so a tile added later falls inside an object the scan
+skips. Force those shards to be rebuilt with::
 
     geotessera-registry zarr-fill <source> <store> --zones 30 \
         --rewrite-existing-shards

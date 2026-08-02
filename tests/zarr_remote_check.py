@@ -20,16 +20,13 @@ import numpy as np
 
 from geotessera import remote
 from geotessera.zarr import (
-    LOCK_DIR_NAME,
     REGISTRY_DIR_NAME,
     StoreLocation,
     TileInfo,
     TileSource,
     UnifiedZoneGrid,
-    _acquire_zone_lock,
     _get_written_tiles,
     _record_written_tiles,
-    _release_zone_lock,
     build_shard_index,
     merge_tile_registry,
     shard_coords_for_tiles,
@@ -292,37 +289,6 @@ check(
 )
 
 # ---------------------------------------------------------------------------
-# Advisory zone locks
-# ---------------------------------------------------------------------------
-
-lock_store = StoreLocation(str(TMP / "lock_store"))
-_acquire_zone_lock(lock_store, 31, 2024)
-check(
-    "lock object created in the state sibling",
-    lock_store.state.exists(LOCK_DIR_NAME, "utm31_2024.json"),
-)
-check("no lock object inside the store", not lock_store.exists(LOCK_DIR_NAME))
-
-try:
-    _acquire_zone_lock(lock_store, 31, 2024)
-    check("second acquire refused", False)
-except RuntimeError as e:
-    check("second acquire refused", "locked by" in str(e))
-
-# A different zone or year is a different lock, so sibling jobs proceed.
-_acquire_zone_lock(lock_store, 30, 2024)
-_acquire_zone_lock(lock_store, 31, 2023)
-check("sibling zone/year locks independent", True)
-
-_acquire_zone_lock(lock_store, 31, 2024, force=True)
-check("force takes over a stale lock", True)
-
-_release_zone_lock(lock_store, 31, 2024)
-check(
-    "release removes the lock", not lock_store.exists(LOCK_DIR_NAME, "utm31_2024.json")
-)
-
-# ---------------------------------------------------------------------------
 # Shard index: rewriting a shard must carry its already-written neighbours
 # ---------------------------------------------------------------------------
 
@@ -422,7 +388,7 @@ except ValueError as e:
     )
 
 for zname in ("utm30", "utm31"):
-    create_stretch_arrays(root[zname], n_years=1, k=50)
+    create_stretch_arrays(root[zname], n_years=1, k=50, n_shard_rows=1, n_shard_cols=1)
 
 check("extend adds the year to every zone", extend_store(ext, [2026]) == 2)
 check(
@@ -456,15 +422,7 @@ try:
 except ValueError as e:
     check("inserting an earlier year refused", "only be appended" in str(e))
 
-ext.state.write_bytes(b"{}", LOCK_DIR_NAME, "utm30_2026.json")
-try:
-    extend_store(ext, [2027])
-    check("extend refuses while a fill lock is held", False)
-except RuntimeError as e:
-    check("extend refuses while a fill lock is held", "fill lock" in str(e))
-check(
-    "extend --force overrides a stale lock", extend_store(ext, [2027], force=True) == 2
-)
+check("extend appends a further year", extend_store(ext, [2027]) == 2)
 
 # ---------------------------------------------------------------------------
 # Stretch statistics
@@ -480,15 +438,16 @@ from geotessera.zarr import (  # noqa: E402
 nprng = np.random.default_rng(11)
 B = 128
 semb = nprng.integers(-128, 127, (B, 96, 96), dtype=np.int8)
-ssc = (nprng.random((96, 96)).astype(np.float32) * 0.01 + 0.001)
+ssc = nprng.random((96, 96)).astype(np.float32) * 0.01 + 0.001
 ssc[:20, :20] = np.nan
 ssc[80:, 80:] = np.inf
 
 sst = shard_stretch_stats(semb, ssc, sample_cap=200, seed=5)
 svalid = np.isfinite(ssc)
-sx = semb.reshape(B, -1)[:, svalid.ravel()].astype(np.float64) * ssc.ravel()[
-    svalid.ravel()
-]
+sx = (
+    semb.reshape(B, -1)[:, svalid.ravel()].astype(np.float64)
+    * ssc.ravel()[svalid.ravel()]
+)
 check("stats count exact", sst["n"] == int(svalid.sum()))
 check(
     "stats sum matches population",
@@ -537,15 +496,24 @@ check(
 import zarr  # noqa: E402
 
 zs = zarr.open_group(str(TMP / "stats.zarr"), mode="w", zarr_format=3)
-create_stretch_arrays(zs, n_years=2, k=100)
+create_stretch_arrays(zs, n_years=2, k=100, n_shard_rows=2, n_shard_cols=3)
 check(
     "stretch arrays created",
     all(n in zs for n in STRETCH_ARRAY_NAMES),
 )
 cand = [(sst["sample_emb"], sst["sample_scales"], sst["sample_weight"])]
-update_zone_stretch_stats(zs, 0, sst["n"], sst["sum"], sst["prod"], cand, seed=1)
-update_zone_stretch_stats(zs, 0, sst["n"], sst["sum"], sst["prod"], cand, seed=2)
+update_zone_stretch_stats(
+    zs, 0, sst["n"], sst["sum"], sst["prod"], cand, seen_coords=[(0, 1)], seed=1
+)
+update_zone_stretch_stats(
+    zs, 0, sst["n"], sst["sum"], sst["prod"], cand, seen_coords=[(1, 2)], seed=2
+)
 check("stats fold additively", int(zs["stretch_stats_count"][0]) == 2 * sst["n"])
+mask0 = np.asarray(zs["stretch_stats_shards"][0])
+check(
+    "coverage mask accumulates seen shards",
+    mask0[0, 1] == 1 and mask0[1, 2] == 1 and int(mask0.sum()) == 2,
+)
 check(
     "sample capacity bounded",
     int(zs["stretch_sample_count"][0]) <= 100,

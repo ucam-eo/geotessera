@@ -3429,14 +3429,15 @@ def _add_source_args(parser) -> None:
 
 
 def _add_state_arg(parser) -> None:
-    """Register ``--state-url`` for the commands that keep build bookkeeping."""
+    """Register ``--state-url`` (legacy; fills are now stateless)."""
     parser.add_argument(
         "--state-url",
         type=str,
         default=None,
-        help="Where to keep build state (ingestion registry, fill locks). "
-        "Default: <store>.build alongside the store. Kept outside the store "
-        "so the published Zarr hierarchy contains only Zarr.",
+        help="Legacy build-state location from before fills became "
+        "stateless. Only zarr-consolidate still reads it (to merge old "
+        "ingestion registries); accepted elsewhere for script "
+        "compatibility and ignored.",
     )
 
 
@@ -3869,8 +3870,6 @@ def zarr_fill_command(args):
                 years=years,
                 console=console,
                 storage_options=store_options,
-                state_url=args.state_url,
-                force_lock=args.force_lock,
             )
         except (ValueError, RuntimeError) as e:
             console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -3920,8 +3919,6 @@ def zarr_fill_command(args):
             storage_options=store_options,
             source=source,
             consolidate=consolidate,
-            force_lock=args.force_lock,
-            state_url=args.state_url,
             skip_existing_shards=not args.rewrite_existing_shards,
             spill_dir=args.spill_dir,
             collect_stretch_stats=not args.no_stretch_stats,
@@ -4013,8 +4010,6 @@ def zarr_extend_command(args):
             storage_options=store_options,
             zones=zones,
             consolidate=not args.no_consolidate,
-            force=args.force,
-            state_url=args.state_url,
         )
     except (ValueError, RuntimeError) as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -5068,8 +5063,9 @@ Directory Structure:
     zarr_fill_parser.add_argument(
         "--force-lock",
         action="store_true",
-        help="Take over a zone/year lock left behind by a dead run. Only use "
-        "this when no other fill is touching the same zone.",
+        help="Deprecated no-op: fills no longer take locks. The store's own "
+        "shard objects are the only state, so a dead run leaves nothing to "
+        "take over.",
     )
     _add_source_args(zarr_fill_parser)
     _add_storage_args(zarr_fill_parser, "source", "Tile source")
@@ -5170,7 +5166,8 @@ Directory Structure:
     zarr_extend_parser.add_argument(
         "--force",
         action="store_true",
-        help="Proceed even if fill locks are present (only when they are stale)",
+        help="Deprecated no-op: fills no longer take locks. Do not extend "
+        "while a fill is in flight.",
     )
     _add_state_arg(zarr_extend_parser)
     _add_storage_args(zarr_extend_parser, "store", "Store", writable=True)
