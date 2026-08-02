@@ -88,6 +88,30 @@ landmask registry for its land denominator:
   $ geotessera-registry zarr-scan --help | grep -oE '\[base_dir\] store_path'
   [base_dir] store_path
 
+Test: stretch statistics are collected at fill time
+----------------------------------------------------
+
+Fills fold each shard's stretch statistics into the zone group, so the
+global stretch never re-reads embeddings:
+
+  $ geotessera-registry zarr-fill --help | grep -o '\-\-no-stretch-stats' | sort -u
+  --no-stretch-stats
+
+  $ geotessera-registry zarr-fill --help | grep -o '\-\-backfill-stretch-stats' | sort -u
+  --backfill-stretch-stats
+
+  $ geotessera-registry zarr-init --help | grep -o '\-\-stretch-sample-size' | sort -u
+  --stretch-sample-size
+
+zarr-stretch aggregates them by default, remote-capable; the legacy
+shard-sampling path is the opt-in:
+
+  $ geotessera-registry zarr-stretch --help | grep -o '\-\-from-shards' | sort -u
+  --from-shards
+
+  $ geotessera-registry zarr-stretch --help | grep -o '\-\-drift-threshold' | sort -u
+  --drift-threshold
+
 Test: zarr-extend grows the time axis
 --------------------------------------
 

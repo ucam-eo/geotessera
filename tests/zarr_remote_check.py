@@ -405,7 +405,34 @@ for zname in ("utm30", "utm31"):
 root["utm31"]["embeddings"][0] = 7
 root["utm31"]["scales"][0] = 0.5
 
+from geotessera.zarr import (  # noqa: E402
+    STRETCH_ARRAY_NAMES,
+    create_stretch_arrays,
+)
+
+# A pre-stats store must be refused (extending it would leave the stretch
+# arrays permanently short) and pointed at the backfill.
+try:
+    extend_store(ext, [2026])
+    check("extend refuses a store without stretch arrays", False)
+except ValueError as e:
+    check(
+        "extend refuses a store without stretch arrays",
+        "backfill-stretch-stats" in str(e),
+    )
+
+for zname in ("utm30", "utm31"):
+    create_stretch_arrays(root[zname], n_years=1, k=50)
+
 check("extend adds the year to every zone", extend_store(ext, [2026]) == 2)
+check(
+    "extend grows the stretch arrays too",
+    all(
+        root[z][a].shape[0] == 2
+        for z in ("utm30", "utm31")
+        for a in STRETCH_ARRAY_NAMES
+    ),
+)
 
 g31 = zarr.open_group(ext.url, mode="r", use_consolidated=False)["utm31"]
 check("time axis grew", [int(v) for v in g31["time"][:]] == [2024, 2026])
@@ -438,6 +465,92 @@ except RuntimeError as e:
 check(
     "extend --force overrides a stale lock", extend_store(ext, [2027], force=True) == 2
 )
+
+# ---------------------------------------------------------------------------
+# Stretch statistics
+# ---------------------------------------------------------------------------
+
+from geotessera.zarr import (  # noqa: E402
+    merge_stretch_samples,
+    shard_stretch_stats,
+    update_zone_stretch_stats,
+    weighted_percentile,
+)
+
+nprng = np.random.default_rng(11)
+B = 128
+semb = nprng.integers(-128, 127, (B, 96, 96), dtype=np.int8)
+ssc = (nprng.random((96, 96)).astype(np.float32) * 0.01 + 0.001)
+ssc[:20, :20] = np.nan
+ssc[80:, 80:] = np.inf
+
+sst = shard_stretch_stats(semb, ssc, sample_cap=200, seed=5)
+svalid = np.isfinite(ssc)
+sx = semb.reshape(B, -1)[:, svalid.ravel()].astype(np.float64) * ssc.ravel()[
+    svalid.ravel()
+]
+check("stats count exact", sst["n"] == int(svalid.sum()))
+check(
+    "stats sum matches population",
+    bool(np.allclose(sst["sum"], sx.sum(1), rtol=1e-5)),
+)
+_truth = sx @ sx.T
+check(
+    "stats product matches population",
+    float(np.abs(sst["prod"] - _truth).max()) < 1e-5 * float(np.abs(_truth).max()),
+)
+check(
+    "sampled pixels are valid pixels",
+    bool(np.isfinite(sst["sample_scales"]).all()),
+)
+
+ha = shard_stretch_stats(semb[:, :48, :], ssc[:48, :], 50, seed=1)
+hb = shard_stretch_stats(semb[:, 48:, :], ssc[48:, :], 50, seed=2)
+check("stats additive across shards", ha["n"] + hb["n"] == sst["n"])
+check(
+    "sums additive across shards",
+    bool(np.allclose(ha["sum"] + hb["sum"], sst["sum"], rtol=1e-5)),
+)
+
+heavy = (np.ones((500, B), np.int8), np.ones(500, np.float32), 50.0)
+light = (np.zeros((500, B), np.int8), np.zeros(500, np.float32), 1.0)
+me, ms = merge_stretch_samples([heavy, light], 300, seed=4)
+check("merge respects capacity", len(me) == 300)
+check(
+    "merge favours high-weight rows",
+    float((me[:, 0] == 1).mean()) > 0.8,
+)
+
+vv = nprng.normal(size=4000)
+check(
+    "weighted percentile matches numpy under uniform weights",
+    float(
+        np.abs(
+            weighted_percentile(vv, np.ones(4000), np.array([2.0, 50.0, 98.0]))
+            - np.percentile(vv, [2, 50, 98])
+        ).max()
+    )
+    < 0.02,
+)
+
+# Zone-array round trip: create, fold twice, contents accumulate.
+import zarr  # noqa: E402
+
+zs = zarr.open_group(str(TMP / "stats.zarr"), mode="w", zarr_format=3)
+create_stretch_arrays(zs, n_years=2, k=100)
+check(
+    "stretch arrays created",
+    all(n in zs for n in STRETCH_ARRAY_NAMES),
+)
+cand = [(sst["sample_emb"], sst["sample_scales"], sst["sample_weight"])]
+update_zone_stretch_stats(zs, 0, sst["n"], sst["sum"], sst["prod"], cand, seed=1)
+update_zone_stretch_stats(zs, 0, sst["n"], sst["sum"], sst["prod"], cand, seed=2)
+check("stats fold additively", int(zs["stretch_stats_count"][0]) == 2 * sst["n"])
+check(
+    "sample capacity bounded",
+    int(zs["stretch_sample_count"][0]) <= 100,
+)
+check("other year untouched", int(zs["stretch_stats_count"][1]) == 0)
 
 # ---------------------------------------------------------------------------
 # Storage options and source layout

@@ -52,6 +52,21 @@
   tile inventory has grown, since a newly-added tile falls inside an
   existing shard. `--skip-existing-shards` is still accepted as a no-op.
   (@avsm)
+- **Per-zone stretch statistics, collected at fill time** (see
+  `docs/specs/zarr-stretch-stats.md`): each zone group gains six arrays —
+  exact mean/covariance sufficient statistics per (zone, year), additive
+  across zones, plus a weighted 20k-pixel sample for quantiles — folded in
+  by `zarr-fill` from the shard buffers it already holds, at no extra I/O.
+  `zarr-stretch` now aggregates these by default: a few MiB of reads and an
+  *exact* global PCA (verified |cos| = 1.0 against a full-population fit)
+  instead of terabytes of shard re-reads, and it works against remote
+  stores. A drift check compares the stats-derived covariance against one
+  refitted from the stored sample and warns when rewritten shards have
+  double-counted. `--from-shards` keeps the legacy path;
+  `zarr-fill --backfill-stretch-stats` rebuilds statistics for stores
+  filled before this existed (and is required before `zarr-extend` will
+  touch such stores); `zarr-init --stretch-sample-size` tunes the sample.
+  (@avsm)
 - **`zarr-fill` reports the shard arithmetic**: `Shards: 1,373 land, 48
   recorded done, 43 found in store, 1,282 to write`. The previous line
   showed only the last figure, which could not be reconciled with

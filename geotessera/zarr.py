@@ -52,6 +52,7 @@ import io
 import logging
 import math
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -938,6 +939,10 @@ def _coarsen_zone_pyramid(
 
 SHARD_SIZE = 4096  # spatial pixels per shard side
 INNER_CHUNK = 32  # spatial pixels per inner chunk side
+
+# Default per-(zone, year) capacity of the raw pixel sample kept for the
+# global stretch quantiles (docs/specs/zarr-stretch-stats.md).
+STRETCH_SAMPLE_K = 20_000
 DEFAULT_WORKERS = 4  # fewer workers due to larger shard buffers (~2GB each)
 
 # Each shard worker holds a full (N_BANDS, SHARD_SIZE, SHARD_SIZE) int8
@@ -951,6 +956,11 @@ WORKER_BUFFER_BYTES = N_BANDS * SHARD_SIZE * SHARD_SIZE + 4 * SHARD_SIZE * SHARD
 # upload body. Measured 4.3 GiB per worker on a sparse three-tile shard; a
 # dense one on a loaded host was killed holding 12 GiB.
 WORKER_PEAK_BYTES = 3 * WORKER_BUFFER_BYTES
+
+# With --spill-dir the shard buffers are memory-mapped, so their pages are
+# reclaimable page cache rather than anonymous memory. Measured on Linux,
+# that takes the buffer's contribution to RssAnon from 1.73 GiB to 0.35 GiB.
+WORKER_PEAK_BYTES_SPILLED = WORKER_PEAK_BYTES - WORKER_BUFFER_BYTES
 
 
 def _total_memory_bytes() -> Optional[int]:
@@ -973,29 +983,36 @@ def _total_memory_bytes() -> Optional[int]:
         return None
 
 
-def _warn_worker_memory(workers: int, console=None) -> None:
+def _warn_worker_memory(workers: int, console=None, spilled: bool = False) -> None:
     """Warn when the requested worker count cannot fit in RAM.
 
     A fill that is OOM-killed leaves no traceback, so the cause is easy to
     miss; say it up front instead.
     """
-    needed = workers * WORKER_PEAK_BYTES
+    per_worker = WORKER_PEAK_BYTES_SPILLED if spilled else WORKER_PEAK_BYTES
+    needed = workers * per_worker
     total = _total_memory_bytes()
     gib = 2**30
     message = (
         f"{workers} workers can peak around {needed / gib:.0f} GiB "
-        f"(~{WORKER_PEAK_BYTES / gib:.1f} GiB each: a "
-        f"{WORKER_BUFFER_BYTES / gib:.1f} GiB shard buffer plus compression "
-        f"and the upload body)"
+        f"(~{per_worker / gib:.1f} GiB each"
+        + (
+            ", shard buffers spilled to disk)"
+            if spilled
+            else f": a {WORKER_BUFFER_BYTES / gib:.1f} GiB shard buffer plus "
+            f"compression and the upload body)"
+        )
     )
     if total is None:
         logger.info(message)
         return
     if needed > 0.8 * total:
-        safe = max(1, int(0.8 * total // WORKER_PEAK_BYTES))
+        safe = max(1, int(0.8 * total // per_worker))
+        hint = "" if spilled else " (or --spill-dir to cut ~2 GiB per worker)"
         text = (
             f"{message}, but only {total / gib:.0f} GiB is available here. "
-            f"The fill will likely be OOM-killed — consider --workers {safe}."
+            f"The fill will likely be OOM-killed — consider "
+            f"--workers {safe}{hint}."
         )
         if console:
             console.print(f"  [yellow]{text}[/yellow]")
@@ -1215,6 +1232,7 @@ def init_store(
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
     state_url: Optional[str] = None,
+    stretch_sample_size: int = STRETCH_SAMPLE_K,
 ) -> str:
     """Create a tessera store with time dimension from the landmask registry.
 
@@ -1327,7 +1345,7 @@ def init_store(
                 f"{n_shards_x}x{n_shards_y} shards[/dim]"
             )
 
-        _create_zone_group(grid, store)
+        _create_zone_group(grid, store, stretch_sample_size)
 
     # Nothing else is written into the store: ingestion tracking and locks
     # are build state and live in the state sibling, created on first fill.
@@ -1351,6 +1369,7 @@ def init_store(
 def _create_zone_group(
     grid: UnifiedZoneGrid,
     store_location: StoreLocation,
+    stretch_sample_size: int = STRETCH_SAMPLE_K,
 ) -> "zarr.Group":
     """Create a zone group with empty (T, B, H, W) arrays."""
     from zarr.codecs import BloscCodec
@@ -1412,6 +1431,11 @@ def _create_zone_group(
         )
         store[name][:] = data
 
+    # Per-zone stretch statistics, populated by zarr-fill (see
+    # docs/specs/zarr-stretch-stats.md). Plain arrays: zone groups carry no
+    # geoemb: attributes.
+    create_stretch_arrays(store, T, stretch_sample_size)
+
     # Use geozarr-toolkit for proj: and spatial: convention metadata
     from geozarr_toolkit import create_geozarr_attrs
 
@@ -1448,6 +1472,221 @@ def _create_zone_group(
     store.attrs.update(geozarr_attrs)
 
     return store
+
+
+# ---------------------------------------------------------------------------
+# Stretch statistics (per-zone, collected at fill time)
+# ---------------------------------------------------------------------------
+# The global RGB stretch needs a mean/covariance (for PCA) and quantiles (for
+# the percentile stretch and equalisation CDF) over every valid pixel in the
+# store. Recomputing those by re-reading shards costs terabytes; instead each
+# fill records, per (zone, year), the exact sufficient statistics for the
+# covariance — which are additive across zones — plus a weighted raw-pixel
+# sample for the quantiles, which are not.
+#
+# These live as ordinary arrays inside each zone group. Zone groups carry no
+# geoemb: attributes (the convention keeps those on the root), so the filled
+# sample count is itself an array rather than an attr.
+
+STRETCH_ARRAY_NAMES = (
+    "stretch_stats_count",
+    "stretch_stats_sum",
+    "stretch_stats_prod",
+    "stretch_sample",
+    "stretch_sample_scales",
+    "stretch_sample_count",
+)
+
+
+def create_stretch_arrays(group: "zarr.Group", n_years: int, k: int) -> None:
+    """Create the per-zone stretch-statistics arrays in *group*.
+
+    One chunk per year on the time axis, so a (zone, year) update touches
+    exactly one chunk per array and ``zarr-extend`` grows them the same way
+    it grows ``embeddings``.
+    """
+    from zarr.codecs import BloscCodec
+
+    comp = BloscCodec(cname="zstd", clevel=3)
+    T = n_years
+    specs = [
+        ("stretch_stats_count", (T,), (1,), np.int64, 0, ["time"]),
+        ("stretch_stats_sum", (T, N_BANDS), (1, N_BANDS), np.float64, 0.0,
+         ["time", "band"]),
+        ("stretch_stats_prod", (T, N_BANDS, N_BANDS), (1, N_BANDS, N_BANDS),
+         np.float64, 0.0, ["time", "band", "band2"]),
+        ("stretch_sample", (T, k, N_BANDS), (1, k, N_BANDS), np.int8,
+         np.int8(0), ["time", "sample", "band"]),
+        # +inf matches the "land, no data" sentinel, so padding slots can
+        # never be mistaken for real pixels even by a reader that ignores
+        # stretch_sample_count.
+        ("stretch_sample_scales", (T, k), (1, k), np.float32,
+         np.float32("inf"), ["time", "sample"]),
+        ("stretch_sample_count", (T,), (1,), np.int64, 0, ["time"]),
+    ]
+    for name, shape, chunks, dtype, fill, dims in specs:
+        group.create_array(
+            name,
+            shape=shape,
+            chunks=chunks,
+            dtype=dtype,
+            fill_value=fill,
+            compressors=comp,
+            dimension_names=dims,
+        )
+
+
+def _shard_sample_cap(k_slots: int, n_shards: int) -> int:
+    """Per-shard sample size: a few times K spread over the shards.
+
+    Oversampling by 4x gives the weighted merge enough candidates to
+    approximate a uniform draw without ballooning the result queue.
+    """
+    return min(k_slots, max(64, -(-4 * k_slots // max(1, n_shards))))
+
+
+def shard_stretch_stats(
+    emb_buf: np.ndarray,
+    scales_buf: np.ndarray,
+    sample_cap: int,
+    seed: Optional[int] = None,
+    block: int = 262_144,
+) -> Optional[Dict[str, Any]]:
+    """Exact (n, S, M) sufficient statistics plus a pixel sample for one shard.
+
+    Works on the shard buffers the fill already holds: ``emb_buf`` is
+    ``(B, S, S)`` int8, ``scales_buf`` ``(S, S)`` float32.  Valid pixels are
+    those with finite scale.  The sum-of-products matrix is accumulated in
+    float64 from float32 block GEMMs — each block sums ~2.6e5 terms of O(1)
+    magnitude, so the block partials carry ~7 significant digits and the
+    float64 accumulation loses nothing that a covariance of 1e9 pixels could
+    show.
+
+    Returns None when the shard has no valid pixels.
+    """
+    valid = np.isfinite(scales_buf)
+    flat = np.flatnonzero(valid.ravel())
+    n = int(flat.size)
+    if n == 0:
+        return None
+
+    emb_flat = emb_buf.reshape(emb_buf.shape[0], -1)
+    scales_flat = scales_buf.ravel()
+
+    s = np.zeros(N_BANDS, dtype=np.float64)
+    m = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
+    for i in range(0, n, block):
+        idx = flat[i : i + block]
+        xb = emb_flat[:, idx].astype(np.float32) * scales_flat[idx].astype(np.float32)
+        s += xb.sum(axis=1, dtype=np.float64)
+        m += (xb @ xb.T).astype(np.float64)
+
+    rng = np.random.default_rng(seed)
+    k = min(sample_cap, n)
+    pick = flat[rng.choice(n, size=k, replace=False)]
+    return {
+        "n": n,
+        "sum": s,
+        "prod": m,
+        "sample_emb": np.ascontiguousarray(emb_flat[:, pick].T),  # (k, B) int8
+        "sample_scales": scales_flat[pick].astype(np.float32),
+        # Each returned row stands for n/k pixels of the shard's population.
+        "sample_weight": n / k,
+    }
+
+
+def merge_stretch_samples(
+    candidates: List[Tuple[np.ndarray, np.ndarray, float]],
+    k: int,
+    seed: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Draw K rows from weighted candidate pools (Efraimidis–Spirakis).
+
+    ``candidates`` is a list of ``(emb (n, B) int8, scales (n,) f32, weight
+    per row)``.  Rows are selected with probability proportional to their
+    weight, without replacement, so pooling per-shard samples of different
+    coverage reproduces a uniform draw over the union population.
+    """
+    embs = [c[0] for c in candidates if len(c[0])]
+    if not embs:
+        return (
+            np.zeros((0, N_BANDS), dtype=np.int8),
+            np.zeros((0,), dtype=np.float32),
+        )
+    emb = np.concatenate(embs, axis=0)
+    scales = np.concatenate([c[1] for c in candidates if len(c[0])], axis=0)
+    weights = np.concatenate(
+        [np.full(len(c[0]), max(c[2], 1e-12)) for c in candidates if len(c[0])]
+    )
+
+    if len(emb) <= k:
+        return emb, scales
+
+    rng = np.random.default_rng(seed)
+    keys = rng.random(len(emb)) ** (1.0 / weights)
+    top = np.argpartition(keys, -k)[-k:]
+    return emb[top], scales[top]
+
+
+def weighted_percentile(
+    values: np.ndarray, weights: np.ndarray, qs: np.ndarray
+) -> np.ndarray:
+    """Percentiles of a weighted sample (qs in 0..100)."""
+    order = np.argsort(values, kind="stable")
+    v = values[order]
+    w = weights[order].astype(np.float64)
+    cdf = np.cumsum(w) - 0.5 * w
+    cdf /= w.sum()
+    return np.interp(np.asarray(qs, dtype=np.float64) / 100.0, cdf, v)
+
+
+def update_zone_stretch_stats(
+    zone_group: "zarr.Group",
+    time_index: int,
+    n: int,
+    s: np.ndarray,
+    m: np.ndarray,
+    sample_candidates: List[Tuple[np.ndarray, np.ndarray, float]],
+    seed: Optional[int] = None,
+) -> None:
+    """Fold one fill run's statistics into a zone's arrays (read-modify-write).
+
+    The additive triple is summed onto what is stored; the sample is re-drawn
+    from the stored sample and the new candidates together, weighted so the
+    result still approximates a uniform draw over all pixels either has seen.
+    Caller must hold the (zone, year) fill lock — this is the same
+    single-writer context the shard writes ran under.
+    """
+    t = time_index
+    count_arr = zone_group["stretch_stats_count"]
+    prev_n = int(count_arr[t])
+
+    count_arr[t] = prev_n + n
+    zone_group["stretch_stats_sum"][t] = (
+        np.asarray(zone_group["stretch_stats_sum"][t]) + s
+    )
+    zone_group["stretch_stats_prod"][t] = (
+        np.asarray(zone_group["stretch_stats_prod"][t]) + m
+    )
+
+    k = zone_group["stretch_sample"].shape[1]
+    stored_k = int(zone_group["stretch_sample_count"][t])
+    pool = list(sample_candidates)
+    if stored_k > 0:
+        pool.append(
+            (
+                np.asarray(zone_group["stretch_sample"][t, :stored_k]),
+                np.asarray(zone_group["stretch_sample_scales"][t, :stored_k]),
+                max(prev_n, 1) / stored_k,
+            )
+        )
+    emb, scales = merge_stretch_samples(pool, k, seed=seed)
+
+    filled = len(emb)
+    if filled:
+        zone_group["stretch_sample"][t, :filled] = emb
+        zone_group["stretch_sample_scales"][t, :filled] = scales
+    zone_group["stretch_sample_count"][t] = filled
 
 
 # ---------------------------------------------------------------------------
@@ -1730,6 +1969,8 @@ def _release_zone_lock(store: StoreLocation, zone: int, year: int) -> None:
 
 _worker_store = None
 _worker_source_options: Optional[Dict[str, Any]] = None
+_worker_spill_dir: Optional[str] = None
+_worker_sample_cap: int = 0  # 0 = stats collection off
 
 
 def _init_shard_worker(
@@ -1737,13 +1978,16 @@ def _init_shard_worker(
     zone_group: str,
     store_options: Optional[Dict[str, Any]] = None,
     source_options: Optional[Dict[str, Any]] = None,
+    spill_dir: Optional[str] = None,
+    sample_cap: int = 0,
 ) -> None:
     """Process pool initializer: open the zone group once per worker.
 
     Both option dicts are plain picklable mappings, so a worker rebuilds its
     own filesystem connections rather than inheriting an unforkable client.
     """
-    global _worker_store, _worker_source_options
+    global _worker_store, _worker_source_options, _worker_spill_dir
+    global _worker_sample_cap
 
     from . import remote
 
@@ -1755,29 +1999,84 @@ def _init_shard_worker(
         mode="r+", path=zone_group, zarr_format=3
     )
     _worker_source_options = source_options
+    _worker_spill_dir = spill_dir
+    _worker_sample_cap = sample_cap
 
 
 def _write_one_shard(
     spec: ShardSpec,
     store: "zarr.Group",
     source_options: Optional[Dict[str, Any]] = None,
-) -> bool:
+    spill_dir: Optional[str] = None,
+    sample_cap: int = 0,
+) -> "bool | Dict[str, Any]":
     """Write one shard in NCHW layout: (T, B, H, W).
 
     Tile reads go through :mod:`geotessera.remote`, so ``spec`` may reference
     either local paths or remote URLs — a remote tile costs one ranged GET for
     the rows this shard needs, not the whole 150 MB object.
     """
+    S = SHARD_SIZE
+
+    # Allocate BHW buffer (bands-first for NCHW write). With a spill
+    # directory the two buffers are memory-mapped instead of anonymous: the
+    # pages become reclaimable page cache, so the kernel evicts them under
+    # pressure rather than the OOM killer taking the whole worker. Measured
+    # on Linux, the buffer's contribution to RssAnon drops from 1.73 GiB to
+    # 0.35 GiB.
+    spill = _open_spill(spill_dir)
+    if spill is None:
+        emb_buf = np.zeros((N_BANDS, S, S), dtype=np.int8)
+        # Start with +inf (land/nodata); landmask sets water to NaN,
+        # valid tiles overwrite with finite scales.
+        scales_buf = np.full((S, S), np.float32("inf"))
+    else:
+        emb_buf = np.memmap(
+            spill / "emb.buf", dtype=np.int8, mode="w+", shape=(N_BANDS, S, S)
+        )
+        scales_buf = np.memmap(
+            spill / "scales.buf", dtype=np.float32, mode="w+", shape=(S, S)
+        )
+        scales_buf[:] = np.float32("inf")
+
+    try:
+        return _fill_and_write_shard(
+            spec, store, emb_buf, scales_buf, source_options, sample_cap
+        )
+    finally:
+        del emb_buf, scales_buf
+        if spill is not None:
+            shutil.rmtree(spill, ignore_errors=True)
+
+
+def _open_spill(spill_dir: Optional[str]):
+    """Create a per-shard scratch directory, or None to stay in memory."""
+    if not spill_dir:
+        return None
+    import tempfile
+
+    Path(spill_dir).mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="shard-", dir=spill_dir))
+
+
+def _fill_and_write_shard(
+    spec: ShardSpec,
+    store: "zarr.Group",
+    emb_buf: np.ndarray,
+    scales_buf: np.ndarray,
+    source_options: Optional[Dict[str, Any]] = None,
+    sample_cap: int = 0,
+) -> "bool | Dict[str, Any]":
+    """Populate the shard buffers from their tiles and write them out.
+
+    With ``sample_cap > 0`` the return value is the shard's stretch
+    statistics (see :func:`shard_stretch_stats`) — collected here because
+    this is the one moment every decoded pixel of the shard is in memory.
+    """
     from . import remote
 
     t = spec.time_index
     S = SHARD_SIZE
-
-    # Allocate BHW buffer (bands-first for NCHW write)
-    emb_buf = np.zeros((N_BANDS, S, S), dtype=np.int8)
-    # Start with +inf (land/nodata); landmask sets water to NaN,
-    # valid tiles overwrite with finite scales.
-    scales_buf = np.full((S, S), np.float32("inf"))
 
     has_data = False
     for ov in spec.tiles:
@@ -1830,12 +2129,23 @@ def _write_one_shard(
     r, c = spec.row_px, spec.col_px
     store["embeddings"][t, :, r : r + S, c : c + S] = emb_buf
     store["scales"][t, r : r + S, c : c + S] = scales_buf
+
+    if sample_cap > 0:
+        stats = shard_stretch_stats(emb_buf, scales_buf, sample_cap)
+        if stats is not None:
+            return stats
     return True
 
 
-def _write_one_shard_worker(spec: ShardSpec) -> bool:
+def _write_one_shard_worker(spec: ShardSpec) -> "bool | Dict[str, Any]":
     """Picklable wrapper for process pool."""
-    return _write_one_shard(spec, _worker_store, _worker_source_options)
+    return _write_one_shard(
+        spec,
+        _worker_store,
+        _worker_source_options,
+        _worker_spill_dir,
+        _worker_sample_cap,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2029,13 +2339,25 @@ def extend_store(
         old_t = len(existing)
         new_t = old_t + len(missing)
 
+        # Every time-indexed array must grow together, or the group's axes
+        # desynchronise. A zone from a store that predates the stretch
+        # statistics lacks those arrays; extending it would leave them
+        # permanently short, so refuse and point at the repair path.
+        absent = [a for a in STRETCH_ARRAY_NAMES if a not in group]
+        if absent:
+            raise ValueError(
+                f"{name}: missing stretch-statistics array(s) "
+                f"{', '.join(absent)} — this store predates fill-time stretch "
+                f"statistics. Run `zarr-fill --backfill-stretch-stats "
+                f"--zones {name[3:]}` first, then re-run zarr-extend."
+            )
+
         # Order matters only for crash-safety: grow the data arrays before
         # advertising the year on the time axis, so a run interrupted midway
         # never leaves a year readers can select but not read.
-        emb = group["embeddings"]
-        scales = group["scales"]
-        emb.resize((new_t,) + tuple(emb.shape[1:]))
-        scales.resize((new_t,) + tuple(scales.shape[1:]))
+        for arr_name in ("embeddings", "scales", *STRETCH_ARRAY_NAMES):
+            arr = group[arr_name]
+            arr.resize((new_t,) + tuple(arr.shape[1:]))
 
         time_arr = group["time"]
         time_arr.resize((new_t,))
@@ -2344,6 +2666,8 @@ def fill_store(
     force_lock: bool = False,
     state_url: Optional[str] = None,
     skip_existing_shards: bool = True,
+    spill_dir: Optional[str] = None,
+    collect_stretch_stats: bool = True,
 ) -> int:
     """Incrementally fill a store with tile data.
 
@@ -2384,7 +2708,7 @@ def fill_store(
 
     fill_years = [year] if year is not None else all_years
 
-    _warn_worker_memory(workers, console)
+    _warn_worker_memory(workers, console, spilled=bool(spill_dir))
 
     if console:
         console.print(f"Filling store at [bold]{store}[/bold]")
@@ -2522,9 +2846,25 @@ def fill_store(
                     f"({workers} workers)"
                 )
 
+            # Stretch statistics: collect only when the zone has the arrays
+            # (stores initialised before the feature lack them; repair with
+            # --backfill-stretch-stats). Per-shard cap sized so the expected
+            # candidate pool is a few times K without ballooning the result
+            # queue.
+            sample_cap = 0
+            if collect_stretch_stats and "stretch_sample" in zone_store:
+                k_slots = zone_store["stretch_sample"].shape[1]
+                sample_cap = _shard_sample_cap(k_slots, len(shard_specs))
+            elif collect_stretch_stats and console:
+                console.print(
+                    f"    [yellow]Zone {zone_num} has no stretch-statistics "
+                    f"arrays (store predates them); skipping collection. "
+                    f"Backfill later with --backfill-stretch-stats.[/yellow]"
+                )
+
             _acquire_zone_lock(store, zone_num, fill_year, force=force_lock)
             try:
-                written_count, failed = _write_shards(
+                written_count, failed, shard_stats = _write_shards(
                     store=store,
                     zone_group=zone_group,
                     shard_specs=shard_specs,
@@ -2532,10 +2872,32 @@ def fill_store(
                     source_options=source.storage_options if source else None,
                     label=f"    Zone {zone_num} y{fill_year}",
                     console=console,
+                    spill_dir=spill_dir,
+                    sample_cap=sample_cap,
                 )
 
                 total_shards_written += written_count
                 total_shards_failed += len(failed)
+
+                if shard_stats:
+                    zone_rw = store.open_group(mode="r+", path=zone_group)
+                    update_zone_stretch_stats(
+                        zone_rw,
+                        time_index,
+                        n=sum(st["n"] for st in shard_stats),
+                        s=sum(st["sum"] for st in shard_stats),
+                        m=sum(st["prod"] for st in shard_stats),
+                        sample_candidates=[
+                            (st["sample_emb"], st["sample_scales"], st["sample_weight"])
+                            for st in shard_stats
+                        ],
+                    )
+                    if console:
+                        console.print(
+                            f"    [dim]Stretch stats: "
+                            f"{sum(st['n'] for st in shard_stats):,} pixels "
+                            f"folded in[/dim]"
+                        )
 
                 if console:
                     console.print(
@@ -2595,17 +2957,28 @@ def _write_shards(
     source_options: Optional[Dict[str, Any]],
     label: str,
     console: Optional["rich.console.Console"],
-) -> Tuple[int, set]:
+    spill_dir: Optional[str] = None,
+    sample_cap: int = 0,
+) -> Tuple[int, set, List[Dict[str, Any]]]:
     """Run the shard writes through a process pool.
 
-    Returns (shards written, set of (sr, sc) that failed).
+    Returns (shards written, set of (sr, sc) that failed, per-shard stretch
+    statistics — empty when collection is off or no shard had valid pixels).
     """
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     written_count = 0
     failed: set = set()
-    initargs = (store.url, zone_group, store.storage_options, source_options)
+    stats_results: List[Dict[str, Any]] = []
+    initargs = (
+        store.url,
+        zone_group,
+        store.storage_options,
+        source_options,
+        spill_dir,
+        sample_cap,
+    )
 
     # "spawn", not the Linux default of "fork": a forked worker inherits the
     # parent's fsspec event-loop object without the thread that runs it, and
@@ -2620,8 +2993,11 @@ def _write_shards(
         for future in as_completed(futures):
             spec = futures[future]
             try:
-                if future.result():
+                result = future.result()
+                if result:
                     written_count += 1
+                if isinstance(result, dict):
+                    stats_results.append(result)
             except Exception as e:
                 logger.warning(f"Shard ({spec.sr},{spec.sc}) failed: {e}")
                 failed.add((spec.sr, spec.sc))
@@ -2669,7 +3045,7 @@ def _write_shards(
     else:
         pool.shutdown(wait=True)
 
-    return written_count, failed
+    return written_count, failed, stats_results
 
 
 def consolidate_store(
@@ -2953,6 +3329,349 @@ def compute_stretch(
 _GLOBAL_STRETCH_ATTR = "geoemb:stretch"
 
 
+def _parse_pca_perm(pca_rgb_order: str, pca_components: int) -> List[int]:
+    """Validate a PC→RGB permutation like '213' and return 0-based indices."""
+    if len(pca_rgb_order) != pca_components or set(pca_rgb_order) != {
+        str(i + 1) for i in range(pca_components)
+    }:
+        raise ValueError(
+            f"pca_rgb_order must be a permutation of the digits "
+            f"1..{pca_components} (e.g. '123' or '213'), got {pca_rgb_order!r}"
+        )
+    return [int(c) - 1 for c in pca_rgb_order]
+
+
+def compute_stretch_from_stats(
+    store_path: "str | Path | StoreLocation",
+    year: int,
+    zones: Optional[List[int]] = None,
+    p_low: float = 2.0,
+    p_high: float = 98.0,
+    equalise: bool = True,
+    equalise_breakpoints: int = 257,
+    mode: str = "pca",
+    pca_components: int = 3,
+    pca_rgb_order: str = "123",
+    drift_threshold: float = 0.25,
+    console: Optional["rich.console.Console"] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Derive the global stretch from the per-zone ``stretch_*`` arrays.
+
+    The fast path of ``zarr-stretch`` (docs/specs/zarr-stretch-stats.md):
+    reads a few MiB of per-zone summaries instead of terabytes of shards.
+    The PCA comes from the summed sufficient statistics and is exact — every
+    valid pixel in the store contributes. Quantiles come from the pooled
+    weighted samples, projected into PC space.
+
+    Writes the result to the root ``geoemb:stretch.{year}`` attribute with
+    the same keys the legacy shard-sampling path produces, so
+    ``build_global_preview`` and other readers are unaffected. Works against
+    local and remote stores alike.
+    """
+    if mode not in ("bands", "pca"):
+        raise ValueError(f"mode must be 'bands' or 'pca', got {mode!r}")
+    pca_perm = _parse_pca_perm(pca_rgb_order, pca_components) if mode == "pca" else None
+
+    store = StoreLocation.resolve(store_path, storage_options)
+    zone_names = _zone_group_names(store, zones)
+    if not zone_names:
+        raise ValueError(f"No UTM zone groups found in {store}")
+
+    n_total = 0
+    s_total = np.zeros(N_BANDS, dtype=np.float64)
+    m_total = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
+    sample_parts: List[Tuple[np.ndarray, np.ndarray, float]] = []
+    zones_used: List[str] = []
+    zones_missing: List[str] = []
+
+    for name in zone_names:
+        group = store.open_group(mode="r", path=name)
+        if "stretch_stats_count" not in group:
+            zones_missing.append(name)
+            continue
+        try:
+            zone_years = [int(v) for v in group["time"][:]]
+            t = zone_years.index(year)
+        except (ValueError, KeyError):
+            continue
+
+        n_z = int(group["stretch_stats_count"][t])
+        if n_z == 0:
+            continue
+        n_total += n_z
+        s_total += np.asarray(group["stretch_stats_sum"][t])
+        m_total += np.asarray(group["stretch_stats_prod"][t])
+
+        k_z = int(group["stretch_sample_count"][t])
+        if k_z > 0:
+            sample_parts.append(
+                (
+                    np.asarray(group["stretch_sample"][t, :k_z]),
+                    np.asarray(group["stretch_sample_scales"][t, :k_z]),
+                    n_z / k_z,
+                )
+            )
+        zones_used.append(name)
+
+    if zones_missing:
+        raise ValueError(
+            f"{len(zones_missing)} zone(s) have no stretch-statistics arrays "
+            f"({', '.join(zones_missing[:5])}{'...' if len(zones_missing) > 5 else ''}). "
+            f"Run `zarr-fill --backfill-stretch-stats` for them, or use "
+            f"--from-shards for the legacy path."
+        )
+    if n_total == 0 or not sample_parts:
+        raise RuntimeError(
+            f"No stretch statistics recorded for year {year} — have the "
+            f"zone fills for this year run with stats collection on?"
+        )
+
+    if console:
+        console.print(
+            f"Stretch from stored statistics: {len(zones_used)} zone(s), "
+            f"{n_total:,} pixels in the exact covariance, "
+            f"{sum(len(p[0]) for p in sample_parts):,} sampled pixels for "
+            f"quantiles"
+        )
+
+    # Exact global mean/covariance from the summed sufficient statistics.
+    mu = s_total / n_total
+    cov = m_total / n_total - np.outer(mu, mu)
+
+    # Pooled weighted sample, dequantised.
+    emb = np.concatenate([p[0] for p in sample_parts], axis=0)
+    scales = np.concatenate([p[1] for p in sample_parts], axis=0)
+    weights = np.concatenate(
+        [np.full(len(p[0]), p[2], dtype=np.float64) for p in sample_parts]
+    )
+    x = emb.astype(np.float32) * scales[:, None]  # (n, 128)
+
+    pca_proj_components = None
+    pca_proj_mean = None
+    pca_evr = None
+    if mode == "pca":
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        order = np.argsort(eigvals)[::-1][:pca_components]
+        components = eigvecs[:, order].T  # (k, 128), eigenvalue-descending
+        evr = eigvals[order] / max(eigvals.sum(), 1e-30)
+
+        # Drift check: re-estimate the covariance from the (independent)
+        # stored sample and compare. Rewritten shards double-count into the
+        # sums but replace sample slots, so divergence here flags stale
+        # statistics. The metric is relative Frobenius distance between the
+        # two covariances — comparing eigenvectors instead would false-alarm
+        # whenever eigenvalues are close, where the vectors are arbitrary.
+        cov_s = np.cov(x.T, aweights=weights)
+        drift = float(
+            np.linalg.norm(cov - cov_s) / max(np.linalg.norm(cov), 1e-30)
+        )
+        # The sample covariance itself carries ~sqrt(d/n_eff) relative error,
+        # so the alarm floor scales with the effective sample size — a small
+        # sample must not read as drift.
+        n_eff = float(weights.sum() ** 2 / (weights**2).sum())
+        noise = math.sqrt(N_BANDS / max(n_eff, 1.0))
+        limit = max(drift_threshold, 3.0 * noise)
+        if console:
+            colour = "green" if drift <= limit else "red"
+            console.print(
+                f"  Drift check: |cov_stats − cov_sample|/|cov_stats| = "
+                f"[{colour}]{drift:.4f}[/{colour}] "
+                f"(limit {limit:.2f}; sample noise floor {noise:.2f})"
+            )
+        if drift > limit:
+            logger.warning(
+                f"Stretch statistics drift: {drift:.4f} > {limit:.2f}. "
+                f"The additive sums likely double-counted rewritten shards; "
+                f"rebuild with `zarr-fill --backfill-stretch-stats`, or "
+                f"cross-check with `zarr-stretch --from-shards`."
+            )
+
+        # Bake the PC→RGB permutation into the stored matrix, as the legacy
+        # path does, so the render path needs no extra swapping.
+        components = components[pca_perm]
+        evr = evr[pca_perm]
+
+        channels = (x - mu.astype(np.float32)) @ components.T.astype(np.float32)
+        pca_proj_components = [[float(v) for v in row] for row in components]
+        pca_proj_mean = [float(v) for v in mu]
+        pca_evr = [float(v) for v in evr]
+        band_indices: Tuple[int, ...] = tuple(range(N_BANDS))
+    else:
+        band_indices = RGB_PREVIEW_BANDS
+        channels = x[:, list(band_indices)]
+
+    n_ch = channels.shape[1]
+    stretch_min = [
+        float(weighted_percentile(channels[:, i], weights, np.array([p_low]))[0])
+        for i in range(n_ch)
+    ]
+    stretch_max = [
+        float(weighted_percentile(channels[:, i], weights, np.array([p_high]))[0])
+        for i in range(n_ch)
+    ]
+    for i in range(n_ch):
+        if stretch_max[i] <= stretch_min[i]:
+            stretch_max[i] = stretch_min[i] + 1.0
+
+    cdf_breaks = None
+    if equalise:
+        n_break = max(64, int(equalise_breakpoints))
+        qs = np.linspace(0.0, 100.0, n_break)
+        cdf_breaks = []
+        for i in range(n_ch):
+            bks = weighted_percentile(channels[:, i], weights, qs)
+            for j in range(1, len(bks)):
+                if bks[j] <= bks[j - 1]:
+                    bks[j] = bks[j - 1] + 1e-9
+            cdf_breaks.append([float(v) for v in bks])
+
+    # Persist with the same key set as the legacy path so readers
+    # (_load_global_stretch, build_global_preview) are unaffected.
+    root_rw = store.open_group(mode="r+")
+    stretch_map = dict(root_rw.attrs.get(_GLOBAL_STRETCH_ATTR, {}))
+    method_prefix = "zone_stats_pca" if mode == "pca" else "zone_stats_percentile"
+    entry: Dict[str, Any] = {
+        "min": stretch_min,
+        "max": stretch_max,
+        "p_low": p_low,
+        "p_high": p_high,
+        "samples": int(channels.shape[0]),
+        "stats_pixels": int(n_total),
+        "zones_used": len(zones_used),
+        "bands": list(band_indices),
+        "method": f"{method_prefix}{'_equalised' if equalise else ''}",
+        "mode": mode,
+    }
+    if cdf_breaks is not None:
+        entry["cdf"] = cdf_breaks
+    if pca_proj_components is not None:
+        entry["pca_components"] = pca_proj_components
+        entry["pca_mean"] = pca_proj_mean
+        entry["pca_explained_variance_ratio"] = pca_evr
+    stretch_map[str(year)] = entry
+    root_rw.attrs[_GLOBAL_STRETCH_ATTR] = stretch_map
+
+    if console:
+        console.print(
+            f"[green]Saved to {_GLOBAL_STRETCH_ATTR}.{year} on the store "
+            f"root.[/green] Run zarr-consolidate so consolidated-metadata "
+            f"readers see it."
+        )
+
+    return {"min": stretch_min, "max": stretch_max, "samples": int(channels.shape[0])}
+
+
+def backfill_stretch_stats(
+    store_path: "str | Path | StoreLocation",
+    zones: Optional[List[int]] = None,
+    years: Optional[List[int]] = None,
+    sample_k: int = STRETCH_SAMPLE_K,
+    console: Optional["rich.console.Console"] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+    state_url: Optional[str] = None,
+    force_lock: bool = False,
+) -> int:
+    """Rebuild a zone's stretch statistics by scanning its existing shards.
+
+    The repair path for stores filled before fill-time collection existed,
+    for interrupted fills, and for suspected double-counting: it re-reads
+    the zone's shards once (the only stats path that touches embeddings) and
+    *sets* the arrays from what is actually in the store. Creates the arrays
+    if the zone predates them. Per-zone, so it composes with fills of other
+    zones; takes the same (zone, year) lock a fill would.
+
+    Returns the number of (zone, year) slots rebuilt.
+    """
+    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    zone_names = _zone_group_names(store, zones)
+    if not zone_names:
+        raise ValueError(f"No UTM zone groups found in {store}")
+
+    rebuilt = 0
+    for name in zone_names:
+        group = store.open_group(mode="r+", path=name, zarr_format=3)
+        zone_years = [int(v) for v in group["time"][:]]
+        T = len(zone_years)
+
+        if "stretch_sample" not in group:
+            create_stretch_arrays(group, T, sample_k)
+            if console:
+                console.print(f"  {name}: created stretch-statistics arrays")
+        k_slots = group["stretch_sample"].shape[1]
+
+        emb_arr = group["embeddings"]
+        scales_arr = group["scales"]
+        H, W = emb_arr.shape[2], emb_arr.shape[3]
+        all_coords = {
+            (sr, sc)
+            for sr in range(math.ceil(H / SHARD_SIZE))
+            for sc in range(math.ceil(W / SHARD_SIZE))
+        }
+
+        for fill_year in years or zone_years:
+            if fill_year not in zone_years:
+                continue
+            t = zone_years.index(fill_year)
+            present = _existing_shards(store, name, t, all_coords, console=None)
+            if not present:
+                continue
+
+            cap = _shard_sample_cap(k_slots, len(present))
+            zone_num = int(name[3:])
+            _acquire_zone_lock(store, zone_num, fill_year, force=force_lock)
+            try:
+                n_total, s_total = 0, np.zeros(N_BANDS, dtype=np.float64)
+                m_total = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
+                candidates: List[Tuple[np.ndarray, np.ndarray, float]] = []
+                for i, (sr, sc) in enumerate(sorted(present)):
+                    r0, c0 = sr * SHARD_SIZE, sc * SHARD_SIZE
+                    r1, c1 = min(r0 + SHARD_SIZE, H), min(c0 + SHARD_SIZE, W)
+                    st = shard_stretch_stats(
+                        np.asarray(emb_arr[t, :, r0:r1, c0:c1]),
+                        np.asarray(scales_arr[t, r0:r1, c0:c1]),
+                        cap,
+                    )
+                    if st is None:
+                        continue
+                    n_total += st["n"]
+                    s_total += st["sum"]
+                    m_total += st["prod"]
+                    candidates.append(
+                        (st["sample_emb"], st["sample_scales"], st["sample_weight"])
+                    )
+                    if console:
+                        console.print(
+                            f"  {name} {fill_year}: shard {i + 1}/{len(present)} "
+                            f"({st['n']:,} px)",
+                            end="\r",
+                        )
+
+                emb_s, scales_s = merge_stretch_samples(candidates, k_slots)
+                # Backfill SETS from actual contents (it is the repair for
+                # double-counting), unlike the fill's additive fold.
+                group["stretch_stats_count"][t] = n_total
+                group["stretch_stats_sum"][t] = s_total
+                group["stretch_stats_prod"][t] = m_total
+                full_emb = np.zeros((k_slots, N_BANDS), dtype=np.int8)
+                full_sc = np.full(k_slots, np.float32("inf"), dtype=np.float32)
+                full_emb[: len(emb_s)] = emb_s
+                full_sc[: len(emb_s)] = scales_s
+                group["stretch_sample"][t] = full_emb
+                group["stretch_sample_scales"][t] = full_sc
+                group["stretch_sample_count"][t] = len(emb_s)
+                rebuilt += 1
+                if console:
+                    console.print(
+                        f"  {name} {fill_year}: rebuilt from "
+                        f"{len(present)} shard(s), {n_total:,} pixels      "
+                    )
+            finally:
+                _release_zone_lock(store, zone_num, fill_year)
+
+    return rebuilt
+
+
 def _sample_shard_task(
     store_path_str: str,
     zone_group: str,
@@ -3054,19 +3773,10 @@ def compute_global_stretch(
         band_indices = tuple(range(pca_total_bands))
 
     # Parse the pca_rgb_order permutation now so we fail fast on bad input.
-    pca_perm: Optional[List[int]] = None
-    if mode == "pca":
-        if len(pca_rgb_order) != pca_components or set(pca_rgb_order) != {
-            str(i + 1) for i in range(pca_components)
-        }:
-            raise ValueError(
-                f"pca_rgb_order must be a permutation of the digits "
-                f"1..{pca_components} (e.g. '123' or '213'), got "
-                f"{pca_rgb_order!r}"
-            )
-        # 0-indexed permutation: pca_perm[k] = which PC ends up in output channel k.
-        # "123" -> [0, 1, 2] = identity; "213" -> [1, 0, 2] = swap R/G.
-        pca_perm = [int(c) - 1 for c in pca_rgb_order]
+    # pca_perm[k] = which PC ends up in output channel k ("213" swaps R/G).
+    pca_perm: Optional[List[int]] = (
+        _parse_pca_perm(pca_rgb_order, pca_components) if mode == "pca" else None
+    )
 
     # Find time_index for the requested year via the first zone's time coord.
     time_index = None

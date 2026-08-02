@@ -167,6 +167,7 @@ def build_storage_options(
     profile: Optional[str] = None,
     requester_pays: bool = False,
     acl: Optional[str] = None,
+    path_style: bool = False,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Assemble an fsspec storage-options dict for an S3-compatible endpoint.
@@ -182,6 +183,11 @@ def build_storage_options(
         acl: Canned ACL to stamp on every object written, e.g.
             ``bucket-owner-full-control`` for a bucket owned by another
             account.  s3fs filters it per operation, so reads are unaffected.
+        path_style: Address buckets as ``endpoint/bucket/key`` rather than
+            ``bucket.endpoint/key``.  Most S3-compatible servers (MinIO,
+            Ceph, and anything on a hostname without wildcard DNS) need
+            this; botocore's default would try to resolve
+            ``<bucket>.<your-endpoint>``.
 
     Returns ``None`` when nothing needs configuring, so callers can pass the
     result through to zarr unchanged.
@@ -210,6 +216,9 @@ def build_storage_options(
 
     if requester_pays:
         options["requester_pays"] = True
+
+    if path_style:
+        options["config_kwargs"] = {"s3": {"addressing_style": "path"}}
 
     if acl:
         if acl not in OBJECT_ACLS:

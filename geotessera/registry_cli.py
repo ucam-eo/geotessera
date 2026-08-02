@@ -3383,6 +3383,21 @@ def _add_source_args(parser) -> None:
         "URL base_dir)",
     )
     parser.add_argument(
+        "--source-npy-root",
+        type=str,
+        default=None,
+        help="Location holding {year}/grid_<lon>_<lat>/ tile directories, for "
+        "a mirror that does not use the published <root>/npy/<version> "
+        "layout",
+    )
+    parser.add_argument(
+        "--source-landmask-root",
+        type=str,
+        default=None,
+        help="Location holding grid_<lon>_<lat>.tiff landmasks, for a mirror "
+        "that does not use the published <root>/landmasks/<version> layout",
+    )
+    parser.add_argument(
         "--manifest-url",
         type=str,
         default=None,
@@ -3465,6 +3480,13 @@ def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -
         f"--{prefix}-requester-pays",
         action="store_true",
         help=f"Send requester-pays headers to the {label.lower()}",
+    )
+    group.add_argument(
+        f"--{prefix}-path-style",
+        action="store_true",
+        help=f"Address the {label.lower()} as endpoint/bucket/key rather "
+        f"than bucket.endpoint/key. Needed by most S3-compatible servers "
+        f"(MinIO, Ceph, and any endpoint without wildcard DNS).",
     )
     if writable:
         from .remote import OBJECT_ACLS
@@ -3551,6 +3573,7 @@ def _storage_options_for(
         profile=opt("profile"),
         requester_pays=bool(opt("requester_pays")),
         acl=opt("acl"),
+        path_style=bool(opt("path_style")),
     )
 
 
@@ -3747,14 +3770,24 @@ def _resolve_source(args, console: "Console"):
             landmasks_registry_path=landmasks_path,
         )
 
-    source = TileSource.for_url(base_dir, version_path, storage_options)
+    if args.source_npy_root or args.source_landmask_root:
+        # A mirror that lays tiles out its own way: take the roots verbatim
+        # rather than appending the published npy/<version> convention.
+        default = TileSource.for_url(base_dir, version_path, storage_options)
+        source = TileSource(
+            embeddings_root=args.source_npy_root or default.embeddings_root,
+            landmasks_root=args.source_landmask_root or default.landmasks_root,
+            storage_options=storage_options,
+        )
+    else:
+        source = TileSource.for_url(base_dir, version_path, storage_options)
     return registry, source, dataset_version, dataset_variant
 
 
 def zarr_init_command(args):
     """Create an empty tessera store with time dimension."""
     from rich.console import Console
-    from .zarr import init_store
+    from .zarr import STRETCH_SAMPLE_K, init_store
 
     console = Console()
 
@@ -3795,6 +3828,7 @@ def zarr_init_command(args):
             console=console,
             storage_options=store_options,
             state_url=args.state_url,
+            stretch_sample_size=args.stretch_sample_size or STRETCH_SAMPLE_K,
         )
     except FileExistsError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -3814,6 +3848,47 @@ def zarr_fill_command(args):
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
+
+    # Backfill mode scans the store itself — no tile source, no manifest.
+    # Accept the store as the only positional (argparse binds it to base_dir
+    # when store_path is absent).
+    if args.backfill_stretch_stats:
+        from .zarr import backfill_stretch_stats
+
+        store_path = args.store_path or args.base_dir
+        if store_path is None:
+            console.print(f"[red]{emoji('❌ ')}No store given.[/red]")
+            return 1
+        store_options = _storage_options_for(args, "store", store_path)
+        zones = _parse_int_range(args.zones) if args.zones else None
+        years = [args.year] if args.year else None
+        try:
+            n = backfill_stretch_stats(
+                store_path,
+                zones=zones,
+                years=years,
+                console=console,
+                storage_options=store_options,
+                state_url=args.state_url,
+                force_lock=args.force_lock,
+            )
+        except (ValueError, RuntimeError) as e:
+            console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+            return 1
+        except (ImportError, *_object_store_errors()) as e:
+            return _report_store_error(e, console)
+        console.print(
+            f"{emoji('✅ ')}{n} (zone, year) statistics rebuilt. "
+            f"Run zarr-consolidate to publish them."
+        )
+        return 0
+
+    if args.store_path is None:
+        console.print(
+            f"[red]{emoji('❌ ')}Usage: zarr-fill <source> <store> "
+            f"(the store-only form is for --backfill-stretch-stats).[/red]"
+        )
+        return 1
 
     try:
         registry, source, _version, _variant = _resolve_source(args, console)
@@ -3848,6 +3923,8 @@ def zarr_fill_command(args):
             force_lock=args.force_lock,
             state_url=args.state_url,
             skip_existing_shards=not args.rewrite_existing_shards,
+            spill_dir=args.spill_dir,
+            collect_stretch_stats=not args.no_stretch_stats,
         )
     except RuntimeError as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -4038,33 +4115,63 @@ def zarr_stretch_command(args):
     """Compute a global cross-zone RGB stretch and persist it to the store."""
     import warnings
     from rich.console import Console
-    from .zarr import compute_global_stretch
 
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
-    if not _require_local_store(args.store_path, "zarr-stretch", console):
-        return 1
-    store_path = Path(args.store_path)
     zones = _parse_int_range(args.zones) if args.zones else None
 
-    compute_global_stretch(
-        store_path=store_path,
-        year=args.year,
-        target_samples=args.target_samples,
-        max_shards=args.max_shards,
-        p_low=args.p_low,
-        p_high=args.p_high,
-        workers=args.workers,
-        zones=zones,
-        equalise=not args.no_equalise,
-        equalise_breakpoints=args.breakpoints,
-        mode=args.mode,
-        pca_components=args.pca_components,
-        pca_total_bands=args.pca_total_bands,
-        pca_rgb_order=args.pca_rgb_order,
-        console=console,
-    )
+    if args.from_shards:
+        # Legacy shard-sampling path: re-reads embeddings, local stores only.
+        from .zarr import compute_global_stretch
+
+        if not _require_local_store(args.store_path, "zarr-stretch", console):
+            return 1
+        compute_global_stretch(
+            store_path=Path(args.store_path),
+            year=args.year,
+            target_samples=args.target_samples,
+            max_shards=args.max_shards,
+            p_low=args.p_low,
+            p_high=args.p_high,
+            workers=args.workers,
+            zones=zones,
+            equalise=not args.no_equalise,
+            equalise_breakpoints=args.breakpoints,
+            mode=args.mode,
+            pca_components=args.pca_components,
+            pca_total_bands=args.pca_total_bands,
+            pca_rgb_order=args.pca_rgb_order,
+            console=console,
+        )
+        return 0
+
+    # Fast path: aggregate the per-zone statistics collected at fill time.
+    # A few MiB of reads; works against local and remote stores alike.
+    from .zarr import compute_stretch_from_stats
+
+    store_options = _storage_options_for(args, "store", args.store_path)
+    try:
+        compute_stretch_from_stats(
+            args.store_path,
+            year=args.year,
+            zones=zones,
+            p_low=args.p_low,
+            p_high=args.p_high,
+            equalise=not args.no_equalise,
+            equalise_breakpoints=args.breakpoints,
+            mode=args.mode,
+            pca_components=args.pca_components,
+            pca_rgb_order=args.pca_rgb_order,
+            drift_threshold=args.drift_threshold,
+            console=console,
+            storage_options=store_options,
+        )
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     return 0
 
@@ -4854,6 +4961,13 @@ Directory Structure:
         help="Output store path or URL (e.g. tessera.zarr, "
         "s3://bucket/tessera.zarr)",
     )
+    zarr_init_parser.add_argument(
+        "--stretch-sample-size",
+        type=int,
+        default=None,
+        help="Per-(zone, year) capacity of the raw pixel sample kept for the "
+        "global stretch quantiles (default: 20000)",
+    )
     _add_source_args(zarr_init_parser)
     _add_storage_args(zarr_init_parser, "source", "Tile source")
     _add_state_arg(zarr_init_parser)
@@ -4878,6 +4992,8 @@ Directory Structure:
     zarr_fill_parser.add_argument(
         "store_path",
         type=str,
+        nargs="?",
+        default=None,
         help="Path or URL of an existing tessera store",
     )
     zarr_fill_parser.add_argument(
@@ -4922,6 +5038,32 @@ Directory Structure:
         help="Rebuild shards that are already in the store instead of "
         "skipping them. Needed only when the tile inventory has grown, since "
         "a newly-added tile falls inside an existing shard.",
+    )
+    zarr_fill_parser.add_argument(
+        "--no-stretch-stats",
+        action="store_true",
+        help="Skip folding stretch statistics into the zone group as shards "
+        "are written (escape hatch; the global stretch then needs a backfill "
+        "or the legacy shard-sampling path)",
+    )
+    zarr_fill_parser.add_argument(
+        "--backfill-stretch-stats",
+        action="store_true",
+        help="Rebuild the selected zones' stretch statistics by scanning "
+        "their existing shards, instead of ingesting tiles. The repair path "
+        "for stores filled before fill-time collection existed, interrupted "
+        "fills, and suspected double-counting. With this flag the tile "
+        "source is not read; `zarr-fill <store> --backfill-stretch-stats` "
+        "works with the store as the only positional.",
+    )
+    zarr_fill_parser.add_argument(
+        "--spill-dir",
+        type=str,
+        default=None,
+        help="Memory-map each worker's shard buffers under this directory "
+        "instead of holding them in RAM. Trades disk for roughly 2 GiB of "
+        "anonymous memory per worker, which is what the OOM killer targets — "
+        "worth it on a memory-tight box with spare disk.",
     )
     zarr_fill_parser.add_argument(
         "--force-lock",
@@ -5220,6 +5362,22 @@ Directory Structure:
         "(PC1->R, PC2->G, PC3->B). Use '213' to swap R and G (PC2->R, "
         "PC1->G, PC3->B), '321' to fully reverse, etc.",
     )
+    zarr_stretch_parser.add_argument(
+        "--from-shards",
+        action="store_true",
+        help="Force the legacy shard-sampling path (re-reads embeddings; "
+        "local stores only). Default: aggregate the per-zone statistics "
+        "collected at fill time — a few MiB of reads, remote-capable.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--drift-threshold",
+        type=float,
+        default=0.25,
+        help="Maximum relative Frobenius distance between the stats-derived "
+        "and sample-derived covariances before warning of stale statistics "
+        "(default: 0.25)",
+    )
+    _add_storage_args(zarr_stretch_parser, "store", "Store", writable=True)
     zarr_stretch_parser.set_defaults(func=zarr_stretch_command)
 
     # Verify-tile command
