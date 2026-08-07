@@ -38,7 +38,7 @@ dependencies = [
     "dask",
     "fsspec",
     "aiohttp",
-    "geozarr-toolkit",
+    "zarr-cm>=0.4.1",
     "contextily",
 ]
 

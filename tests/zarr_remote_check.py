@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -492,6 +493,23 @@ check(
     < 0.02,
 )
 
+# Sentinel scales: huge-finite nodata values must not count as data. Some
+# published scales files carry ~FLT_MAX sentinels that pass isfinite() —
+# they inflated N by 100x and overflowed the product sums to inf.
+jemb = nprng.integers(-128, 127, (B, 64, 64), dtype=np.int8)
+jsc = nprng.random((64, 64)).astype(np.float32) * 0.01 + 0.001
+jsc[:8, :8] = np.float32(3.4e38)  # FLT_MAX-style sentinel
+jsc[8, 8] = np.float32(0.0)  # degenerate
+jsc[9, 9] = np.float32(-1.0)  # negative
+jst = shard_stretch_stats(jemb, jsc, sample_cap=100, seed=3)
+check("sentinel scales excluded from N", jst["n"] == 64 * 64 - 64 - 2)
+check("junk-free sums stay finite", bool(np.isfinite(jst["sum"]).all()))
+check("junk-free products stay finite", bool(np.isfinite(jst["prod"]).all()))
+check(
+    "sampled scales all plausible",
+    float(jst["sample_scales"].max()) < 1.0,
+)
+
 # Zone-array round trip: create, fold twice, contents accumulate.
 import zarr  # noqa: E402
 
@@ -519,6 +537,40 @@ check(
     int(zs["stretch_sample_count"][0]) <= 100,
 )
 check("other year untouched", int(zs["stretch_stats_count"][1]) == 0)
+
+# ---------------------------------------------------------------------------
+# Preview work list from shard footprints
+# ---------------------------------------------------------------------------
+
+from geotessera.zarr import GLOBAL_CHUNK, _chunks_for_shards  # noqa: E402
+
+# One shard at UTM zone 31's origin near (0.0E, ~0.9N): its footprint is
+# ~41 km, so the candidate set must be a handful of chunks, not a
+# bounding-box sweep.
+transform31 = [10.0, 0.0, 166021.44, 0.0, -10.0, 100000.0]
+chunks, regions = _chunks_for_shards({(0, 0)}, 32631, transform31, (8192, 8192))
+check("shard footprint yields a small chunk set", 0 < len(chunks) < 200)
+check("an ordinary footprint needs one region", len(regions) == 1)
+r0, r1, c0, c1 = regions[0]
+check(
+    "footprint bounds are chunk-aligned and ordered",
+    r0 < r1 and c0 < c1 and r0 % GLOBAL_CHUNK == 0 and c1 % GLOBAL_CHUNK == 0,
+)
+check(
+    "empty shard set yields no work",
+    _chunks_for_shards(set(), 32631, transform31, (8192, 8192))[0] == set(),
+)
+
+# Two far-apart shards must not fill the space between them: the union is
+# exactly the two footprints, despite a row span of >1000 chunks.
+near, _ = _chunks_for_shards({(0, 0)}, 32631, transform31, (1011712, 8192))
+far, _ = _chunks_for_shards({(200, 0)}, 32631, transform31, (1011712, 8192))
+both, _ = _chunks_for_shards({(0, 0), (200, 0)}, 32631, transform31, (1011712, 8192))
+rows = {c[0] for c in both}
+check(
+    "sparse shards keep a sparse work list",
+    both == near | far and max(rows) - min(rows) > 1000,
+)
 
 # ---------------------------------------------------------------------------
 # Storage options and source layout
@@ -577,6 +629,209 @@ check(
     == "s3://bucket/tessera/landmasks/v1/grid_0.05_52.05.tiff",
 )
 check("url source reports remote", src.is_remote)
+
+
+# ---------------------------------------------------------------------------
+# Preview work list: antimeridian footprints must not span the globe
+# ---------------------------------------------------------------------------
+# A shard straddling 180 samples corners near -180 and +180. Taking the naive
+# min/max of those makes it claim every chunk column at its latitude, which
+# for utm01/utm60 enqueued ~2.3M bogus chunks.
+
+from geotessera.zarr import (  # noqa: E402
+    GLOBAL_CHUNK,
+    GLOBAL_LEVEL0_W,
+    _chunks_for_shards,
+)
+
+N_COLS = GLOBAL_LEVEL0_W // GLOBAL_CHUNK
+
+
+def _shard_cols(epsg, origin_x, origin_y):
+    """Columns and coarsening regions of one 4096px shard at a zone origin."""
+    chunks, regions = _chunks_for_shards(
+        {(0, 0)},
+        epsg,
+        [10.0, 0.0, origin_x, 0.0, -10.0, origin_y],
+        (4096, 4096),
+    )
+    cols = {c for _r, c in chunks}
+    return cols, (max(cols) - min(cols)) if cols else 0, regions, chunks
+
+
+# EPSG:32660 has central meridian 177E, so easting ~834000 sits on the
+# antimeridian at the equator; this shard straddles it.
+wrap_cols, wrap_span, wrap_regions, wrap_chunks = _shard_cols(
+    32660, 810_000.0, 500_000.0
+)
+check(
+    "antimeridian shard does not claim the whole grid width",
+    len(wrap_cols) < N_COLS // 10,
+)
+check(
+    "antimeridian shard reaches both grid edges",
+    min(wrap_cols) == 0 and max(wrap_cols) == N_COLS - 1,
+)
+# One enclosing rectangle would span every column and make the coarsening
+# read and rewrite the entire grid width; two tight ones must not.
+check("antimeridian footprint splits into two regions", len(wrap_regions) == 2)
+wrap_slots = sum(
+    ((b - a) // GLOBAL_CHUNK) * ((d - c) // GLOBAL_CHUNK) for a, b, c, d in wrap_regions
+)
+wrap_rows = {r for r, _c in wrap_chunks}
+enclosing = (max(wrap_rows) - min(wrap_rows) + 1) * (
+    max(wrap_cols) - min(wrap_cols) + 1
+)
+check(
+    "split regions stay near the real chunk count",
+    wrap_slots <= 2 * len(wrap_chunks),
+)
+check(
+    "split beats a single enclosing rectangle by orders of magnitude",
+    wrap_slots * 100 < enclosing,
+)
+
+# A shard well inside the same zone must be unaffected by the wrap handling.
+mid_cols, mid_span, mid_regions, _mid_chunks = _shard_cols(32660, 500_000.0, 500_000.0)
+check("mid-zone shard stays contiguous", mid_span == len(mid_cols) - 1)
+check("mid-zone shard spans few columns", len(mid_cols) < 20)
+check("mid-zone shard needs one region", len(mid_regions) == 1)
+
+
+# ---------------------------------------------------------------------------
+# Global preview pyramid: destination may be local or remote
+# ---------------------------------------------------------------------------
+# The pyramid is written through a StoreLocation, so a file:// destination
+# drives the same fsspec path an s3:// one takes.
+
+import zarr  # noqa: E402
+
+from geotessera.zarr import (  # noqa: E402
+    GLOBAL_CHUNK,
+    GLOBAL_LEVEL0_H,
+    GLOBAL_LEVEL0_W,
+    GLOBAL_NUM_BANDS,
+    _coarsen_zone_pyramid,
+    _ensure_global_store,
+    _preview_marker_parts,
+)
+
+for label, dest_loc in (
+    ("local path", str(TMP / "pyr_local.zarr")),
+    ("file:// url", url(TMP / "pyr_url.zarr")),
+):
+    dest = StoreLocation.resolve(dest_loc)
+    dest.open_group(mode="a", zarr_format=3)
+    _ensure_global_store(dest, 4)
+
+    root = dest.open_group(mode="r+", zarr_format=3)
+    check(
+        f"pyramid level 0 has the global shape over {label}",
+        root["global_rgb/0/rgb"].shape
+        == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS),
+    )
+    check(f"pyramid levels created over {label}", "global_rgb/3/rgb" in root)
+    check(
+        f"pyramid registers its conventions over {label}",
+        {c["name"] for c in root["global_rgb"].attrs["zarr_conventions"]}
+        == {"spatial:", "proj:", "multiscales"},
+    )
+    check(
+        f"pyramid keeps per-level geometry over {label}",
+        "spatial:shape" in root["global_rgb"].attrs["multiscales"]["layout"][1],
+    )
+
+    # A second ensure on a matching pyramid must not wipe what is there.
+    r0, c0 = 4 * GLOBAL_CHUNK, 6 * GLOBAL_CHUNK
+    root["global_rgb/0/rgb"][r0 : r0 + GLOBAL_CHUNK, c0 : c0 + GLOBAL_CHUNK, :] = (
+        np.full((GLOBAL_CHUNK, GLOBAL_CHUNK, GLOBAL_NUM_BANDS), 200, dtype=np.uint8)
+    )
+    _ensure_global_store(dest, 4)
+    check(
+        f"re-ensure keeps existing pyramid data over {label}",
+        int(dest.open_group(mode="r", zarr_format=3)["global_rgb/0/rgb"][r0, c0, 0])
+        == 200,
+    )
+
+    _coarsen_zone_pyramid(
+        dest=dest,
+        row_start=r0,
+        row_end=r0 + GLOBAL_CHUNK,
+        col_start=c0,
+        col_end=c0 + GLOBAL_CHUNK,
+        num_levels=4,
+        workers=2,
+    )
+    check(
+        f"coarsening writes level 1 over {label}",
+        int(dest.open_group(mode="r", zarr_format=3)["global_rgb/1/rgb"][r0 // 2, c0 // 2, 0])
+        == 200,
+    )
+
+    # start_level walks the region down without touching the levels below it,
+    # which is what lets a parallel sweep stop early and a global pass finish.
+    g = dest.open_group(mode="r+", zarr_format=3)
+    g["global_rgb/1/rgb"][r0 // 2, c0 // 2, :] = 0
+    g["global_rgb/2/rgb"][r0 // 4, c0 // 4, :] = 0
+    _coarsen_zone_pyramid(
+        dest=dest,
+        row_start=r0,
+        row_end=r0 + GLOBAL_CHUNK,
+        col_start=c0,
+        col_end=c0 + GLOBAL_CHUNK,
+        num_levels=4,
+        workers=2,
+        start_level=2,
+    )
+    g = dest.open_group(mode="r", zarr_format=3)
+    check(
+        f"start_level leaves shallower levels alone over {label}",
+        int(g["global_rgb/1/rgb"][r0 // 2, c0 // 2, 0]) == 0,
+    )
+    check(
+        f"start_level still coarsens deeper levels over {label}",
+        int(g["global_rgb/2/rgb"][r0 // 4, c0 // 4, 0]) > 0,
+    )
+
+    # Markers follow an explicit state_url rather than the <store>.build
+    # sibling, so a remote pyramid can keep its bookkeeping on local disk.
+    elsewhere = StoreLocation.resolve(
+        dest_loc, None, url(TMP / f"state_{label.split()[0]}")
+    )
+    parts = _preview_marker_parts(7)
+    elsewhere.state.write_bytes(b"zone=7\n", *parts)
+    check(
+        f"state_url redirects markers off the store for {label}",
+        elsewhere.state.exists(*parts, on_denied=False)
+        and not dest.state.exists(*parts, on_denied=False),
+    )
+
+    # Resume markers belong to the state sibling, never the published store.
+    state, parts = dest.state, _preview_marker_parts(30)
+    state.write_bytes(b"zone=30\n", *parts)
+    check(
+        f"preview marker lands in the state sibling over {label}",
+        state.exists(*parts, on_denied=False)
+        and not dest.exists(*parts, on_denied=False),
+    )
+    state.remove(*parts)
+    check(
+        f"preview marker is removable over {label}",
+        not state.exists(*parts, on_denied=False),
+    )
+
+# Consolidation goes through the location too, so it works on either.
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", message="Consolidated metadata")
+    zarr.consolidate_metadata(
+        StoreLocation.resolve(url(TMP / "pyr_url.zarr")).as_zarr_store()
+    )
+check(
+    "pyramid consolidates over a url",
+    StoreLocation.resolve(url(TMP / "pyr_url.zarr")).exists(
+        "zarr.json", on_denied=False
+    ),
+)
 
 import shutil  # noqa: E402
 

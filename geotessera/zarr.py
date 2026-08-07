@@ -85,6 +85,15 @@ GLOBAL_CHUNK = 512
 GLOBAL_NUM_BANDS = 4
 GLOBAL_DEFAULT_LEVELS = 10
 
+# Deepest pyramid level a per-zone pass may coarsen while other zones run
+# concurrently. Each level halves the region, so zone strips that start far
+# apart converge until they share a 512px chunk. Measured against the real
+# written-shard footprints, an odd/even zone split has no overlapping pairs
+# through level 6 and starts colliding at level 7 (9 pairs, then 21 at level
+# 8 and 36 at level 9). Levels above this must be built by a single global
+# pass — see ``--coarsen-only``.
+COARSEN_PARALLEL_SAFE_LEVEL = 6
+
 # GeoZarr convention registration entries
 GEOEMB_CONVENTION = {
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
@@ -93,6 +102,49 @@ GEOEMB_CONVENTION = {
     "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/blob/v1/README.md",
     "schema_url": "https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/refs/tags/v1/schema.json",
 }
+
+# Revisions of the shared conventions to stamp into ``zarr_conventions``.
+# zarr-cm pins each revision to the spec commit that defined it, so these
+# resolve where a tag-based URL does not. ``multiscales`` has no r3.
+SPATIAL_REVISION = "r3"
+PROJ_REVISION = "r3"
+MULTISCALES_REVISION = "r2"
+
+
+def _geo_convention_attrs(
+    dimensions: List[str],
+    crs: str,
+    bbox: List[float],
+    transform: Optional[List[float]] = None,
+    shape: Optional[List[int]] = None,
+    registration: str = "pixel",
+) -> Dict[str, Any]:
+    """Build ``spatial:`` and ``proj:`` attrs plus their registrations.
+
+    Arguments left as None are omitted rather than written as nulls, so a
+    group that has no single affine transform (the multiscale pyramid root,
+    whose geometry is per level) carries only the attributes it can state.
+    """
+    from zarr_cm import geo_proj, spatial
+
+    attrs: Dict[str, Any] = {}
+    attrs = spatial.insert(
+        attrs,
+        spatial.create(
+            revision=SPATIAL_REVISION,
+            dimensions=dimensions,
+            bbox=bbox,
+            transform_type="affine",
+            transform=transform,
+            shape=shape,
+            registration=registration,
+        ),
+    )
+    attrs = geo_proj.insert(
+        attrs,
+        geo_proj.create(revision=PROJ_REVISION, code=crs),
+    )
+    return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -714,100 +766,153 @@ def _run_parallel(
 # ---------------------------------------------------------------------------
 
 
-def _preview_marker_path(store_path: Path, zone_num: int) -> Path:
-    """Resume marker for a zone's global-preview reprojection.
+def _preview_marker_parts(zone_num: int) -> Tuple[str, str]:
+    """Key of a zone's global-preview resume marker within the state area.
 
-    Kept in the state sibling (``<store>.build/_preview/``) rather than the
-    store, for the same reason as the ingestion registry: the published Zarr
-    hierarchy should contain only Zarr.
+    Markers live in the state sibling (``<store>.build/_preview/``) rather
+    than the store, for the same reason as the ingestion registry: the
+    published Zarr hierarchy should contain only Zarr. Returned relative to
+    :attr:`StoreLocation.state` so the same marker works on a local pyramid
+    and one on object storage.
     """
-    return Path(f"{str(store_path).rstrip('/')}.build") / "_preview" / (
-        f"zone_{zone_num}_done"
-    )
+    return ("_preview", f"zone_{zone_num}_done")
 
 
-def _zone_output_bounds(
+def _chunks_for_shards(
+    present: set,
     zone_epsg: int,
     zone_transform: list,
     zone_shape: tuple,
-) -> Tuple[int, int, int, int]:
-    """Compute the chunk-aligned output bounds for a zone in global grid pixels.
+) -> Tuple[set, List[Tuple[int, int, int, int]]]:
+    """Output chunks that can actually receive data, from present shards.
 
-    Returns (row_start, row_end, col_start, col_end).
+    A zone's *bounding rectangle* back-projected to lon/lat is hopeless as a
+    work list: a high-latitude zone spans most longitudes at its top edge,
+    which for utm02 meant ~5.6 million candidate chunks to render 28 shards.
+    Projecting each present shard's footprint instead yields only the chunks
+    its data can touch — the same objects-are-the-truth move the fill makes.
+
+    Returns (chunk (row, col) set, list of (row_start, row_end, col_start,
+    col_end) rectangles in level-0 pixels, chunk-aligned). The rectangles
+    cover the same chunks and drive the pyramid coarsening; see
+    :func:`_regions_for_chunks` for why there can be more than one.
     """
     from pyproj import Transformer
 
+    if not present:
+        return set(), (0, 0, 0, 0)
+
     src_pixel = zone_transform[0]
-    src_origin_e = zone_transform[2]
-    src_origin_n = zone_transform[5]
-    src_h, src_w = zone_shape[:2]
+    origin_e = zone_transform[2]
+    origin_n = zone_transform[5]
+    H, W = zone_shape[:2]
+    west, _s, _e, north = GLOBAL_BOUNDS
 
-    west, _south, _east, north = GLOBAL_BOUNDS
+    to_4326 = Transformer.from_crs(f"EPSG:{zone_epsg}", "EPSG:4326", always_xy=True)
 
-    to_4326 = Transformer.from_crs(
-        f"EPSG:{zone_epsg}",
-        "EPSG:4326",
-        always_xy=True,
-    )
-    corners_utm = [
-        (src_origin_e, src_origin_n),
-        (src_origin_e + src_w * src_pixel, src_origin_n),
-        (src_origin_e, src_origin_n - src_h * src_pixel),
-        (src_origin_e + src_w * src_pixel, src_origin_n - src_h * src_pixel),
-    ]
-    mid_e = src_origin_e + src_w * src_pixel / 2
-    mid_n = src_origin_n - src_h * src_pixel / 2
-    corners_utm += [
-        (mid_e, src_origin_n),
-        (mid_e, src_origin_n - src_h * src_pixel),
-        (src_origin_e, mid_n),
-        (src_origin_e + src_w * src_pixel, mid_n),
-    ]
-    corners_4326 = [to_4326.transform(e, n) for e, n in corners_utm]
-    lons = [c[0] for c in corners_4326]
-    lats = [c[1] for c in corners_4326]
+    chunks: set = set()
+    for sr, sc in present:
+        r0, c0 = sr * SHARD_SIZE, sc * SHARD_SIZE
+        r1, c1 = min(r0 + SHARD_SIZE, H), min(c0 + SHARD_SIZE, W)
+        es = [origin_e + c0 * src_pixel, origin_e + c1 * src_pixel]
+        ns = [origin_n - r0 * src_pixel, origin_n - r1 * src_pixel]
+        # Corners plus edge midpoints: enough to bound the curved footprint.
+        pts_e = [es[0], es[1], es[0], es[1], (es[0] + es[1]) / 2,
+                 (es[0] + es[1]) / 2, es[0], es[1]]
+        pts_n = [ns[0], ns[0], ns[1], ns[1], ns[0], ns[1],
+                 (ns[0] + ns[1]) / 2, (ns[0] + ns[1]) / 2]
+        lons, lats = to_4326.transform(pts_e, pts_n)
+        finite = [(lo, la) for lo, la in zip(lons, lats)
+                  if math.isfinite(lo) and math.isfinite(la)]
+        if not finite:
+            continue
+        la_min = min(p[1] for p in finite)
+        la_max = max(p[1] for p in finite)
 
-    zlon_min, zlon_max = min(lons), max(lons)
-    zlat_min, zlat_max = min(lats), max(lats)
+        # A shard straddling the antimeridian samples corners near -180 and
+        # +180, whose naive min/max spans the globe and would enqueue every
+        # chunk column at that latitude — for utm01/utm60 that was ~2.3M
+        # bogus chunks, a third of a year's work list. Re-measuring the span
+        # with longitudes shifted to [0, 360) detects the wrap, because that
+        # frame's discontinuity is at 0 rather than at the antimeridian; the
+        # footprint is then contiguous and splits into two column ranges.
+        # Near a pole a shard genuinely does span most longitudes and both
+        # frames stay wide, so the full range is kept.
+        lons_f = [p[0] for p in finite]
+        lo_min, lo_max = min(lons_f), max(lons_f)
+        shifted = [lo % 360.0 for lo in lons_f]
+        sh_min, sh_max = min(shifted), max(shifted)
+        if (lo_max - lo_min) > 180.0 and (sh_max - sh_min) < 180.0:
+            lon_ranges = [(sh_min, 180.0), (-180.0, sh_max - 360.0)]
+        else:
+            lon_ranges = [(lo_min, lo_max)]
 
-    col_start = max(
-        0,
-        (
-            int(math.floor((zlon_min - west) / GLOBAL_BASE_RES))
-            // GLOBAL_CHUNK
-            * GLOBAL_CHUNK
-        ),
-    )
-    col_end = min(
-        GLOBAL_LEVEL0_W,
-        (
-            (int(math.ceil((zlon_max - west) / GLOBAL_BASE_RES)) + GLOBAL_CHUNK - 1)
-            // GLOBAL_CHUNK
-            * GLOBAL_CHUNK
-        ),
-    )
-    row_start = max(
-        0,
-        (
-            int(math.floor((north - zlat_max) / GLOBAL_BASE_RES))
-            // GLOBAL_CHUNK
-            * GLOBAL_CHUNK
-        ),
-    )
-    row_end = min(
-        GLOBAL_LEVEL0_H,
-        (
-            (int(math.ceil((north - zlat_min) / GLOBAL_BASE_RES)) + GLOBAL_CHUNK - 1)
-            // GLOBAL_CHUNK
-            * GLOBAL_CHUNK
-        ),
-    )
+        cr0 = max(0, int((north - la_max) / GLOBAL_BASE_RES) // GLOBAL_CHUNK - 1)
+        cr1 = min(
+            GLOBAL_LEVEL0_H // GLOBAL_CHUNK,
+            int((north - la_min) / GLOBAL_BASE_RES) // GLOBAL_CHUNK + 2,
+        )
+        # One chunk of margin absorbs footprint curvature between samples.
+        for lo_a, lo_b in lon_ranges:
+            cc0 = max(0, int((lo_a - west) / GLOBAL_BASE_RES) // GLOBAL_CHUNK - 1)
+            cc1 = min(
+                GLOBAL_LEVEL0_W // GLOBAL_CHUNK,
+                int((lo_b - west) / GLOBAL_BASE_RES) // GLOBAL_CHUNK + 2,
+            )
+            for cr in range(cr0, cr1):
+                for cc in range(cc0, cc1):
+                    chunks.add((cr, cc))
 
-    return (row_start, row_end, col_start, col_end)
+    return chunks, _regions_for_chunks(chunks)
+
+
+def _regions_for_chunks(chunks: set) -> List[Tuple[int, int, int, int]]:
+    """Chunk-aligned pixel rectangles covering *chunks*, for the coarsening.
+
+    Normally one rectangle. A zone straddling the antimeridian holds chunks
+    at both edges of the grid and none between, and a single enclosing
+    rectangle then spans every column: 16.7M chunk slots for utm60's 38k real
+    chunks, each of which the coarsening pass reads and rewrites. Splitting on
+    a column gap wider than half the grid keeps that case to two tight
+    rectangles and leaves every other zone with exactly one.
+    """
+    if not chunks:
+        return []
+
+    cols = sorted({c for _r, c in chunks})
+    split_at = None
+    if len(cols) > 1:
+        gap, idx = max((cols[i + 1] - cols[i], i) for i in range(len(cols) - 1))
+        if gap > (GLOBAL_LEVEL0_W // GLOBAL_CHUNK) // 2:
+            split_at = cols[idx + 1]
+
+    if split_at is None:
+        groups = [chunks]
+    else:
+        groups = [
+            {(r, c) for r, c in chunks if c < split_at},
+            {(r, c) for r, c in chunks if c >= split_at},
+        ]
+
+    regions = []
+    for group in groups:
+        if not group:
+            continue
+        rows = [r for r, _c in group]
+        gcols = [c for _r, c in group]
+        regions.append(
+            (
+                min(rows) * GLOBAL_CHUNK,
+                (max(rows) + 1) * GLOBAL_CHUNK,
+                min(gcols) * GLOBAL_CHUNK,
+                (max(gcols) + 1) * GLOBAL_CHUNK,
+            )
+        )
+    return regions
 
 
 def _coarsen_zone_pyramid(
-    store_path: Path,
+    dest: "StoreLocation",
     row_start: int,
     row_end: int,
     col_start: int,
@@ -815,18 +920,22 @@ def _coarsen_zone_pyramid(
     num_levels: int,
     workers: int,
     console: Optional["rich.console.Console"] = None,
+    start_level: int = 1,
 ) -> None:
-    """Update pyramid levels 1 through num_levels-1 for the affected region.
+    """Update pyramid levels ``start_level``..``num_levels``-1 for a region.
 
     Reads from the previous level and writes coarsened data to the current
     level, processing in 2D tiles parallelised with a thread pool.
+
+    Levels below *start_level* are still walked, because each level's region
+    is derived by halving the one above it, but no data is touched there.
+    That is what lets a parallel zone sweep stop at
+    :data:`COARSEN_PARALLEL_SAFE_LEVEL` and a single global pass pick up the
+    rest.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    import zarr
 
-    root = zarr.open_group(
-        str(store_path), mode="r+", zarr_format=3, use_consolidated=False
-    )
+    root = dest.open_group(mode="r+", zarr_format=3)
 
     prev_row_start, prev_row_end = row_start, row_end
     prev_col_start, prev_col_end = col_start, col_end
@@ -855,6 +964,12 @@ def _coarsen_zone_pyramid(
 
         if lr_end <= lr_start or lc_end <= lc_start:
             break
+
+        if lvl < start_level:
+            # Walk the region down to the starting level without touching it.
+            prev_row_start, prev_row_end = lr_start, lr_end
+            prev_col_start, prev_col_end = lc_start, lc_end
+            continue
 
         if console is not None:
             console.print(
@@ -943,6 +1058,20 @@ INNER_CHUNK = 32  # spatial pixels per inner chunk side
 # Default per-(zone, year) capacity of the raw pixel sample kept for the
 # global stretch quantiles (docs/specs/zarr-stretch-stats.md).
 STRETCH_SAMPLE_K = 20_000
+
+# Scales above this are treated as nodata. Some published scales files carry
+# a huge-finite sentinel (~FLT_MAX) that passes isfinite(): real per-pixel
+# quantisation scales here are O(0.1), and a sentinel pixel squared
+# overflows float32 — utm04's stored sum reached 1e37 and its product
+# matrix went inf from a handful of such pixels. Six orders of magnitude of
+# headroom above anything plausible, thirty-two below the sentinel.
+MAX_VALID_SCALE = 1.0e6
+
+
+def valid_scale_mask(scales: np.ndarray) -> np.ndarray:
+    """True where a scale denotes real data: finite, positive, plausible."""
+    with np.errstate(invalid="ignore"):
+        return np.isfinite(scales) & (scales > 0) & (scales < MAX_VALID_SCALE)
 DEFAULT_WORKERS = 4  # fewer workers due to larger shard buffers (~2GB each)
 
 # Each shard worker holds a full (N_BANDS, SHARD_SIZE, SHARD_SIZE) int8
@@ -1442,40 +1571,28 @@ def _create_zone_group(
         math.ceil(W / SHARD_SIZE),
     )
 
-    # Use geozarr-toolkit for proj: and spatial: convention metadata
-    from geozarr_toolkit import create_geozarr_attrs
-
     x_min = grid.origin_x
     x_max = grid.origin_x + W * grid.pixel_size
     y_max = grid.origin_y
     y_min = grid.origin_y - H * grid.pixel_size
 
-    geozarr_attrs = create_geozarr_attrs(
-        dimensions=["y", "x"],
-        crs=f"EPSG:{grid.canonical_epsg}",
-        transform=[
-            grid.pixel_size,
-            0.0,
-            grid.origin_x,
-            0.0,
-            -grid.pixel_size,
-            grid.origin_y,
-        ],
-        bbox=[x_min, y_min, x_max, y_max],
-        shape=[H, W],
-        registration="pixel",
-    )
-
-    # Fix convention descriptions to match upstream schemas exactly
-    # (geozarr-toolkit has a bug: "Spatial coordinate and transformation
-    # information" instead of "Spatial coordinate information")
-    for conv in geozarr_attrs.get("zarr_conventions", []):
-        if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
-            conv["description"] = "Spatial coordinate information"
-
     # Zone groups only carry proj: and spatial: conventions (geoemb: is on root)
-
-    store.attrs.update(geozarr_attrs)
+    store.attrs.update(
+        _geo_convention_attrs(
+            dimensions=["y", "x"],
+            crs=f"EPSG:{grid.canonical_epsg}",
+            transform=[
+                grid.pixel_size,
+                0.0,
+                grid.origin_x,
+                0.0,
+                -grid.pixel_size,
+                grid.origin_y,
+            ],
+            bbox=[x_min, y_min, x_max, y_max],
+            shape=[H, W],
+        )
+    )
 
     return store
 
@@ -1660,7 +1777,7 @@ def shard_stretch_stats(
 
     Returns None when the shard has no valid pixels.
     """
-    valid = np.isfinite(scales_buf)
+    valid = valid_scale_mask(scales_buf)
     flat = np.flatnonzero(valid.ravel())
     n = int(flat.size)
     if n == 0:
@@ -2176,7 +2293,9 @@ def _fill_and_write_shard(
             storage_options=source_options,
         )
         s[lm == 0] = np.float32("nan")
-        s[~np.isfinite(s)] = np.float32("nan")
+        # Non-finite, non-positive and sentinel-huge scales are all nodata;
+        # storing them as NaN keeps every reader's isfinite() test honest.
+        s[~valid_scale_mask(s)] = np.float32("nan")
 
         scales_buf[ov.s_row_start : ov.s_row_end, ov.s_col_start : ov.s_col_end] = s
         has_data = True
@@ -3221,7 +3340,7 @@ def _compute_rgb_chunk(
     """
     h, w = scales_hw.shape
     rgba = np.zeros((4, h, w), dtype=np.uint8)
-    valid = np.isfinite(scales_hw)
+    valid = valid_scale_mask(scales_hw)
     scales_safe = np.where(valid, scales_hw, 0.0)
 
     # Build the per-channel float arrays. Two paths:
@@ -3308,7 +3427,7 @@ def _sample_chunk_stats(
     c0, c1 = cj * shard_size, min(cj * shard_size + shard_size, W)
 
     scales_chunk = np.asarray(scales_arr[time_index, r0:r1, c0:c1])
-    valid = np.isfinite(scales_chunk)
+    valid = valid_scale_mask(scales_chunk)
     if not np.any(valid):
         return None
 
@@ -3429,8 +3548,13 @@ def compute_stretch_from_stats(
     drift_threshold: float = 0.25,
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
+    persist: bool = True,
 ) -> dict:
     """Derive the global stretch from the per-zone ``stretch_*`` arrays.
+
+    With ``persist=False`` the stretch entry is returned without touching
+    the store — how a read-only consumer (a preview against a store it
+    cannot write to) gets a stretch from the live statistics.
 
     The fast path of ``zarr-stretch`` (docs/specs/zarr-stretch-stats.md):
     reads a few MiB of per-zone summaries instead of terabytes of shards.
@@ -3458,6 +3582,7 @@ def compute_stretch_from_stats(
     sample_parts: List[Tuple[np.ndarray, np.ndarray, float]] = []
     zones_used: List[str] = []
     zones_missing: List[str] = []
+    zones_poisoned: List[str] = []
 
     for name in zone_names:
         group = store.open_group(mode="r", path=name)
@@ -3473,9 +3598,14 @@ def compute_stretch_from_stats(
         n_z = int(group["stretch_stats_count"][t])
         if n_z == 0:
             continue
+        s_z = np.asarray(group["stretch_stats_sum"][t])
+        m_z = np.asarray(group["stretch_stats_prod"][t])
+        if not (np.isfinite(s_z).all() and np.isfinite(m_z).all()):
+            zones_poisoned.append(name)
+            continue
         n_total += n_z
-        s_total += np.asarray(group["stretch_stats_sum"][t])
-        m_total += np.asarray(group["stretch_stats_prod"][t])
+        s_total += s_z
+        m_total += m_z
 
         k_z = int(group["stretch_sample_count"][t])
         if k_z > 0:
@@ -3488,6 +3618,14 @@ def compute_stretch_from_stats(
             )
         zones_used.append(name)
 
+    if zones_poisoned:
+        raise ValueError(
+            f"Stretch statistics for {', '.join(zones_poisoned)} contain "
+            f"non-finite sums — collected before sentinel-scale filtering "
+            f"existed, so nodata pixels with huge finite scales overflowed "
+            f"them. Rebuild with `zarr-fill <store> --backfill-stretch-stats "
+            f"--zones {','.join(z[3:].lstrip('0') for z in zones_poisoned)}`."
+        )
     if zones_missing:
         raise ValueError(
             f"{len(zones_missing)} zone(s) have no stretch-statistics arrays "
@@ -3537,9 +3675,16 @@ def compute_stretch_from_stats(
         # two covariances — comparing eigenvectors instead would false-alarm
         # whenever eigenvalues are close, where the vectors are arbitrary.
         cov_s = np.cov(x.T, aweights=weights)
-        drift = float(
-            np.linalg.norm(cov - cov_s) / max(np.linalg.norm(cov), 1e-30)
-        )
+        with np.errstate(invalid="ignore", over="ignore"):
+            drift = float(
+                np.linalg.norm(cov - cov_s) / max(np.linalg.norm(cov), 1e-30)
+            )
+        if not math.isfinite(drift):
+            raise RuntimeError(
+                "Drift check is non-finite — the aggregated statistics are "
+                "corrupt. Rebuild them with `zarr-fill <store> "
+                "--backfill-stretch-stats`."
+            )
         # The sample covariance itself carries ~sqrt(d/n_eff) relative error,
         # so the alarm floor scales with the effective sample size — a small
         # sample must not read as drift.
@@ -3600,10 +3745,8 @@ def compute_stretch_from_stats(
                     bks[j] = bks[j - 1] + 1e-9
             cdf_breaks.append([float(v) for v in bks])
 
-    # Persist with the same key set as the legacy path so readers
+    # The same key set as the legacy path so readers
     # (_load_global_stretch, build_global_preview) are unaffected.
-    root_rw = store.open_group(mode="r+")
-    stretch_map = dict(root_rw.attrs.get(_GLOBAL_STRETCH_ATTR, {}))
     method_prefix = "zone_stats_pca" if mode == "pca" else "zone_stats_percentile"
     entry: Dict[str, Any] = {
         "min": stretch_min,
@@ -3623,17 +3766,19 @@ def compute_stretch_from_stats(
         entry["pca_components"] = pca_proj_components
         entry["pca_mean"] = pca_proj_mean
         entry["pca_explained_variance_ratio"] = pca_evr
-    stretch_map[str(year)] = entry
-    root_rw.attrs[_GLOBAL_STRETCH_ATTR] = stretch_map
+    if persist:
+        root_rw = store.open_group(mode="r+")
+        stretch_map = dict(root_rw.attrs.get(_GLOBAL_STRETCH_ATTR, {}))
+        stretch_map[str(year)] = entry
+        root_rw.attrs[_GLOBAL_STRETCH_ATTR] = stretch_map
+        if console:
+            console.print(
+                f"[green]Saved to {_GLOBAL_STRETCH_ATTR}.{year} on the store "
+                f"root.[/green] Run zarr-consolidate so consolidated-metadata "
+                f"readers see it."
+            )
 
-    if console:
-        console.print(
-            f"[green]Saved to {_GLOBAL_STRETCH_ATTR}.{year} on the store "
-            f"root.[/green] Run zarr-consolidate so consolidated-metadata "
-            f"readers see it."
-        )
-
-    return {"min": stretch_min, "max": stretch_max, "samples": int(channels.shape[0])}
+    return entry
 
 
 def backfill_stretch_stats(
@@ -4082,7 +4227,11 @@ def compute_global_stretch(
     }
 
 
-def _load_global_stretch(store_path: Path, year: int) -> Optional[dict]:
+def _load_global_stretch(
+    store_path: "str | Path | StoreLocation",
+    year: int,
+    storage_options: Optional[Dict[str, Any]] = None,
+) -> Optional[dict]:
     """Look up a previously-computed global stretch for ``year``.
 
     Returns ``{"min": [..], "max": [..], "cdf": [[..], ..],
@@ -4090,9 +4239,7 @@ def _load_global_stretch(store_path: Path, year: int) -> Optional[dict]:
     only populated when the stretch was computed in ``mode='pca'``.
     Returns ``None`` if no stretch is stored for the year.
     """
-    import zarr
-
-    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    root = StoreLocation.resolve(store_path, storage_options).open_group(mode="r")
     stretch_map = root.attrs.get(_GLOBAL_STRETCH_ATTR, {})
     if not isinstance(stretch_map, dict):
         return None
@@ -4118,26 +4265,30 @@ def _load_global_stretch(store_path: Path, year: int) -> Optional[dict]:
 # coarsening.
 
 
-def _ensure_global_store(store_path: Path, num_levels: int) -> None:
+def _ensure_global_store(dest: "StoreLocation", num_levels: int) -> None:
     """Create the global_rgb/ pyramid group within the store."""
-    import zarr
     from zarr.codecs import BloscCodec
 
-    root = zarr.open_group(
-        str(store_path), mode="r+", zarr_format=3, use_consolidated=False
-    )
+    root = dest.open_group(mode="r+", zarr_format=3)
 
     # Check if already exists with correct shape
     if "global_rgb/0/rgb" in root:
         shape = root["global_rgb/0/rgb"].shape
         if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
             return
+        if dest.is_remote:
+            # Dropping the prefix could be millions of objects; deleting that
+            # implicitly is not something a build step should decide.
+            raise ValueError(
+                f"{dest} already holds a global_rgb pyramid of shape {shape}, "
+                f"which does not match the expected "
+                f"{(GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS)}. "
+                f"Delete the global_rgb/ prefix yourself and re-run."
+            )
         import shutil
 
-        shutil.rmtree(str(store_path / "global_rgb"))
-        root = zarr.open_group(
-            str(store_path), mode="r+", zarr_format=3, use_consolidated=False
-        )
+        shutil.rmtree(str(Path(dest.url) / "global_rgb"))
+        root = dest.open_group(mode="r+", zarr_format=3)
 
     # Create pyramid levels via zarr API
     global_grp = root.create_group("global_rgb")
@@ -4167,18 +4318,12 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
         w //= 2
 
     # Re-open the global_rgb group to ensure attrs write to the correct handle
-    root = zarr.open_group(
-        str(store_path), mode="r+", zarr_format=3, use_consolidated=False
-    )
+    root = dest.open_group(mode="r+", zarr_format=3)
     global_grp = root["global_rgb"]
 
     # Build multiscale + spatial + proj metadata directly
     # (avoids depending on unstable topozarr API)
-    from geozarr_toolkit import (
-        create_geozarr_attrs,
-        create_multiscales_layout,
-    )
-    from geozarr_toolkit.conventions.multiscales import MultiscalesConventionMetadata
+    from zarr_cm import multiscales
 
     west, south, east, north_ = GLOBAL_BOUNDS
     actual_levels = len([k for k in global_grp.keys() if k.isdigit()])
@@ -4202,27 +4347,23 @@ def _ensure_global_store(store_path: Path, num_levels: int) -> None:
         w_lvl //= 2
         res *= 2.0
 
-    ms_layout = create_multiscales_layout(levels, resampling_method="mean")
-
-    # Geospatial attrs (proj + spatial)
-    geozarr_attrs = create_geozarr_attrs(
+    # The pyramid root states no single transform or shape — each level
+    # carries its own in the layout entries above. Insert multiscales last so
+    # it joins the same ``zarr_conventions`` list rather than replacing it.
+    attrs = _geo_convention_attrs(
         dimensions=["lat", "lon"],
         crs="EPSG:4326",
         bbox=[west, south, east, north_],
     )
-
-    # Fix spatial description bug in geozarr-toolkit
-    for conv in geozarr_attrs.get("zarr_conventions", []):
-        if conv.get("uuid") == "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4":
-            conv["description"] = "Spatial coordinate information"
-
-    # Add multiscales convention registration
-    ms_conv = MultiscalesConventionMetadata()
-    geozarr_attrs["zarr_conventions"].insert(0, ms_conv.model_dump(exclude_none=True))
-
-    # Merge all attrs
-    geozarr_attrs.update(ms_layout)
-    global_grp.attrs.update(geozarr_attrs)
+    attrs = multiscales.insert(
+        attrs,
+        multiscales.create(
+            revision=MULTISCALES_REVISION,
+            layout=levels,
+            resampling_method="mean",
+        ),
+    )
+    global_grp.attrs.update(attrs)
 
 
 # Per-worker state for reprojection
@@ -4235,21 +4376,40 @@ _reproj_stretch = None
 
 
 def _init_reproj_worker(
-    store_path: str,
+    source_url: str,
+    source_options: Optional[Dict[str, Any]],
+    dest_url: str,
+    dest_options: Optional[Dict[str, Any]],
     zone_group: str,
     zone_epsg: int,
     time_index: int,
     stretch: dict,
 ) -> None:
-    """Process pool initializer: open stores and create transformer."""
+    """Process pool initializer: open stores and create transformer.
+
+    The zone embeddings are read from ``source_url`` and the pyramid written
+    to ``dest_url``; either may be a remote store, and they may live on
+    different endpoints with different credentials. Workers are spawned, so
+    remote filesystem state is built fresh here rather than inherited from a
+    fork.
+    """
     global _reproj_global_arr, _reproj_emb_arr, _reproj_scales_arr
     global _reproj_to_utm, _reproj_time_index, _reproj_stretch
-    import zarr
     from pyproj import Transformer
 
-    root = zarr.open_group(store_path, mode="r+", zarr_format=3, use_consolidated=False)
-    _reproj_global_arr = root["global_rgb/0/rgb"]
-    zone = root[zone_group]
+    from . import remote
+
+    remote.quieten_dependency_logging()
+    remote.reset_after_fork()
+    remote.die_with_parent()
+
+    dest = StoreLocation(dest_url, dest_options).open_group(
+        mode="r+", zarr_format=3
+    )
+    _reproj_global_arr = dest["global_rgb/0/rgb"]
+    zone = StoreLocation(source_url, source_options).open_group(
+        mode="r", path=zone_group
+    )
     _reproj_emb_arr = zone["embeddings"]
     _reproj_scales_arr = zone["scales"]
     _reproj_to_utm = Transformer.from_crs(
@@ -4373,7 +4533,7 @@ def _reproject_chunk(
 
     # Compute RGB on the fly from embeddings + scales (no stored rgb array needed)
     scales_chunk = np.asarray(scales_arr[time_index, r_min:r_max, c_min:c_max])
-    valid = np.isfinite(scales_chunk)
+    valid = valid_scale_mask(scales_chunk)
     if not np.any(valid):
         return False
 
@@ -4470,7 +4630,8 @@ def _reproject_chunk(
 
 
 def _reproject_zone(
-    store_path: Path,
+    source: StoreLocation,
+    dest: "StoreLocation",
     zone_num: int,
     zone_group: str,
     zone_epsg: int,
@@ -4479,64 +4640,64 @@ def _reproject_zone(
     time_index: int,
     stretch: dict,
     workers: int,
+    present: set,
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
-) -> Tuple[int, int, int, int, bool]:
-    """Reproject one zone's embeddings into global level 0 (computing RGB on the fly)."""
+) -> Tuple[List[Tuple[int, int, int, int]], bool]:
+    """Reproject one zone's embeddings into global level 0.
+
+    Embeddings are read from *source* and the pyramid's level 0 written into
+    *dest*; either may be local or remote. ``present`` is the zone's set of
+    existing shard coordinates for this year — the work list is derived from
+    their footprints, never from the zone's bounding box, which at high
+    latitude covers most longitudes and would enqueue millions of empty
+    chunks.
+
+    Returns (rectangles the zone touched, whether work was done); the
+    rectangles feed the coarsening.
+    """
+    import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # Spawn, not fork: the source may be a remote store, and a forked
+    # worker inheriting fsspec's event loop without its thread deadlocks.
+    mp_context = multiprocessing.get_context("spawn")
 
     src_pixel = zone_transform[0]
     src_origin_e = zone_transform[2]
     src_origin_n = zone_transform[5]
     src_h, src_w = zone_shape[:2]
 
-    row_start, row_end, col_start, col_end = _zone_output_bounds(
-        zone_epsg=zone_epsg,
-        zone_transform=zone_transform,
-        zone_shape=(src_h, src_w),
+    chunk_set, regions = _chunks_for_shards(
+        present, zone_epsg, zone_transform, (src_h, src_w)
     )
-
-    if col_end <= col_start or row_end <= row_start:
+    if not chunk_set:
         if console:
-            console.print(f"    [yellow]Zone {zone_num}: no output region[/yellow]")
-        return (0, 0, 0, 0, False)
-
-    n_chunk_rows = (row_end - row_start) // GLOBAL_CHUNK
-    n_chunk_cols = (col_end - col_start) // GLOBAL_CHUNK
-    chunk_row_start = row_start // GLOBAL_CHUNK
-    chunk_col_start = col_start // GLOBAL_CHUNK
+            console.print(f"    [yellow]Zone {zone_num}: no data to render[/yellow]")
+        return ([], False)
 
     # Resume check. The marker lives in the state sibling, not the store, so
     # the published hierarchy stays free of non-Zarr objects.
-    marker = _preview_marker_path(store_path, zone_num)
-    if marker.exists():
+    state = dest.state
+    marker = _preview_marker_parts(zone_num)
+    if state.exists(*marker, on_denied=False):
         if force:
-            marker.unlink()
+            state.remove(*marker)
         else:
             if console:
                 console.print(f"    Zone {zone_num:02d}: already complete, skipping")
-            return (row_start, row_end, col_start, col_end, False)
+            return (regions, False)
 
-    chunks_total = n_chunk_rows * n_chunk_cols
+    chunks_total = len(chunk_set)
     if console:
         console.print(
-            f"    Zone {zone_num:02d}: {n_chunk_rows}x{n_chunk_cols} "
-            f"= {chunks_total} chunks"
+            f"    Zone {zone_num:02d}: {chunks_total:,} candidate chunk(s) "
+            f"from {len(present)} shard footprint(s)"
         )
 
     work_items = [
-        (
-            chunk_row_start + cr,
-            chunk_col_start + cc,
-            zone_epsg,
-            src_pixel,
-            src_origin_e,
-            src_origin_n,
-            src_h,
-            src_w,
-        )
-        for cr in range(n_chunk_rows)
-        for cc in range(n_chunk_cols)
+        (cr, cc, zone_epsg, src_pixel, src_origin_e, src_origin_n, src_h, src_w)
+        for cr, cc in sorted(chunk_set)
     ]
 
     chunks_written = 0
@@ -4567,8 +4728,18 @@ def _reproject_zone(
             )
             with ProcessPoolExecutor(
                 max_workers=workers,
+                mp_context=mp_context,
                 initializer=_init_reproj_worker,
-                initargs=(str(store_path), zone_group, zone_epsg, time_index, stretch),
+                initargs=(
+                    source.url,
+                    source.storage_options,
+                    dest.url,
+                    dest.storage_options,
+                    zone_group,
+                    zone_epsg,
+                    time_index,
+                    stretch,
+                ),
             ) as pool:
                 futures = {
                     pool.submit(_reproject_chunk_worker, item): item
@@ -4585,8 +4756,18 @@ def _reproject_zone(
     else:
         with ProcessPoolExecutor(
             max_workers=workers,
+            mp_context=mp_context,
             initializer=_init_reproj_worker,
-            initargs=(str(store_path), zone_group, zone_epsg, time_index, stretch),
+            initargs=(
+                source.url,
+                source.storage_options,
+                dest.url,
+                dest.storage_options,
+                zone_group,
+                zone_epsg,
+                time_index,
+                stretch,
+            ),
         ) as pool:
             futures = {
                 pool.submit(_reproject_chunk_worker, item): item for item in work_items
@@ -4598,16 +4779,16 @@ def _reproject_zone(
                 except Exception as e:
                     logger.warning(f"Reproject chunk failed: {e}")
 
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(
-        f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n"
+    state.write_bytes(
+        f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n".encode(),
+        *marker,
     )
 
-    return (row_start, row_end, col_start, col_end, True)
+    return (regions, True)
 
 
 def build_global_preview(
-    store_path: Path,
+    store_path: "str | Path | StoreLocation",
     year: int = 2024,
     zones: Optional[List[int]] = None,
     num_levels: int = GLOBAL_DEFAULT_LEVELS,
@@ -4616,12 +4797,40 @@ def build_global_preview(
     saturation: float = 1.0,
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
+    storage_options: Optional[Dict[str, Any]] = None,
+    output_path: "Optional[str | Path | StoreLocation]" = None,
+    output_storage_options: Optional[Dict[str, Any]] = None,
+    state_url: Optional[str] = None,
+    state_storage_options: Optional[Dict[str, Any]] = None,
+    reproject_only: bool = False,
+    coarsen_only: bool = False,
 ) -> None:
     """Build the global EPSG:4326 RGB pyramid from zone-level embeddings.
 
-    Computes RGB from embeddings+scales (bands 0-2) for the specified year,
-    reprojects from UTM to geographic coordinates and composites into the
-    pyramid. No pre-computed rgb array needed.
+    Computes RGB from embeddings+scales for the specified year, reprojects
+    from UTM to geographic coordinates and composites into the pyramid.
+
+    Source and destination are independent locations, each local or remote
+    with its own credentials, so a pyramid can be written to a bucket while
+    embeddings stream anonymously from a read-only mirror — reads are
+    sub-shard byte ranges, so no copy of the source is ever made. Without
+    ``output_path`` the pyramid is written into the source store itself. If
+    the store carries no persisted ``geoemb:stretch`` for the year, one is
+    computed on the fly from the per-zone stretch statistics — a few MiB of
+    reads — so previewing a read-only store needs no prior ``zarr-stretch``.
+
+    Zones are composited into shared level-0 chunks with a read-modify-write,
+    so by default separate invocations must not run **concurrently** against
+    the same destination. Running them one at a time (``--zones N`` per
+    invocation) is safe and resumable: each zone records a marker in the
+    state area, which ``state_url`` can place on local disk even when the
+    pyramid itself is remote.
+
+    For a parallel sweep, *reproject_only* stops each zone's coarsening at
+    :data:`COARSEN_PARALLEL_SAFE_LEVEL`, below which zones that do not share
+    level-0 chunks stay disjoint at every level. Two rounds — odd zones, then
+    even — cover all 60 without any pair colliding. *coarsen_only* then
+    builds the remaining levels in one global pass.
 
     Args:
         gamma: Per-channel gamma applied after normalisation. ``< 1.0``
@@ -4639,8 +4848,38 @@ def build_global_preview(
 
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
-    store_path = Path(store_path)
-    root = zarr.open_group(str(store_path), mode="r", use_consolidated=False)
+    if reproject_only and coarsen_only:
+        raise ValueError("--reproject-only and --coarsen-only are mutually exclusive")
+
+    source = StoreLocation.resolve(store_path, storage_options)
+    if output_path is not None:
+        dest = StoreLocation.resolve(
+            output_path,
+            output_storage_options
+            if output_storage_options is not None
+            else storage_options,
+            state_url,
+            state_storage_options,
+        )
+        # The pyramid gets its own store; create the root on first use.
+        # Opened through the location rather than as_zarr_store() so a local
+        # destination (plain path or file:// URL) gets its directory made.
+        if not dest.exists("zarr.json", on_denied=False):
+            dest.open_group(mode="a", zarr_format=3)
+    else:
+        dest = StoreLocation.resolve(
+            source.url, source.storage_options, state_url, state_storage_options
+        )
+
+    # Each zone's coarsening stops short of the levels where zones converge
+    # when a parallel sweep is in play; ``--coarsen-only`` finishes them.
+    zone_coarsen_levels = (
+        min(num_levels, COARSEN_PARALLEL_SAFE_LEVEL + 1)
+        if reproject_only
+        else num_levels
+    )
+
+    root = source.open_group(mode="r")
 
     # Derive years from first zone's time coordinate
     all_years: list[int] = []
@@ -4707,11 +4946,98 @@ def build_global_preview(
         console.print(f"  {len(zone_infos)} zone(s) with data")
 
     # Ensure global pyramid structure exists
-    _ensure_global_store(store_path, num_levels)
+    _ensure_global_store(dest, num_levels)
 
-    # Prefer a pre-computed cross-zone stretch (written by `zarr-stretch`).
+    if coarsen_only:
+        # Single-writer finish for the levels where zones share chunks. The
+        # region is the whole grid: by this depth every zone's contribution
+        # overlaps, so there is nothing to restrict it to.
+        start = COARSEN_PARALLEL_SAFE_LEVEL + 1
+        if start >= num_levels:
+            if console:
+                console.print(
+                    f"[yellow]Nothing to do: levels beyond "
+                    f"{COARSEN_PARALLEL_SAFE_LEVEL} are outside a "
+                    f"{num_levels}-level pyramid.[/yellow]"
+                )
+            return
+        if console:
+            console.print(
+                f"Coarsening levels {start}-{num_levels - 1} over the full grid"
+            )
+        _coarsen_zone_pyramid(
+            dest=dest,
+            row_start=0,
+            row_end=GLOBAL_LEVEL0_H,
+            col_start=0,
+            col_end=GLOBAL_LEVEL0_W,
+            num_levels=num_levels,
+            workers=workers,
+            console=console,
+            start_level=start,
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Consolidated metadata")
+            zarr.consolidate_metadata(dest.as_zarr_store())
+        if console:
+            console.print("\n  [green]Coarsening complete[/green]")
+        return
+
+    # Prefer a pre-computed cross-zone stretch (written by `zarr-stretch`);
+    # fall back to deriving one from the per-zone statistics right now.
     # Using one shared stretch eliminates inter-zone colour discontinuities.
-    global_stretch = _load_global_stretch(store_path, year)
+    #
+    # The destination is consulted first when it differs from the source. A
+    # read-only mirror is typically a cache in front of the very bucket the
+    # destination addresses, so a stretch written minutes ago may not have
+    # propagated to it yet; going direct avoids silently falling back to a
+    # derived stretch because the cached copy still lacks the attribute.
+    global_stretch = None
+    if dest.url != source.url:
+        try:
+            global_stretch = _load_global_stretch(dest, year)
+        except Exception:
+            global_stretch = None  # A pyramid-only destination has no stretch.
+    if global_stretch is None:
+        global_stretch = _load_global_stretch(source, year)
+    if global_stretch is None:
+        try:
+            entry = compute_stretch_from_stats(
+                source,
+                year=year,
+                zones=zones,
+                console=console,
+                persist=False,
+            )
+            global_stretch = {
+                "min": list(entry["min"]),
+                "max": list(entry["max"]),
+                "mode": entry.get("mode", "bands"),
+            }
+            if entry.get("cdf") is not None:
+                global_stretch["cdf"] = [list(c) for c in entry["cdf"]]
+            if entry.get("pca_components") is not None:
+                global_stretch["pca_components"] = [
+                    list(r) for r in entry["pca_components"]
+                ]
+                global_stretch["pca_mean"] = list(entry["pca_mean"])
+            if console:
+                console.print(
+                    "[cyan]Derived stretch from the store's per-zone "
+                    "statistics (not persisted).[/cyan]"
+                )
+        except (ValueError, RuntimeError) as e:
+            if source.is_remote:
+                raise RuntimeError(
+                    f"No persisted stretch for {year} and none derivable "
+                    f"from statistics ({e}). A remote source cannot fall "
+                    f"back to shard sampling."
+                ) from e
+            if console:
+                console.print(
+                    f"[yellow]No stretch statistics available ({e}); "
+                    f"falling back to per-zone sampling.[/yellow]"
+                )
     if global_stretch is not None:
         global_stretch["gamma"] = gamma
         global_stretch["saturation"] = saturation
@@ -4739,13 +5065,7 @@ def build_global_preview(
             stretch = global_stretch
         else:
             # Fallback: per-zone stretch (produces seams at zone boundaries).
-            zone_store = zarr.open_group(
-                str(store_path),
-                mode="r",
-                path=info["zone_group"],
-                zarr_format=3,
-                use_consolidated=False,
-            )
+            zone_store = source.open_group(mode="r", path=info["zone_group"])
             if console:
                 console.print("    Sampling stretch...")
             stretch = compute_stretch(
@@ -4763,8 +5083,24 @@ def build_global_preview(
                     f"gamma={gamma}, saturation={saturation}"
                 )
 
-        row_start, row_end, col_start, col_end, did_work = _reproject_zone(
-            store_path=store_path,
+        zone_h, zone_w = info["shape"]
+        all_coords = {
+            (sr, sc)
+            for sr in range(math.ceil(zone_h / SHARD_SIZE))
+            for sc in range(math.ceil(zone_w / SHARD_SIZE))
+        }
+        present = _existing_shards(
+            source, info["zone_group"], time_index, all_coords, console=None
+        )
+        if not present:
+            if console:
+                console.print(f"    no shards for {year}, skipping")
+            gc.collect()
+            continue
+
+        regions, did_work = _reproject_zone(
+            source=source,
+            dest=dest,
             zone_num=zone_num,
             zone_group=info["zone_group"],
             zone_epsg=info["epsg"],
@@ -4773,6 +5109,7 @@ def build_global_preview(
             time_index=time_index,
             stretch=stretch,
             workers=workers,
+            present=present,
             console=console,
             force=force,
         )
@@ -4780,23 +5117,24 @@ def build_global_preview(
         if did_work:
             if console:
                 console.print("    Building pyramid...")
-            _coarsen_zone_pyramid(
-                store_path=store_path,
-                row_start=row_start,
-                row_end=row_end,
-                col_start=col_start,
-                col_end=col_end,
-                num_levels=num_levels,
-                workers=workers,
-                console=console,
-            )
+            for row_start, row_end, col_start, col_end in regions:
+                _coarsen_zone_pyramid(
+                    dest=dest,
+                    row_start=row_start,
+                    row_end=row_end,
+                    col_start=col_start,
+                    col_end=col_end,
+                    num_levels=zone_coarsen_levels,
+                    workers=workers,
+                    console=console,
+                )
 
         gc.collect()
 
-    # Consolidate
+    # Consolidate the pyramid store (always local).
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Consolidated metadata")
-        zarr.consolidate_metadata(str(store_path))
+        zarr.consolidate_metadata(dest.as_zarr_store())
 
     if console:
         console.print("\n  [green]Global preview complete[/green]")

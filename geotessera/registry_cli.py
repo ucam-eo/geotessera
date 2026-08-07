@@ -4070,9 +4070,9 @@ def _require_local_store(store_path: str, command: str, console: "Console") -> b
     console.print(
         f"[red]{emoji('❌ ')}{command} needs a local store path; "
         f"got {store_path}.[/red]\n"
-        f"Copy the store locally (or mount it) and run it there — only "
-        f"zarr-init, zarr-fill and zarr-consolidate work against remote "
-        f"locations."
+        f"Only the legacy shard-sampling path is local-only — the default "
+        f"stats-based stretch and zarr-global-preview --output both work "
+        f"against remote stores."
     )
     return False
 
@@ -4086,22 +4086,41 @@ def zarr_global_preview_command(args):
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
-    if not _require_local_store(args.store_path, "zarr-global-preview", console):
-        return 1
-    store_path = Path(args.store_path)
-    zones = _parse_int_range(args.zones) if args.zones else None
 
-    build_global_preview(
-        store_path=store_path,
-        year=args.year,
-        zones=zones,
-        num_levels=args.levels,
-        workers=args.workers,
-        gamma=args.gamma,
-        saturation=args.saturation,
-        console=console,
-        force=args.force,
+    zones = _parse_int_range(args.zones) if args.zones else None
+    store_options = _storage_options_for(args, "store", args.store_path)
+    output_options = (
+        _storage_options_for(args, "output", args.output) if args.output else None
     )
+
+    try:
+        build_global_preview(
+            store_path=args.store_path,
+            year=args.year,
+            zones=zones,
+            num_levels=args.levels,
+            workers=args.workers,
+            gamma=args.gamma,
+            saturation=args.saturation,
+            console=console,
+            force=args.force,
+            storage_options=store_options,
+            output_path=args.output,
+            output_storage_options=output_options,
+            state_url=args.state_url,
+            state_storage_options=(
+                _storage_options_for(args, "state", args.state_url)
+                if args.state_url
+                else None
+            ),
+            reproject_only=args.reproject_only,
+            coarsen_only=args.coarsen_only,
+        )
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     return 0
 
@@ -5252,6 +5271,42 @@ Directory Structure:
         "Try 1.5–2.5 if colours look washed out. Beyond ~3 most pixels "
         "start clipping at the colour-cube edges.",
     )
+    zarr_gp_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Path or URL of the store to hold the pyramid, with its own "
+        "--output-* credentials. Embeddings stream from the source store "
+        "read-only (sub-shard byte ranges, no copy), so this can write to a "
+        "bucket while reading from a read-only mirror. Default: write the "
+        "pyramid into the source store itself.",
+    )
+    zarr_gp_parser.add_argument(
+        "--reproject-only",
+        action="store_true",
+        help="Render this zone's level 0 and coarsen only as far as the "
+        "depth where zones stay disjoint. Safe to run concurrently across "
+        "zones that share no level-0 chunks — an odd-numbered round then an "
+        "even-numbered one covers all 60. Finish with --coarsen-only.",
+    )
+    zarr_gp_parser.add_argument(
+        "--coarsen-only",
+        action="store_true",
+        help="Build the remaining coarse levels in one global pass, without "
+        "reprojecting. Single-writer: run once after every zone's "
+        "--reproject-only has finished.",
+    )
+    zarr_gp_parser.add_argument(
+        "--state-url",
+        type=str,
+        default=None,
+        help="Where per-zone resume markers live (default: <output>.build, "
+        "alongside the pyramid). Point it at a local directory to keep "
+        "build bookkeeping out of a published bucket.",
+    )
+    _add_storage_args(zarr_gp_parser, "store", "Store")
+    _add_storage_args(zarr_gp_parser, "output", "Pyramid output", writable=True)
+    _add_storage_args(zarr_gp_parser, "state", "Build state", writable=True)
     zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
 
     # Zarr-stretch command

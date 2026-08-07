@@ -52,8 +52,15 @@ _NOISY_LOGGERS = (
     "aiobotocore",
     "s3fs",
     "urllib3",
-    "aiohttp",
 )
+
+# These two emit "Unclosed client session"/"Unclosed connector" at ERROR
+# from aiohttp object destructors, via asyncio's exception handler, whenever
+# an fsspec event loop is torn down without a graceful session close — which
+# fsspec does not do. Harmless garbage-collection noise, but at ERROR it
+# survives a WARNING cap and lands all over the progress bars, so these two
+# are silenced outright. Real S3 failures surface as exceptions, not logs.
+_DESTRUCTOR_NOISE_LOGGERS = ("aiohttp", "asyncio")
 
 
 def quieten_dependency_logging(level: int = logging.WARNING) -> None:
@@ -65,6 +72,8 @@ def quieten_dependency_logging(level: int = logging.WARNING) -> None:
     """
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(level)
+    for name in _DESTRUCTOR_NOISE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.CRITICAL)
 
 
 def reset_after_fork() -> None:
