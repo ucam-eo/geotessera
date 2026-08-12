@@ -1,6 +1,79 @@
 ## Unreleased
 
-### New Features
+### Breaking Changes
+
+- **Convention metadata now comes from `zarr-cm`**, replacing
+  `geozarr-toolkit`. Stores stamp `spatial:` and `proj:` at revision **r3**
+  and `multiscales` at **r2** (no r3 exists upstream), each pinned to the
+  spec commit that defined it. The previous `refs/tags/v1` URLs were dead —
+  every schema URL written by earlier builds returns 404, since those tags
+  were never cut and `geo-proj` has since moved to `zarr-conventions/proj`.
+  Convention UUIDs and every `spatial:`/`proj:`/`multiscales` attribute
+  keep their existing names and shapes, so readers are unaffected; only the
+  `spec_url`/`schema_url` registrations change. Existing published stores
+  keep their dead URLs until their metadata is rewritten. Drops the
+  `pydantic` and `structlog` transitive dependencies. (@avsm)
+- **`zarr-stretch --from-sample`**: take the covariance from the stored
+  per-zone reservoir instead of the summed sufficient statistics. The sums
+  are exact but unrepairable in place once a few out-of-range pixels have
+  dominated them — the only other remedy is a full rescan of the store. A
+  uniform reservoir almost never contains such pixels, and 1.2M pooled
+  samples is ample for a 128x128 covariance, so this recovers a usable
+  stretch in seconds. The drift figure still reports how far the sums have
+  strayed rather than comparing the sample against itself. (@avsm)
+- **`zarr-global-preview --state-url`**: per-zone resume markers no longer
+  have to sit in `<output>.build` beside the pyramid, so a build writing to a
+  published bucket can keep its bookkeeping on local disk. Takes the usual
+  `--state-*` object-store flags. (@avsm)
+### Bug Fixes
+
+- **Out-of-range scales no longer poison the stretch statistics**:
+  `MAX_VALID_SCALE` was `1e6`, set to reject only the `~FLT_MAX` sentinel and
+  pass everything below. Measured over the published v1 store's 1.2M pooled
+  sample pixels, real scales run median 0.064 / p99.9 0.119 / p99.99 0.137,
+  and only 5 in 1.2M exceed 1.0 — but pixels with scales just under `1e6`
+  survived the filter and contributed ~1e16 apiece to the second moment,
+  poisoning **47 of 60 zones** (max|prod|/n of 1e6–1.9e8 against 27–653 for a
+  clean zone) and so every colour derived from the PCA. The limit is now
+  `1.0`: seven times the p99.99 of real data, six orders of magnitude below
+  the corrupt values. The pooled sample is also re-filtered on read, since a
+  reservoir written under the old limit can still hold a few. (@avsm)
+- **`zarr-stretch` refuses to persist a stretch that fails its own drift
+  check** unless `--allow-drift`. It previously warned and saved anyway,
+  which is how a covariance known to be wrong reached the store and then
+  every preview built from it. (@avsm)
+- **`zarr-global-preview` no longer races itself creating the pyramid**:
+  zarr's create is check-then-write, so a parallel zone sweep had several
+  callers pass the existence check before any wrote, and the losers died with
+  `A group exists ... at path 'global_rgb/2'` or `An array exists ... at path
+  'global_rgb/0/rgb'`. Every creation step is now idempotent, so all callers
+  build the identical structure and converge. (@avsm)
+- **Antimeridian zones no longer coarsen the whole grid width**: the
+  reprojection work list was tightened (below), but the coarsening still took
+  a single enclosing rectangle, which for a zone with chunks at both grid
+  edges spans every column — 16.0M chunk slots for utm01's 18.8k real chunks
+  and 16.7M for utm60's 37.8k, each one read and rewritten by
+  `_coarsen_tile`. Footprints now split on a column gap wider than half the
+  grid, giving two tight rectangles: utm01 falls to 347k slots (853x -> 18.5x
+  overhead) and utm60 to 364k (442x -> 9.6x), with every other zone still a
+  single rectangle and bit-identical. (@avsm)
+- **Antimeridian shards no longer enqueue the whole globe**: a shard
+  straddling 180° samples corners near -180 and +180, and taking the naive
+  min/max of those made `_chunks_for_shards` claim every chunk column at that
+  latitude. utm60 enqueued 1,395,753 level-0 chunks from 360 shards (~3,900
+  per shard, against ~65 for a normal zone) and utm01 877,648 from 146 — some
+  22% of a year's reprojection work list, all of it reprojecting to nothing.
+  The wrap is now detected by re-measuring the span with longitudes shifted
+  to `[0, 360)` and split into two column ranges; a polar shard, which
+  genuinely does span most longitudes, keeps the full range. For 2024 this
+  cuts utm60 to 37,791 chunks and utm01 to 18,766, leaves every other zone
+  bit-identical, and reduces the cross-zone conflict graph from 172 pairs to
+  60 — 59 adjacent plus utm01↔utm60, which really are neighbours. (@avsm)
+- **Pyramid levels keep their per-level geometry**: `zarr-global-preview`
+  computed `spatial:shape` and `spatial:transform` for each multiscale level,
+  but `geozarr-toolkit`'s layout builder silently dropped both, so every
+  level advertised only its scale factor. `zarr-cm` preserves them, and the
+  multiscales schema permits them (`additionalProperties: true`). (@avsm)
 
 - **Remote zarr builds**: `zarr-init` and `zarr-fill` now take locations
   rather than paths — both the tile source and the output store may be
@@ -52,6 +125,34 @@
   tile inventory has grown, since a newly-added tile falls inside an
   existing shard. `--skip-existing-shards` is still accepted as a no-op.
   (@avsm)
+- **Sentinel scales no longer count as data.** Some published v1 scales
+  files carry a huge-finite nodata sentinel (~FLT_MAX) that passes
+  `isfinite()`: those pixels inflated valid-pixel counts up to 100x,
+  drove stretch sums to 1e37 and overflowed the product matrices to inf —
+  which surfaced as a `nan` drift check and garbage PCA. Validity is now
+  finite, positive and below `MAX_VALID_SCALE` (1e6), applied at stats
+  collection, at fill time (the store now records such pixels as NaN
+  nodata), and in preview rendering. `zarr-stretch` refuses poisoned
+  statistics outright, naming the zones to rebuild with
+  `--backfill-stretch-stats`; statistics collected before this fix need
+  that rebuild (shards themselves are unaffected). The aiohttp
+  "Unclosed client session" destructor noise that flooded preview output
+  is also silenced. (@avsm)
+- **`zarr-global-preview` streams from remote stores.** The pyramid source
+  and destination are now separate: `--output <local-store>` builds the
+  EPSG:4326 RGB pyramid locally while reading zone embeddings straight from
+  a remote store (anonymously or with credentials) as sub-shard byte
+  ranges — no copy of the source is made. If the store has no persisted
+  `geoemb:stretch` for the year, one is derived on the fly from the
+  per-zone stretch statistics (a few MiB of reads, not persisted), so a
+  read-only consumer can preview a store it cannot write to without any
+  prior `zarr-stretch` step. Reprojection workers now spawn rather than
+  fork, for the same fsspec event-loop reason as the fill workers. The
+  work list is now derived from the footprints of the shards that exist,
+  not the zone's bounding rectangle — at high latitude a zone's rectangle
+  back-projects across most longitudes, and utm02 enqueued ~5.6 million
+  candidate chunks (22 GiB of queued futures) to render 28 shards of
+  actual data. (@avsm)
 - **Fills are stateless and stretch statistics collect themselves.** The
   ingestion registry and advisory locks are gone from `zarr-fill`: the
   store's shard objects are the only record of progress, so a preemptible
@@ -136,7 +237,6 @@
   failed shard now reports an error. (@avsm)
 - **`geotessera-registry` propagates exit status**: command return codes
   were discarded, so failures reported success to the shell. (@avsm)
-
 
 ## 0.10.0 (2026-08-20)
 
@@ -337,8 +437,6 @@ This release contains registry tooling improvements.
 This release adds Windows platform support, more robust tolerance to
 interrupted scripts leaving temporary files around, and documentation fixes for
 coordinate printing and tile discovery.
-
-### Windows Support
 
 Added Windows testing infrastructure in CI and applied code fixes (@avsm):
 - New conda-based CI workflow for Windows runners
@@ -541,8 +639,6 @@ diverse hosting options online before the end of 2025.
   - Useful when working directly with downloaded quantized NPY files, but use the Tiles class for normal usage.
   - Example: `embedding = dequantize_embedding(quantized, scales)`
 
-### Migration Notes
-
 From v0.6.0 to v0.7.0:
 - Update initialization code to use new `cache_dir` parameter instead of environment variables
 - Remove any custom `TESSERA_DATA_DIR` or `TESSERA_REGISTRY_DIR` environment variable usage
@@ -654,7 +750,6 @@ system preserved
   - Callback-based progress reporting for programmatic use
   - Integration throughout CLI commands for better user experience
 
-
 ### Performance and Efficiency Improvements
 
 - Registry System Optimization
@@ -675,8 +770,6 @@ system preserved
 - **Added**: `geodatasets>=2024.8.0` for geographic data access
 - **Enhanced**: `rich` and `typer` for improved CLI experience
 - **Updated**: Various dependencies to latest stable versions
-
-### Migration Notes
 
 From v0.4.0 to v0.5.0:
 - **API changes**: Update code to handle new return values from `fetch_embedding()` and `fetch_embeddings()`
@@ -774,8 +867,6 @@ Deprecated Features:
 - **New methods**:
   - `get_available_years()` - List available years in the dataset
   - Multiple georeferencing helper methods
-
-### CLI Enhancements
 
 The `geotessera` tool has also been improved.
 

@@ -1,7 +1,9 @@
 # Per-zone stretch statistics and the global preview pipeline
 
-**Status:** Implemented (except `zarr-global-preview` remote support and the
-two-phase mode, which remain proposed). Deviations from the draft are marked
+**Status:** Implemented (except the two-phase parallel preview mode, which
+remains proposed; `zarr-global-preview` gained remote-source support with a
+local `--output` pyramid, plus on-the-fly stretch derivation from the
+statistics when none is persisted). Deviations from the draft are marked
 **[as built]**.
 **Scope:** `geotessera-registry` subcommands `zarr-init`, `zarr-fill`, `zarr-extend`, `zarr-stretch`, `zarr-global-preview`, `zarr-consolidate`
 **Store convention:** additions to the per-zone group layout of the Tessera Zarr v3 store

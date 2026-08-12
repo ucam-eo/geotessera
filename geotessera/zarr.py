@@ -1060,12 +1060,19 @@ INNER_CHUNK = 32  # spatial pixels per inner chunk side
 STRETCH_SAMPLE_K = 20_000
 
 # Scales above this are treated as nodata. Some published scales files carry
-# a huge-finite sentinel (~FLT_MAX) that passes isfinite(): real per-pixel
-# quantisation scales here are O(0.1), and a sentinel pixel squared
-# overflows float32 — utm04's stored sum reached 1e37 and its product
-# matrix went inf from a handful of such pixels. Six orders of magnitude of
-# headroom above anything plausible, thirty-two below the sentinel.
-MAX_VALID_SCALE = 1.0e6
+# huge-finite values that pass isfinite(), and a single one squared swamps a
+# sum over billions of real pixels.
+#
+# The old limit of 1e6 was set to catch only the ~FLT_MAX sentinel and let
+# everything below through, which turned out to be far too generous: measured
+# over the 1.2M pooled sample pixels of the published v1 store, real scales
+# run median 0.064, p99.9 0.119, p99.99 0.137, and only 5 pixels in 1.2M
+# exceed 1.0 at all. Yet pixels with scales just under 1e6 survived the
+# filter and contributed ~1e16 apiece to the second moment, poisoning the
+# covariance of 47 of 60 zones (max|prod|/n of 1e6-1.9e8 against 27-653 for
+# a clean zone). One is seven times the p99.99 of real data and six orders
+# of magnitude below the corrupt values, so it separates them cleanly.
+MAX_VALID_SCALE = 1.0
 
 
 def valid_scale_mask(scales: np.ndarray) -> np.ndarray:
@@ -3549,6 +3556,8 @@ def compute_stretch_from_stats(
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
     persist: bool = True,
+    from_sample: bool = False,
+    allow_drift: bool = False,
 ) -> dict:
     """Derive the global stretch from the per-zone ``stretch_*`` arrays.
 
@@ -3566,6 +3575,19 @@ def compute_stretch_from_stats(
     the same keys the legacy shard-sampling path produces, so
     ``build_global_preview`` and other readers are unaffected. Works against
     local and remote stores alike.
+
+    Args:
+        from_sample: Take the covariance from the pooled stored sample rather
+            than the summed sufficient statistics. The sums are exact over
+            every pixel but unrecoverable once poisoned — a handful of
+            out-of-range scales dominates them, and the only repair is a
+            full rescan. The reservoir is a uniform draw that such rare
+            pixels almost never land in, so it stays usable, and 1.2M pooled
+            pixels is ample for a 128x128 covariance. Trades exactness for
+            not re-reading the store.
+        allow_drift: Persist even when the drift check fails. Off by default:
+            a stretch that fails the check is normally wrong, and writing it
+            anyway propagates the damage into every preview built from it.
     """
     if mode not in ("bands", "pca"):
         raise ValueError(f"mode must be 'bands' or 'pca', got {mode!r}")
@@ -3651,23 +3673,36 @@ def compute_stretch_from_stats(
     mu = s_total / n_total
     cov = m_total / n_total - np.outer(mu, mu)
 
-    # Pooled weighted sample, dequantised.
+    # Pooled weighted sample, dequantised. Re-filter on the way in: a
+    # reservoir written under a looser MAX_VALID_SCALE can still hold a few
+    # out-of-range pixels, and one of those would distort the quantiles the
+    # same way it distorts a covariance.
     emb = np.concatenate([p[0] for p in sample_parts], axis=0)
     scales = np.concatenate([p[1] for p in sample_parts], axis=0)
     weights = np.concatenate(
         [np.full(len(p[0]), p[2], dtype=np.float64) for p in sample_parts]
     )
+    keep = valid_scale_mask(scales)
+    if not keep.all():
+        dropped = int((~keep).sum())
+        if console:
+            console.print(
+                f"  Dropped {dropped:,} of {len(keep):,} sampled pixel(s) "
+                f"with scales outside (0, {MAX_VALID_SCALE:g})"
+            )
+        emb, scales, weights = emb[keep], scales[keep], weights[keep]
+    if len(emb) == 0:
+        raise RuntimeError(
+            f"Every sampled pixel for {year} has a scale outside "
+            f"(0, {MAX_VALID_SCALE:g}) — the stored sample is unusable."
+        )
     x = emb.astype(np.float32) * scales[:, None]  # (n, 128)
 
     pca_proj_components = None
     pca_proj_mean = None
     pca_evr = None
+    proj_mu = mu
     if mode == "pca":
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        order = np.argsort(eigvals)[::-1][:pca_components]
-        components = eigvecs[:, order].T  # (k, 128), eigenvalue-descending
-        evr = eigvals[order] / max(eigvals.sum(), 1e-30)
-
         # Drift check: re-estimate the covariance from the (independent)
         # stored sample and compare. Rewritten shards double-count into the
         # sums but replace sample slots, so divergence here flags stale
@@ -3675,9 +3710,31 @@ def compute_stretch_from_stats(
         # two covariances — comparing eigenvectors instead would false-alarm
         # whenever eigenvalues are close, where the vectors are arbitrary.
         cov_s = np.cov(x.T, aweights=weights)
+        # Keep the summed-statistics covariance for the drift metric even
+        # when it is not the one being used, so --from-sample still reports
+        # how far the sums have strayed instead of comparing the sample
+        # against itself and printing a reassuring zero.
+        cov_stats = cov
+
+        if from_sample:
+            # The sums are exact but unrepairable in place; the reservoir is
+            # a uniform draw, so rare poisoned pixels are almost never in it.
+            proj_mu = np.average(x.astype(np.float64), axis=0, weights=weights)
+            cov = cov_s
+            if console:
+                console.print(
+                    f"  [cyan]Covariance from the stored sample "
+                    f"({len(x):,} pixels), not the summed statistics.[/cyan]"
+                )
+
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        order = np.argsort(eigvals)[::-1][:pca_components]
+        components = eigvecs[:, order].T  # (k, 128), eigenvalue-descending
+        evr = eigvals[order] / max(eigvals.sum(), 1e-30)
         with np.errstate(invalid="ignore", over="ignore"):
             drift = float(
-                np.linalg.norm(cov - cov_s) / max(np.linalg.norm(cov), 1e-30)
+                np.linalg.norm(cov_stats - cov_s)
+                / max(np.linalg.norm(cov_stats), 1e-30)
             )
         if not math.isfinite(drift):
             raise RuntimeError(
@@ -3698,22 +3755,31 @@ def compute_stretch_from_stats(
                 f"[{colour}]{drift:.4f}[/{colour}] "
                 f"(limit {limit:.2f}; sample noise floor {noise:.2f})"
             )
-        if drift > limit:
-            logger.warning(
-                f"Stretch statistics drift: {drift:.4f} > {limit:.2f}. "
-                f"The additive sums likely double-counted rewritten shards; "
-                f"rebuild with `zarr-fill --backfill-stretch-stats`, or "
-                f"cross-check with `zarr-stretch --from-shards`."
+        if drift > limit and not from_sample:
+            message = (
+                f"Stretch statistics drift: {drift:.4f} > {limit:.2f}. The "
+                f"summed statistics disagree with the stored sample, so the "
+                f"covariance — and every colour derived from it — is "
+                f"untrustworthy. Either take the covariance from the sample "
+                f"instead (`zarr-stretch --from-sample`, seconds), or rebuild "
+                f"the sums (`zarr-fill --backfill-stretch-stats`, a full "
+                f"rescan). `--allow-drift` persists it as-is."
             )
+            if persist and not allow_drift:
+                # Saving a stretch that failed its own check propagates the
+                # damage into every preview built from it, which is how a
+                # bad covariance turns into a wrong global mosaic.
+                raise ValueError(message)
+            logger.warning(message)
 
         # Bake the PC→RGB permutation into the stored matrix, as the legacy
         # path does, so the render path needs no extra swapping.
         components = components[pca_perm]
         evr = evr[pca_perm]
 
-        channels = (x - mu.astype(np.float32)) @ components.T.astype(np.float32)
+        channels = (x - proj_mu.astype(np.float32)) @ components.T.astype(np.float32)
         pca_proj_components = [[float(v) for v in row] for row in components]
-        pca_proj_mean = [float(v) for v in mu]
+        pca_proj_mean = [float(v) for v in proj_mu]
         pca_evr = [float(v) for v in evr]
         band_indices: Tuple[int, ...] = tuple(range(N_BANDS))
     else:
@@ -3767,15 +3833,28 @@ def compute_stretch_from_stats(
         entry["pca_mean"] = pca_proj_mean
         entry["pca_explained_variance_ratio"] = pca_evr
     if persist:
+        import warnings as _warnings
+
+        import zarr as _zarr
+
         root_rw = store.open_group(mode="r+")
         stretch_map = dict(root_rw.attrs.get(_GLOBAL_STRETCH_ATTR, {}))
         stretch_map[str(year)] = entry
         root_rw.attrs[_GLOBAL_STRETCH_ATTR] = stretch_map
+
+        # Writing root attributes through a handle opened without consolidated
+        # metadata re-serialises zarr.json *without* the consolidated block,
+        # deleting it. Readers that navigate by it — the TZE viewer builds its
+        # entire zone and year list from it — then see an empty store. Rebuild
+        # it here rather than leaving the store broken until someone
+        # remembers to re-consolidate.
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings("ignore", message="Consolidated metadata")
+            _zarr.consolidate_metadata(store.as_zarr_store())
         if console:
             console.print(
                 f"[green]Saved to {_GLOBAL_STRETCH_ATTR}.{year} on the store "
-                f"root.[/green] Run zarr-consolidate so consolidated-metadata "
-                f"readers see it."
+                f"root[/green] and re-consolidated the root metadata."
             )
 
     return entry
@@ -4265,8 +4344,82 @@ def _load_global_stretch(
 # coarsening.
 
 
-def _ensure_global_store(dest: "StoreLocation", num_levels: int) -> None:
-    """Create the global_rgb/ pyramid group within the store."""
+def _require_node(create, fetch, retries: int = 20, delay: float = 0.5):
+    """Create a Zarr node, tolerating another process creating it first.
+
+    Zarr's create is check-then-write, so concurrent callers can all pass the
+    existence check and all but one then fail. Falling back to a fetch turns
+    that into a no-op — but the winner's metadata may not be readable for a
+    moment yet, hence the retry.
+    """
+    import time
+
+    try:
+        return create()
+    except Exception:
+        for _ in range(retries):
+            try:
+                return fetch()
+            except Exception:
+                time.sleep(delay)
+        raise
+
+
+def _require_group(parent, name: str):
+    """``parent.create_group(name)``, idempotent under concurrency."""
+    return _require_node(lambda: parent.create_group(name), lambda: parent[name])
+
+
+def _require_array(parent, name: str, **kwargs):
+    """``parent.create_array(name, ...)``, idempotent under concurrency."""
+    return _require_node(
+        lambda: parent.create_array(name, **kwargs), lambda: parent[name]
+    )
+
+
+def _await_global_store(
+    dest: "StoreLocation",
+    timeout: float = 600.0,
+    poll: float = 3.0,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Block until another process has finished creating the pyramid.
+
+    Completion is judged by the ``multiscales`` attribute, which
+    :func:`_ensure_global_store` writes only after every level array exists —
+    so a waiter never starts rendering into a half-built pyramid.
+    """
+    import time
+
+    if console:
+        console.print("    Another zone is creating the pyramid; waiting...")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            grp = dest.open_group(mode="r", path="global_rgb", zarr_format=3)
+            if "multiscales" in dict(grp.attrs):
+                return
+        except Exception:
+            pass
+        time.sleep(poll)
+    raise RuntimeError(
+        f"Timed out after {timeout:.0f}s waiting for another process to "
+        f"finish creating global_rgb in {dest}. If no other build is "
+        f"running, the group is half-created: delete the global_rgb prefix "
+        f"and start again."
+    )
+
+
+def _ensure_global_store(
+    dest: "StoreLocation",
+    num_levels: int,
+    console: Optional["rich.console.Console"] = None,
+) -> None:
+    """Create the global_rgb/ pyramid group within the store.
+
+    Safe to call concurrently: exactly one caller creates the structure and
+    the others wait for it (see :func:`_await_global_store`).
+    """
     from zarr.codecs import BloscCodec
 
     root = dest.open_group(mode="r+", zarr_format=3)
@@ -4290,16 +4443,23 @@ def _ensure_global_store(dest: "StoreLocation", num_levels: int) -> None:
         shutil.rmtree(str(Path(dest.url) / "global_rgb"))
         root = dest.open_group(mode="r+", zarr_format=3)
 
-    # Create pyramid levels via zarr API
-    global_grp = root.create_group("global_rgb")
+    # Create pyramid levels via zarr API. A parallel zone sweep starts every
+    # zone at once and they all arrive here together; zarr's create is
+    # check-then-write, so several can pass the existence check before any of
+    # them writes and the losers get "A group exists at path 'global_rgb/2'"
+    # or "An array exists at path 'global_rgb/0/rgb'". Rather than pick a
+    # winner — which needs a lock this layer does not have — every step is
+    # idempotent, so all callers build the identical structure and converge.
+    global_grp = _require_group(root, "global_rgb")
     h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
     band_data = np.arange(GLOBAL_NUM_BANDS, dtype=np.int32)
 
     for lvl in range(num_levels):
         if h < 1 or w < 1:
             break
-        lvl_grp = global_grp.create_group(str(lvl))
-        lvl_grp.create_array(
+        lvl_grp = _require_group(global_grp, str(lvl))
+        _require_array(
+            lvl_grp,
             "rgb",
             shape=(h, w, GLOBAL_NUM_BANDS),
             chunks=(GLOBAL_CHUNK, GLOBAL_CHUNK, GLOBAL_NUM_BANDS),
@@ -4308,7 +4468,8 @@ def _ensure_global_store(dest: "StoreLocation", num_levels: int) -> None:
             compressors=BloscCodec(cname="zstd", clevel=3),
             dimension_names=["lat", "lon", "band"],
         )
-        lvl_grp.create_array(
+        _require_array(
+            lvl_grp,
             "band",
             data=band_data,
             chunks=(GLOBAL_NUM_BANDS,),
@@ -4779,10 +4940,11 @@ def _reproject_zone(
                 except Exception as e:
                     logger.warning(f"Reproject chunk failed: {e}")
 
-    state.write_bytes(
-        f"zone={zone_num} chunks={chunks_total} written={chunks_written}\n".encode(),
-        *marker,
-    )
+    # The marker is deliberately NOT written here: a zone is complete only
+    # once its coarser levels exist too, and the caller builds those after
+    # this returns. Marking it done now means a zone interrupted mid-coarsen
+    # is skipped on resume and keeps half a pyramid — invisible except as
+    # missing detail at intermediate zooms.
 
     return (regions, True)
 
@@ -4946,7 +5108,7 @@ def build_global_preview(
         console.print(f"  {len(zone_infos)} zone(s) with data")
 
     # Ensure global pyramid structure exists
-    _ensure_global_store(dest, num_levels)
+    _ensure_global_store(dest, num_levels, console=console)
 
     if coarsen_only:
         # Single-writer finish for the levels where zones share chunks. The
@@ -5128,6 +5290,12 @@ def build_global_preview(
                     workers=workers,
                     console=console,
                 )
+            # Only now is the zone genuinely finished, so only now may a
+            # resume skip it.
+            dest.state.write_bytes(
+                f"zone={zone_num} levels=1-{zone_coarsen_levels - 1}\n".encode(),
+                *_preview_marker_parts(zone_num),
+            )
 
         gc.collect()
 

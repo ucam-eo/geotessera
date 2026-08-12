@@ -4180,6 +4180,8 @@ def zarr_stretch_command(args):
             drift_threshold=args.drift_threshold,
             console=console,
             storage_options=store_options,
+            from_sample=args.from_sample,
+            allow_drift=args.allow_drift,
         )
     except (ValueError, RuntimeError) as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -5420,6 +5422,22 @@ Directory Structure:
         help="Force the legacy shard-sampling path (re-reads embeddings; "
         "local stores only). Default: aggregate the per-zone statistics "
         "collected at fill time — a few MiB of reads, remote-capable.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--from-sample",
+        action="store_true",
+        help="Take the covariance from the stored per-zone sample instead of "
+        "the summed statistics. Use when the sums are poisoned (the drift "
+        "check fails): a few out-of-range pixels can dominate a sum over "
+        "billions, but almost never land in a uniform reservoir. Runs in "
+        "seconds and needs no rescan.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="Persist the stretch even if the drift check fails. Off by "
+        "default: a stretch that fails its own check is normally wrong, and "
+        "saving it propagates into every preview built from it.",
     )
     zarr_stretch_parser.add_argument(
         "--drift-threshold",

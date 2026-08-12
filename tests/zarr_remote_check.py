@@ -33,6 +33,12 @@ from geotessera.zarr import (
     shard_coords_for_tiles,
 )
 
+# Concurrent group creation leaves transient ".partial" temporaries visible to
+# whoever enumerates the hierarchy at that instant. They are cleaned up (this
+# suite asserts the pyramid ends up complete), and every CLI entry point
+# filters the same warning; matching that here keeps the output stable.
+warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
 TMP = Path(tempfile.mkdtemp(prefix="gt-zarr-check-"))
 FAILED = []
 
@@ -705,6 +711,7 @@ check("mid-zone shard needs one region", len(mid_regions) == 1)
 # drives the same fsspec path an s3:// one takes.
 
 import zarr  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 from geotessera.zarr import (  # noqa: E402
     GLOBAL_CHUNK,
@@ -819,6 +826,33 @@ for label, dest_loc in (
         f"preview marker is removable over {label}",
         not state.exists(*parts, on_denied=False),
     )
+
+# A parallel zone sweep calls _ensure_global_store from every zone at once.
+# Exactly one may create the structure; the rest must wait, not fail.
+race_dest = StoreLocation.resolve(str(TMP / "pyr_race.zarr"))
+race_dest.open_group(mode="a", zarr_format=3)
+
+
+def _racer(_i):
+    try:
+        _ensure_global_store(race_dest, 3)
+        return None
+    except Exception as exc:  # noqa: BLE001 - the point is to see any failure
+        return f"{type(exc).__name__}: {exc}"
+
+
+with ThreadPoolExecutor(max_workers=8) as _pool:
+    race_errs = [e for e in _pool.map(_racer, range(8)) if e]
+
+check(
+    "concurrent _ensure_global_store calls all succeed",
+    not race_errs,
+)
+check(
+    "the raced pyramid is complete",
+    "multiscales" in dict(race_dest.open_group(mode="r", path="global_rgb").attrs)
+    and "global_rgb/2/rgb" in race_dest.open_group(mode="r", zarr_format=3),
+)
 
 # Consolidation goes through the location too, so it works on either.
 with warnings.catch_warnings():
