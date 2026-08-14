@@ -238,6 +238,13 @@
 - **`geotessera-registry` propagates exit status**: command return codes
   were discarded, so failures reported success to the shell. (@avsm)
 
+- **`zarr-consolidate` merges registries and works remotely**: the
+  subcommand (introduced in 0.10.0) now also merges the per-zone ingestion
+  registries into `_registry.parquet` — the single-writer step that
+  finishes a parallel sweep — and accepts a remote store URL as well as a
+  local path. (@avsm)
+
+
 ## 0.10.0 (2026-08-20)
 
 ### Breaking Changes
