@@ -51,6 +51,7 @@ from __future__ import annotations
 import io
 import logging
 import math
+import time
 import os
 import shutil
 from dataclasses import dataclass
@@ -93,6 +94,12 @@ GLOBAL_DEFAULT_LEVELS = 10
 # 8 and 36 at level 9). Levels above this must be built by a single global
 # pass — see ``--coarsen-only``.
 COARSEN_PARALLEL_SAFE_LEVEL = 6
+
+# A chunk that fails is retried on a fresh pool rather than dropped: the
+# gateway returns 429/525 under load, and a skipped chunk used to become a
+# permanent hole because the zone still reported success and got its marker.
+CHUNK_RETRY_ATTEMPTS = 3
+CHUNK_RETRY_BACKOFF = 15  # seconds, multiplied by the attempt number
 
 # GeoZarr convention registration entries
 GEOEMB_CONVENTION = {
@@ -4861,60 +4868,18 @@ def _reproject_zone(
         for cr, cc in sorted(chunk_set)
     ]
 
+    # Chunk failures are retried on a fresh pool rather than skipped. A
+    # transient 429/525 from the gateway used to be logged and dropped, and
+    # since the zone still reported success its marker was written and the
+    # hole became permanent — nothing would ever revisit it. zarr-fill
+    # already refuses to record a shard it failed to write; this is the same
+    # contract for the preview.
+    pending = work_items
     chunks_written = 0
 
-    if console:
-        from rich.progress import (
-            Progress,
-            SpinnerColumn,
-            BarColumn,
-            TextColumn,
-            MofNCompleteColumn,
-            TimeElapsedColumn,
-            TimeRemainingColumn,
-        )
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            ptask = progress.add_task(
-                f"Reprojecting zone {zone_num:02d}",
-                total=len(work_items),
-            )
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                mp_context=mp_context,
-                initializer=_init_reproj_worker,
-                initargs=(
-                    source.url,
-                    source.storage_options,
-                    dest.url,
-                    dest.storage_options,
-                    zone_group,
-                    zone_epsg,
-                    time_index,
-                    stretch,
-                ),
-            ) as pool:
-                futures = {
-                    pool.submit(_reproject_chunk_worker, item): item
-                    for item in work_items
-                }
-                for future in as_completed(futures):
-                    try:
-                        if future.result():
-                            chunks_written += 1
-                    except Exception as e:
-                        logger.warning(f"Reproject chunk failed: {e}")
-                    progress.advance(ptask)
-        console.print(f"    {chunks_written} chunks with data")
-    else:
+    def _run_pass(items, advance=None):
+        """One pass over *items* on a fresh pool. Returns (written, failed)."""
+        written, failed = 0, []
         with ProcessPoolExecutor(
             max_workers=workers,
             mp_context=mp_context,
@@ -4930,15 +4895,69 @@ def _reproject_zone(
                 stretch,
             ),
         ) as pool:
-            futures = {
-                pool.submit(_reproject_chunk_worker, item): item for item in work_items
-            }
+            futures = {pool.submit(_reproject_chunk_worker, it): it for it in items}
             for future in as_completed(futures):
                 try:
                     if future.result():
-                        chunks_written += 1
+                        written += 1
                 except Exception as e:
-                    logger.warning(f"Reproject chunk failed: {e}")
+                    failed.append(futures[future])
+                    logger.debug(f"Reproject chunk failed (will retry): {e}")
+                if advance is not None:
+                    advance()
+        return written, failed
+
+    for attempt in range(1, CHUNK_RETRY_ATTEMPTS + 1):
+        if attempt == 1 and console:
+            from rich.progress import (
+                Progress,
+                SpinnerColumn,
+                BarColumn,
+                TextColumn,
+                MofNCompleteColumn,
+                TimeElapsedColumn,
+                TimeRemainingColumn,
+            )
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+            ) as progress:
+                ptask = progress.add_task(
+                    f"Reprojecting zone {zone_num:02d}", total=len(pending)
+                )
+                written, pending = _run_pass(
+                    pending, advance=lambda: progress.advance(ptask)
+                )
+        else:
+            written, pending = _run_pass(pending)
+        chunks_written += written
+        if not pending:
+            break
+        if attempt < CHUNK_RETRY_ATTEMPTS:
+            delay = CHUNK_RETRY_BACKOFF * attempt
+            if console:
+                console.print(
+                    f"    [yellow]{len(pending):,} chunk(s) failed; retrying "
+                    f"in {delay}s (attempt {attempt + 1}/"
+                    f"{CHUNK_RETRY_ATTEMPTS})[/yellow]"
+                )
+            time.sleep(delay)
+
+    if pending:
+        # Refusing here leaves the marker unwritten, so the sweep re-runs the
+        # zone rather than publishing one with holes in it.
+        raise RuntimeError(
+            f"Zone {zone_num:02d}: {len(pending):,} chunk(s) still failing "
+            f"after {CHUNK_RETRY_ATTEMPTS} attempts; zone not marked complete"
+        )
+    if console:
+        console.print(f"    {chunks_written} chunks with data")
 
     # The marker is deliberately NOT written here: a zone is complete only
     # once its coarser levels exist too, and the caller builds those after
