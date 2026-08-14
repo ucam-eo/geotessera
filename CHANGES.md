@@ -244,7 +244,6 @@
   finishes a parallel sweep — and accepts a remote store URL as well as a
   local path. (@avsm)
 
-
 ## 0.10.0 (2026-08-20)
 
 ### Breaking Changes

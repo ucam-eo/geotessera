@@ -37,6 +37,45 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+@contextmanager
+def atomic_output(dest: Optional[str | Path], suffix: str = "") -> Iterator[Path]:
+    """Yield a temporary path that atomically becomes *dest* on success.
+
+    The temp file is created in *dest*'s directory (created if needed) so the
+    final ``replace()`` stays on one filesystem. On any exception — including
+    ``KeyboardInterrupt`` — the temp file is removed, so a partial write can
+    never be observed at *dest* or left behind as a stray ``.*_tmp_*`` file.
+
+    With ``dest=None`` the temp file is created in the system temp directory
+    and simply kept on success (removed on failure); the caller owns it.
+    """
+    if dest is not None:
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(
+            dir=dest.parent,
+            prefix=f".{dest.name}_tmp_",
+            suffix=suffix,
+            delete=False,
+        )
+    else:
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    tmp.close()
+    path = Path(tmp.name)
+    try:
+        yield path
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    else:
+        if dest is not None:
+            # replace() (not rename()): it overwrites an existing destination
+            # on both POSIX and Windows, whereas rename() raises
+            # FileExistsError on Windows.
+            path.replace(dest)
+
+
 # Protocols we can read/write through fsspec. Anything else without a
 # scheme is treated as a local filesystem path.
 _URL_MARKER = "://"
@@ -120,9 +159,7 @@ def die_with_parent() -> None:
         import signal
 
         PR_SET_PDEATHSIG = 1
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(
-            PR_SET_PDEATHSIG, signal.SIGKILL
-        )
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
     except Exception as e:  # pragma: no cover - best effort
         logger.debug(f"Could not set parent-death signal: {e}")
 
@@ -264,6 +301,13 @@ def _filesystem_cached(protocol: str, options_key: str):
         # Object stores have no directories to create; a file:// store still
         # needs them, and fsspec will not make them unless asked.
         options.setdefault("auto_mkdir", True)
+    if protocol == "s3":
+        # Absorb transient 429/5xx inside botocore with jittered adaptive
+        # backoff, so a busy gateway is retried at the request level rather
+        # than surfacing as a failed chunk/shard that costs a whole outer
+        # pass. Callers can still override via storage options.
+        config_kwargs = options.setdefault("config_kwargs", {})
+        config_kwargs.setdefault("retries", {"max_attempts": 8, "mode": "adaptive"})
     if protocol in ("http", "https"):
         # The Source Cooperative CDN rejects some default user agents.
         from . import __version__
@@ -413,10 +457,8 @@ def download(
 ) -> Path:
     """Copy a remote object to a local file, writing atomically."""
     dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(f".{dest.name}.tmp")
-    tmp.write_bytes(read_bytes(loc, storage_options))
-    tmp.replace(dest)
+    with atomic_output(dest) as tmp:
+        tmp.write_bytes(read_bytes(loc, storage_options))
     return dest
 
 

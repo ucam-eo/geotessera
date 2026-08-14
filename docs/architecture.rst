@@ -33,6 +33,8 @@ The library follows a layered architecture:
     Data Access Layer
     ├── HTTPS downloads (urllib3 pool, no cloud SDK)
     ├── Zarr v3 store (cloud-native streaming)
+
+    ├── Zarr v3 store (cloud-native streaming; forthcoming)
     ├── Rasterio (GeoTIFF I/O)
     └── GeoPandas (geospatial operations)
             ↓
@@ -313,6 +315,29 @@ request shares one ``urllib3`` connection pool.
   wherever that is a content MD5
 - **Conditional caching**: Manifests are refetched with an
   ``If-Modified-Since`` GET, so an unchanged one costs a 304 and no body
+
+GeoTessera streams all data (manifests, embedding tiles, and landmasks)
+over plain HTTPS (a shared ``urllib3`` connection pool, no cloud SDK)
+from the public Source
+Cooperative repository:
+
+**Features**:
+
+- **Per-output-dir mirroring**: Tiles land in the user-supplied
+  ``--output`` directory and persist there for re-use across runs
+- **Connection pooling**: All downloads and listings share one
+  ``urllib3.PoolManager``, so the thousands of per-tile GETs in a region
+  download reuse connections instead of paying a TCP + TLS handshake each
+- **Retries in the client**: urllib3's ``Retry`` handles 429/5xx (honouring
+  ``Retry-After``), connection failures, and read errors with exponential
+  backoff; failures that strike mid-stream restart the download
+- **Integrity checking**: urllib3 enforces the response ``Content-Length``
+  (a truncated body raises instead of ending the stream silently), and the
+  streamed body is verified against an MD5 whenever the server's ``ETag``
+  is a content MD5 (single-part uploads)
+- **Conditional caching**: Per-version manifests are refetched with an
+  ``If-Modified-Since`` conditional GET keyed on the cached file's mtime,
+  so unchanged manifests yield a 304 with zero body
 - **Progress callbacks**: Real-time download feedback with speed and size info
 - **Resumable**: Existing files in the output dir are skipped on rerun
 
