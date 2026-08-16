@@ -393,18 +393,28 @@ class TileSource:
         root: str,
         version_path: str,
         storage_options: Optional[Dict[str, Any]] = None,
+        dataset_dir: Optional[str] = None,
     ) -> "TileSource":
         """Build a source from a repository root in the published layout.
 
         The Source Cooperative repository — and any mirror of it — lays tiles
-        out as ``{root}/npy/{version}/{year}/grid_.../`` with landmasks under
+        out as ``{root}/npy/{dataset}/{year}/grid_.../`` with landmasks under
         ``{root}/landmasks/{version}/``.  ``root`` may be an ``s3://`` URL for
         a credentialed mirror or an ``https://`` URL for the public front.
+
+        The two trees are keyed differently, which is easy to get wrong. The
+        ``npy/`` tree has one directory per *dataset* — a (version, variant)
+        pair — with the variant encoded as a suffix, so 1.1/cambridge lives in
+        ``npy/v1.1-cam/``. Landmasks are shared across a version's variants and
+        stay under the plain ``landmasks/v1.1/``. Pass *dataset_dir* from
+        :func:`geotessera.registry.dataset_path`; it defaults to
+        *version_path*, which is only correct for the v1 series, where the
+        directory predates the suffix scheme.
         """
         from . import remote
 
         return cls(
-            embeddings_root=remote.join(root, "npy", version_path),
+            embeddings_root=remote.join(root, "npy", dataset_dir or version_path),
             landmasks_root=remote.join(root, "landmasks", version_path),
             storage_options=storage_options,
         )

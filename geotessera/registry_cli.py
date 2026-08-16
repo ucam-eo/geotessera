@@ -3732,9 +3732,21 @@ def _resolve_source(args, console: "Console"):
     dataset_variant = args.dataset_variant or default_variant(version_norm)
     storage_options = _storage_options_for(args, "source", base_dir)
 
+    # The npy/ tree is keyed by *dataset* — a (version, variant) pair — with
+    # the variant encoded as a directory suffix, so 1.1/cambridge lives in
+    # npy/v1.1-cam/. Landmasks are shared across a version's variants and stay
+    # under the plain landmasks/v1.1/. Deriving the npy path from the version
+    # alone points at a prefix that does not exist, and the failure surfaces
+    # only much later as every shard reporting "The specified key does not
+    # exist". The v1 series is the exception that hides it: its directory
+    # predates the suffix scheme, so version and dataset happen to coincide.
+    from .registry import dataset_path
+
+    dataset_dir = dataset_path(version_norm, dataset_variant) or version_path
+
     console.print(
         f"[cyan]Streaming tiles from {base_dir} "
-        f"(version={version_path}, variant={dataset_variant})[/cyan]"
+        f"(dataset=npy/{dataset_dir}, variant={dataset_variant})[/cyan]"
     )
 
     if args.registry_dir:
@@ -3746,7 +3758,7 @@ def _resolve_source(args, console: "Console"):
     else:
         cache_dir = _remote_registry_cache_dir(base_dir, version_path)
         manifest_loc = args.manifest_url or join(
-            base_dir, "npy", version_path, "manifest.parquet"
+            base_dir, "npy", dataset_dir, "manifest.parquet"
         )
         landmasks_loc = args.landmasks_url or join(
             base_dir, "landmasks", version_path, "landmasks.parquet"
@@ -3773,15 +3785,19 @@ def _resolve_source(args, console: "Console"):
 
     if args.source_npy_root or args.source_landmask_root:
         # A mirror that lays tiles out its own way: take the roots verbatim
-        # rather than appending the published npy/<version> convention.
-        default = TileSource.for_url(base_dir, version_path, storage_options)
+        # rather than appending the published npy/<dataset> convention.
+        default = TileSource.for_url(
+            base_dir, version_path, storage_options, dataset_dir=dataset_dir
+        )
         source = TileSource(
             embeddings_root=args.source_npy_root or default.embeddings_root,
             landmasks_root=args.source_landmask_root or default.landmasks_root,
             storage_options=storage_options,
         )
     else:
-        source = TileSource.for_url(base_dir, version_path, storage_options)
+        source = TileSource.for_url(
+            base_dir, version_path, storage_options, dataset_dir=dataset_dir
+        )
     return registry, source, dataset_version, dataset_variant
 
 

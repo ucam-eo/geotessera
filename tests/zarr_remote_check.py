@@ -636,6 +636,37 @@ check(
 )
 check("url source reports remote", src.is_remote)
 
+# The npy/ tree is keyed by dataset (version *and* variant); landmasks are
+# keyed by version alone. Deriving the npy path from the version silently
+# points a fill at a prefix that does not exist — every shard then fails with
+# "The specified key does not exist", which is how the v1.1 conversion died.
+# v1 hides the bug because its directory predates the variant-suffix scheme.
+from geotessera.registry import dataset_path  # noqa: E402
+
+v11 = TileSource.for_url(
+    "s3://bucket/tessera", "v1.1", {"anon": True},
+    dataset_dir=dataset_path("1.1", "cambridge"),
+)
+e11, s11 = v11.embedding_locations(0.05, 52.05, 2024)
+check(
+    "variant-suffixed dataset uses its own npy directory",
+    e11 == "s3://bucket/tessera/npy/v1.1-cam/2024/grid_0.05_52.05/grid_0.05_52.05.npy"
+    and s11.endswith("npy/v1.1-cam/2024/grid_0.05_52.05/grid_0.05_52.05_scales.npy"),
+)
+check(
+    "landmasks stay keyed by version, not dataset",
+    v11.landmask_location(0.05, 52.05)
+    == "s3://bucket/tessera/landmasks/v1.1/grid_0.05_52.05.tiff",
+)
+check(
+    "v1 is unaffected (dataset dir equals version path)",
+    TileSource.for_url(
+        "s3://bucket/tessera", "v1", {"anon": True},
+        dataset_dir=dataset_path("1.0", "vultr"),
+    ).embedding_locations(0.05, 52.05, 2024)[0]
+    == "s3://bucket/tessera/npy/v1/2024/grid_0.05_52.05/grid_0.05_52.05.npy",
+)
+
 
 # ---------------------------------------------------------------------------
 # Preview work list: antimeridian footprints must not span the globe
