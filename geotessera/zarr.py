@@ -920,30 +920,49 @@ def _regions_for_chunks(chunks: set) -> List[Tuple[int, int, int, int]]:
 
 def _coarsen_zone_pyramid(
     dest: "StoreLocation",
-    row_start: int,
-    row_end: int,
-    col_start: int,
-    col_end: int,
     num_levels: int,
     workers: int,
     console: Optional["rich.console.Console"] = None,
     start_level: int = 1,
+    chunks: Optional[set] = None,
+    row_start: int = 0,
+    row_end: int = 0,
+    col_start: int = 0,
+    col_end: int = 0,
 ) -> None:
-    """Update pyramid levels ``start_level``..``num_levels``-1 for a region.
+    """Update pyramid levels ``start_level``..``num_levels``-1.
 
     Reads from the previous level and writes coarsened data to the current
     level, processing in 2D tiles parallelised with a thread pool.
 
-    Levels below *start_level* are still walked, because each level's region
-    is derived by halving the one above it, but no data is touched there.
-    That is what lets a parallel zone sweep stop at
-    :data:`COARSEN_PARALLEL_SAFE_LEVEL` and a single global pass pick up the
-    rest.
+    Two ways to say *which* tiles:
+
+    ``chunks``
+        The exact set of level-0 chunk coordinates holding data. Level *n*'s
+        tiles are then just those coordinates halved *n* times, because a
+        level-*n* chunk draws only from the four level-(*n*-1) chunks above
+        it. This is what a zone pass uses.
+    bounding rectangle
+        The fallback, for the global finishing pass which has no per-zone
+        chunk set. Walks every tile in the rectangle.
+
+    The distinction matters enormously. A zone's bounding rectangle is a
+    terrible proxy for where its data is — high-latitude zones spread across
+    many degrees of longitude, so utm59 walked 2.6M tiles to coarsen 43k
+    chunks' worth of data, 98% of it empty round-trips against the store.
+    Measured waste across zones ran 75-98%, which made coarsening the
+    dominant cost of a preview build.
+
+    Levels below *start_level* are still walked, because each level derives
+    from the one above, but no data is touched there. That is what lets a
+    parallel zone sweep stop at :data:`COARSEN_PARALLEL_SAFE_LEVEL` and a
+    single global pass pick up the rest.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     root = dest.open_group(mode="r+", zarr_format=3)
 
+    cur_chunks = set(chunks) if chunks is not None else None
     prev_row_start, prev_row_end = row_start, row_end
     prev_col_start, prev_col_end = col_start, col_end
 
@@ -958,30 +977,42 @@ def _coarsen_zone_pyramid(
         cur_arr = root[cur_arr_path]
         cur_h, cur_w = cur_arr.shape[:2]
 
-        lr_start = max(0, (prev_row_start // 2) // GLOBAL_CHUNK * GLOBAL_CHUNK)
-        lr_end = min(
-            cur_h,
-            ((prev_row_end // 2 + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK),
-        )
-        lc_start = max(0, (prev_col_start // 2) // GLOBAL_CHUNK * GLOBAL_CHUNK)
-        lc_end = min(
-            cur_w,
-            ((prev_col_end // 2 + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK),
-        )
-
-        if lr_end <= lr_start or lc_end <= lc_start:
-            break
-
-        if lvl < start_level:
-            # Walk the region down to the starting level without touching it.
-            prev_row_start, prev_row_end = lr_start, lr_end
-            prev_col_start, prev_col_end = lc_start, lc_end
-            continue
-
-        if console is not None:
-            console.print(
-                f"    Level {lvl}: rows {lr_start}-{lr_end}, cols {lc_start}-{lc_end}"
+        if cur_chunks is not None:
+            # A level-n chunk draws from the four level-(n-1) chunks above it,
+            # so the coordinates simply halve.
+            cur_chunks = {(r // 2, c // 2) for r, c in cur_chunks}
+            if not cur_chunks:
+                break
+            if lvl < start_level:
+                continue
+            if console is not None:
+                console.print(f"    Level {lvl}: {len(cur_chunks):,} tile(s)")
+        else:
+            lr_start = max(0, (prev_row_start // 2) // GLOBAL_CHUNK * GLOBAL_CHUNK)
+            lr_end = min(
+                cur_h,
+                ((prev_row_end // 2 + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK),
             )
+            lc_start = max(0, (prev_col_start // 2) // GLOBAL_CHUNK * GLOBAL_CHUNK)
+            lc_end = min(
+                cur_w,
+                ((prev_col_end // 2 + GLOBAL_CHUNK - 1) // GLOBAL_CHUNK * GLOBAL_CHUNK),
+            )
+
+            if lr_end <= lr_start or lc_end <= lc_start:
+                break
+
+            if lvl < start_level:
+                # Walk the region down to the start level without touching it.
+                prev_row_start, prev_row_end = lr_start, lr_end
+                prev_col_start, prev_col_end = lc_start, lc_end
+                continue
+
+            if console is not None:
+                console.print(
+                    f"    Level {lvl}: rows {lr_start}-{lr_end}, "
+                    f"cols {lc_start}-{lc_end}"
+                )
 
         tile_size = GLOBAL_CHUNK  # output tile dimension
 
@@ -1007,11 +1038,20 @@ def _coarsen_zone_pyramid(
             result = np.clip(coarsened, 0, 255).astype(np.uint8)
             _cur_arr[r0 : r0 + th, c0 : c0 + tw, :] = result
 
-        tile_args = [
-            (r0, c0)
-            for r0 in range(lr_start, lr_end, tile_size)
-            for c0 in range(lc_start, lc_end, tile_size)
-        ]
+        if cur_chunks is not None:
+            tile_args = [
+                (r * tile_size, c * tile_size)
+                for r, c in sorted(cur_chunks)
+                if r * tile_size < cur_h and c * tile_size < cur_w
+            ]
+        else:
+            tile_args = [
+                (r0, c0)
+                for r0 in range(lr_start, lr_end, tile_size)
+                for c0 in range(lc_start, lc_end, tile_size)
+            ]
+        if not tile_args:
+            break
 
         if console is not None:
             from rich.progress import (
@@ -1051,8 +1091,9 @@ def _coarsen_zone_pyramid(
                 for future in as_completed(futures):
                     future.result()
 
-        prev_row_start, prev_row_end = lr_start, lr_end
-        prev_col_start, prev_col_end = lc_start, lc_end
+        if cur_chunks is None:
+            prev_row_start, prev_row_end = lr_start, lr_end
+            prev_col_start, prev_col_end = lc_start, lc_end
 
 
 # ---------------------------------------------------------------------------
@@ -4811,7 +4852,7 @@ def _reproject_zone(
     present: set,
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
-) -> Tuple[List[Tuple[int, int, int, int]], bool]:
+) -> Tuple[set, bool]:
     """Reproject one zone's embeddings into global level 0.
 
     Embeddings are read from *source* and the pyramid's level 0 written into
@@ -4821,8 +4862,9 @@ def _reproject_zone(
     latitude covers most longitudes and would enqueue millions of empty
     chunks.
 
-    Returns (rectangles the zone touched, whether work was done); the
-    rectangles feed the coarsening.
+    Returns (the level-0 chunk coordinates the zone touched, whether work
+    was done); that set drives the coarsening, so it walks only tiles that
+    can hold data.
     """
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -4836,13 +4878,13 @@ def _reproject_zone(
     src_origin_n = zone_transform[5]
     src_h, src_w = zone_shape[:2]
 
-    chunk_set, regions = _chunks_for_shards(
+    chunk_set, _regions = _chunks_for_shards(
         present, zone_epsg, zone_transform, (src_h, src_w)
     )
     if not chunk_set:
         if console:
             console.print(f"    [yellow]Zone {zone_num}: no data to render[/yellow]")
-        return ([], False)
+        return (set(), False)
 
     # Resume check. The marker lives in the state sibling, not the store, so
     # the published hierarchy stays free of non-Zarr objects.
@@ -4854,7 +4896,7 @@ def _reproject_zone(
         else:
             if console:
                 console.print(f"    Zone {zone_num:02d}: already complete, skipping")
-            return (regions, False)
+            return (chunk_set, False)
 
     chunks_total = len(chunk_set)
     if console:
@@ -4965,7 +5007,7 @@ def _reproject_zone(
     # is skipped on resume and keeps half a pyramid — invisible except as
     # missing detail at intermediate zooms.
 
-    return (regions, True)
+    return (chunk_set, True)
 
 
 def build_global_preview(
@@ -5279,7 +5321,7 @@ def build_global_preview(
             gc.collect()
             continue
 
-        regions, did_work = _reproject_zone(
+        zone_chunks, did_work = _reproject_zone(
             source=source,
             dest=dest,
             zone_num=zone_num,
@@ -5298,17 +5340,13 @@ def build_global_preview(
         if did_work:
             if console:
                 console.print("    Building pyramid...")
-            for row_start, row_end, col_start, col_end in regions:
-                _coarsen_zone_pyramid(
-                    dest=dest,
-                    row_start=row_start,
-                    row_end=row_end,
-                    col_start=col_start,
-                    col_end=col_end,
-                    num_levels=zone_coarsen_levels,
-                    workers=workers,
-                    console=console,
-                )
+            _coarsen_zone_pyramid(
+                dest=dest,
+                chunks=zone_chunks,
+                num_levels=zone_coarsen_levels,
+                workers=workers,
+                console=console,
+            )
             # Only now is the zone genuinely finished, so only now may a
             # resume skip it.
             dest.state.write_bytes(

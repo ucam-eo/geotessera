@@ -827,6 +827,67 @@ for label, dest_loc in (
         not state.exists(*parts, on_denied=False),
     )
 
+# Coarsening driven by the chunk set must match the rectangle sweep on every
+# tile that holds data, while touching far fewer tiles. The rectangle is a
+# terrible proxy for where a zone's data is (measured 75-98% empty), and that
+# waste was the dominant cost of a preview build.
+cmp_a = StoreLocation.resolve(str(TMP / "coarse_rect.zarr"))
+cmp_b = StoreLocation.resolve(str(TMP / "coarse_set.zarr"))
+data_chunks = {(8, 12), (8, 13), (9, 12), (40, 60)}  # two clusters, far apart
+for loc in (cmp_a, cmp_b):
+    loc.open_group(mode="a", zarr_format=3)
+    _ensure_global_store(loc, 3)
+    arr = loc.open_group(mode="r+", zarr_format=3)["global_rgb/0/rgb"]
+    for cr, cc in data_chunks:
+        arr[
+            cr * GLOBAL_CHUNK : (cr + 1) * GLOBAL_CHUNK,
+            cc * GLOBAL_CHUNK : (cc + 1) * GLOBAL_CHUNK,
+            :,
+        ] = np.full(
+            (GLOBAL_CHUNK, GLOBAL_CHUNK, GLOBAL_NUM_BANDS), 200, dtype=np.uint8
+        )
+
+rows = [r for r, _c in data_chunks]
+cols = [c for _r, c in data_chunks]
+_coarsen_zone_pyramid(
+    dest=cmp_a,
+    num_levels=3,
+    workers=2,
+    row_start=min(rows) * GLOBAL_CHUNK,
+    row_end=(max(rows) + 1) * GLOBAL_CHUNK,
+    col_start=min(cols) * GLOBAL_CHUNK,
+    col_end=(max(cols) + 1) * GLOBAL_CHUNK,
+)
+_coarsen_zone_pyramid(dest=cmp_b, num_levels=3, workers=2, chunks=data_chunks)
+
+# Compare only the windows the data can reach — the full level-1 array is
+# 900k x 1.8M x 4, which is terabytes if materialised.
+same = True
+for lvl in (1, 2):
+    aa = cmp_a.open_group(mode="r", zarr_format=3)[f"global_rgb/{lvl}/rgb"]
+    bb = cmp_b.open_group(mode="r", zarr_format=3)[f"global_rgb/{lvl}/rgb"]
+    for cr, cc in data_chunks:
+        r0 = (cr >> lvl) * GLOBAL_CHUNK
+        c0 = (cc >> lvl) * GLOBAL_CHUNK
+        wa = np.asarray(aa[r0 : r0 + GLOBAL_CHUNK, c0 : c0 + GLOBAL_CHUNK, :])
+        wb = np.asarray(bb[r0 : r0 + GLOBAL_CHUNK, c0 : c0 + GLOBAL_CHUNK, :])
+        same = same and np.array_equal(wa, wb)
+check("chunk-driven coarsening matches the rectangle sweep exactly", same)
+
+lvl1 = cmp_b.open_group(mode="r", zarr_format=3)["global_rgb/1/rgb"]
+got = [
+    int(np.asarray(lvl1[(cr // 2) * GLOBAL_CHUNK, (cc // 2) * GLOBAL_CHUNK, 0]))
+    for cr, cc in sorted(data_chunks)
+]
+check("coarsened data lands where it should", all(v == 200 for v in got))
+# The rectangle spanning both clusters is ~32x21 chunks; the chunk set is 4.
+rect_tiles = ((max(rows) - min(rows) + 1) // 2 + 1) * ((max(cols) - min(cols) + 1) // 2 + 1)
+check(
+    "chunk set walks far fewer tiles than the rectangle",
+    len({(r // 2, c // 2) for r, c in data_chunks}) * 8 < rect_tiles,
+)
+
+
 # A parallel zone sweep calls _ensure_global_store from every zone at once.
 # Exactly one may create the structure; the rest must wait, not fail.
 race_dest = StoreLocation.resolve(str(TMP / "pyr_race.zarr"))
