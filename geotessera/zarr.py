@@ -56,7 +56,7 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -1137,6 +1137,127 @@ def valid_scale_mask(scales: np.ndarray) -> np.ndarray:
     """True where a scale denotes real data: finite, positive, plausible."""
     with np.errstate(invalid="ignore"):
         return np.isfinite(scales) & (scales > 0) & (scales < MAX_VALID_SCALE)
+
+
+# ---------------------------------------------------------------------------
+# Nested embedding depths (docs/specs/zarr-matryoshka-depths.md)
+# ---------------------------------------------------------------------------
+# v2 embeddings are matryoshka-trained: dimensions are ordered by importance,
+# so the first 4 or 16 of the 128 are usable embeddings in their own right.
+# `embeddings` is one chunk wide on the band axis, so reading a prefix from it
+# decodes all 128 bands; the prefixes are therefore stored as their own arrays.
+# They share the shard grid so one buffer fills them all and one resume oracle
+# still covers them, and differ only in inner-chunk granularity.
+
+MATRYOSHKA_MIN_VERSION = 2.0
+
+_DEPTHS_ATTR = "geoemb:depths"
+
+# Inner chunks are sized to this many bytes or fewer. It is what the depth-128
+# array already uses — (1, 128, 32, 32) int8 — so no depth ever produces a
+# chunk larger than the layout we have been running in production.
+INNER_CHUNK_BUDGET_BYTES = N_BANDS * INNER_CHUNK * INNER_CHUNK
+
+
+def depth_array_name(depth: int) -> str:
+    """Array holding the first *depth* dimensions of every embedding."""
+    return "embeddings" if depth >= N_BANDS else f"embeddings_d{depth}"
+
+
+def depth_band_dim(depth: int) -> str:
+    """Band dimension name for a depth-*depth* array.
+
+    Distinct per depth: an xarray reader opening the zone group would
+    otherwise see one ``band`` dimension with conflicting sizes (4 vs 128)
+    and refuse to build the dataset.
+    """
+    return "band" if depth >= N_BANDS else f"band_d{depth}"
+
+
+def depth_inner_chunk(depth: int) -> int:
+    """Spatial side of the inner chunk for a depth-*depth* array.
+
+    The largest power of two whose chunk fits the byte budget. Holding chunk
+    bytes roughly constant matters more than holding pixels constant: the
+    sharding codec's index costs a fixed 16 bytes per inner chunk *including
+    absent ones*, so keeping 32x32 at depth 4 would mean a 256 KiB index fetch
+    to reach a 1-2 KiB chunk. Every power of two <= SHARD_SIZE divides it, so
+    ``shards % chunks == 0`` holds by construction.
+    """
+    side = INNER_CHUNK
+    while (
+        side * 2 <= SHARD_SIZE and depth * (side * 2) ** 2 <= INNER_CHUNK_BUDGET_BYTES
+    ):
+        side *= 2
+    return side
+
+
+def validate_matryoshka_depths(
+    depths: "Sequence[int]", version_norm: Optional[str] = None
+) -> Tuple[int, ...]:
+    """Normalise and check a requested set of nested depths.
+
+    The full depth is implied rather than listed, so entries must be strictly
+    below ``N_BANDS``. Refused outright for pre-2.0 datasets: v1/v1.1
+    dimensions are not ordered by importance, so a prefix of them is an
+    arbitrary slice and the store would look correct while being meaningless.
+    """
+    if not depths:
+        return ()
+
+    if version_norm is not None:
+        try:
+            numeric = float(version_norm)
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is not None and numeric < MATRYOSHKA_MIN_VERSION:
+            raise ValueError(
+                f"Nested embedding depths need matryoshka-ordered dimensions, "
+                f"which dataset version {version_norm} does not have. Only "
+                f"v{MATRYOSHKA_MIN_VERSION:g} and later qualify; a prefix of "
+                f"v1/v1.1 dimensions is an arbitrary slice."
+            )
+
+    out = sorted(set(int(d) for d in depths))
+    if out[0] < 1:
+        raise ValueError(f"Depths must be >= 1, got {out[0]}")
+    if out[-1] >= N_BANDS:
+        raise ValueError(
+            f"Depths must be strictly less than the full {N_BANDS} dimensions, "
+            f"which is always present as `embeddings` and need not be listed; "
+            f"got {out[-1]}."
+        )
+    return tuple(out)
+
+
+def depths_attr_value(depths: "Sequence[int]") -> List[Dict[str, Any]]:
+    """The ``geoemb:depths`` root attribute for a set of nested depths.
+
+    Always includes the full depth as its own entry, so a client choosing a
+    depth never has to special-case the base array's name.
+    """
+    return [
+        {"dimensions": int(d), "array": depth_array_name(int(d))}
+        for d in (*depths, N_BANDS)
+    ]
+
+
+def store_depths(store: "StoreLocation | zarr.Group") -> Tuple[int, ...]:
+    """Nested depths declared by a store's root, excluding the full depth.
+
+    Empty for a single-depth store, which is every v1/v1.1 store.
+    """
+    root = store if hasattr(store, "attrs") else store.open_group(mode="r")
+    entries = root.attrs.get(_DEPTHS_ATTR) or []
+    return tuple(
+        sorted(
+            int(e["dimensions"])
+            for e in entries
+            if isinstance(e, dict) and int(e.get("dimensions", 0)) < N_BANDS
+        )
+    )
+
+
 DEFAULT_WORKERS = 4  # fewer workers due to larger shard buffers (~2GB each)
 
 # Each shard worker holds a full (N_BANDS, SHARD_SIZE, SHARD_SIZE) int8
@@ -1427,6 +1548,7 @@ def init_store(
     storage_options: Optional[Dict[str, Any]] = None,
     state_url: Optional[str] = None,
     stretch_sample_size: int = STRETCH_SAMPLE_K,
+    matryoshka_depths: Sequence[int] = (),
 ) -> str:
     """Create a tessera store with time dimension from the landmask registry.
 
@@ -1445,6 +1567,8 @@ def init_store(
     point, so initialising directly on the target object store is cheap.
     """
     import zarr
+
+    depths = validate_matryoshka_depths(matryoshka_depths, model_version)
 
     store = StoreLocation.resolve(output_path, storage_options, state_url)
     if not store.is_remote:
@@ -1473,6 +1597,12 @@ def init_store(
     if console:
         console.print(f"Initialising store at [bold]{store}[/bold]")
         console.print(f"  Years: {years[0]}-{years[-1]} ({T} time steps)")
+        if depths:
+            listed = ", ".join(
+                f"{depth_array_name(d)} ({d}d, {depth_inner_chunk(d)}px chunks)"
+                for d in depths
+            )
+            console.print(f"  Nested depths: {listed}")
 
     # Get landmask coverage grouped by UTM zone
     landmask_by_zone = _gather_landmask_tiles_by_zone(registry)
@@ -1520,6 +1650,13 @@ def init_store(
             },
         }
     )
+    # Nested depths are declared on the root only: the geoemb: convention
+    # keeps its attributes there, and zone groups carry nothing beyond
+    # proj:/spatial:. Absence of the key means a single-depth store.
+    # Every depth shares the one `scales` array — quantisation is per-pixel,
+    # not per-band, so a prefix dequantises against the identical scales.
+    if depths:
+        root.attrs[_DEPTHS_ATTR] = depths_attr_value(depths)
 
     # Create each zone group from landmask coverage
     for zone_num in sorted(landmask_by_zone.keys()):
@@ -1539,7 +1676,7 @@ def init_store(
                 f"{n_shards_x}x{n_shards_y} shards[/dim]"
             )
 
-        _create_zone_group(grid, store, stretch_sample_size)
+        _create_zone_group(grid, store, stretch_sample_size, depths)
 
     # Nothing else is written into the store: ingestion tracking and locks
     # are build state and live in the state sibling, created on first fill.
@@ -1564,6 +1701,7 @@ def _create_zone_group(
     grid: UnifiedZoneGrid,
     store_location: StoreLocation,
     stretch_sample_size: int = STRETCH_SAMPLE_K,
+    depths: Sequence[int] = (),
 ) -> "zarr.Group":
     """Create a zone group with empty (T, B, H, W) arrays."""
     from zarr.codecs import BloscCodec
@@ -1577,17 +1715,22 @@ def _create_zone_group(
     H = grid.height_px
     W = grid.width_px
 
-    # Main data arrays — (T, B, H, W) layout
-    store.create_array(
-        "embeddings",
-        shape=(T, N_BANDS, H, W),
-        chunks=(1, N_BANDS, INNER_CHUNK, INNER_CHUNK),
-        shards=(1, N_BANDS, SHARD_SIZE, SHARD_SIZE),
-        dtype=np.int8,
-        fill_value=np.int8(0),
-        compressors=BloscCodec(cname="zstd", clevel=3),
-        dimension_names=["time", "band", "y", "x"],
-    )
+    # Main data arrays — (T, B, H, W) layout. Nested-depth prefixes share the
+    # shard grid exactly and differ only in inner-chunk granularity, so one
+    # shard coordinate addresses the same pixels in every one of them
+    # (docs/specs/zarr-matryoshka-depths.md).
+    for depth in (*depths, N_BANDS):
+        inner = depth_inner_chunk(depth)
+        store.create_array(
+            depth_array_name(depth),
+            shape=(T, depth, H, W),
+            chunks=(1, depth, inner, inner),
+            shards=(1, depth, SHARD_SIZE, SHARD_SIZE),
+            dtype=np.int8,
+            fill_value=np.int8(0),
+            compressors=BloscCodec(cname="zstd", clevel=3),
+            dimension_names=["time", depth_band_dim(depth), "y", "x"],
+        )
     # fill_value=+inf means unwritten land pixels read as "no data yet".
     # Water pixels are written as NaN during zarr-fill (from landmask).
     # Clients: isinf(scales) → land/no-data, isnan(scales) → water,
@@ -1609,12 +1752,21 @@ def _create_zone_group(
     time_coords = np.array(grid.years, dtype=np.int32)
     band_coords = np.arange(N_BANDS, dtype=np.int32)
 
-    for name, data, dim in [
+    coord_arrays = [
         ("x", x_coords, "x"),
         ("y", y_coords, "y"),
         ("time", time_coords, "time"),
         ("band", band_coords, "band"),
-    ]:
+    ]
+    # One per nested depth, so each depth array's band axis has a coordinate
+    # of matching length. The values are the band indices they alias in the
+    # full array, which for a prefix is simply 0..depth-1.
+    coord_arrays += [
+        (depth_band_dim(d), np.arange(d, dtype=np.int32), depth_band_dim(d))
+        for d in depths
+    ]
+
+    for name, data, dim in coord_arrays:
         store.create_array(
             name,
             shape=data.shape,
@@ -2209,6 +2361,7 @@ _worker_source_options: Optional[Dict[str, Any]] = None
 _worker_spill_dir: Optional[str] = None
 _worker_sample_cap: int = 0  # 0 = stats collection off
 _worker_time_index: int = 0
+_worker_depths: Tuple[int, ...] = ()  # nested depths to write alongside the full one
 
 
 def _init_shard_worker(
@@ -2219,6 +2372,7 @@ def _init_shard_worker(
     spill_dir: Optional[str] = None,
     sample_cap: int = 0,
     time_index: int = 0,
+    depths: Sequence[int] = (),
 ) -> None:
     """Process pool initializer: open the zone group once per worker.
 
@@ -2226,7 +2380,7 @@ def _init_shard_worker(
     own filesystem connections rather than inheriting an unforkable client.
     """
     global _worker_store, _worker_source_options, _worker_spill_dir
-    global _worker_sample_cap, _worker_time_index
+    global _worker_sample_cap, _worker_time_index, _worker_depths
 
     from . import remote
 
@@ -2241,6 +2395,7 @@ def _init_shard_worker(
     _worker_spill_dir = spill_dir
     _worker_sample_cap = sample_cap
     _worker_time_index = time_index
+    _worker_depths = tuple(depths)
 
 
 def _write_one_shard(
@@ -2249,6 +2404,7 @@ def _write_one_shard(
     source_options: Optional[Dict[str, Any]] = None,
     spill_dir: Optional[str] = None,
     sample_cap: int = 0,
+    depths: Sequence[int] = (),
 ) -> "bool | Dict[str, Any]":
     """Write one shard in NCHW layout: (T, B, H, W).
 
@@ -2281,7 +2437,7 @@ def _write_one_shard(
 
     try:
         return _fill_and_write_shard(
-            spec, store, emb_buf, scales_buf, source_options, sample_cap
+            spec, store, emb_buf, scales_buf, source_options, sample_cap, depths
         )
     finally:
         del emb_buf, scales_buf
@@ -2306,6 +2462,7 @@ def _fill_and_write_shard(
     scales_buf: np.ndarray,
     source_options: Optional[Dict[str, Any]] = None,
     sample_cap: int = 0,
+    depths: Sequence[int] = (),
 ) -> "bool | Dict[str, Any]":
     """Populate the shard buffers from their tiles and write them out.
 
@@ -2369,6 +2526,15 @@ def _fill_and_write_shard(
         return False
 
     r, c = spec.row_px, spec.col_px
+    # Nested depths first, full depth last. Every one is a slice of the buffer
+    # already in memory, so there are no extra source reads — but the ordering
+    # is load-bearing: it makes "the `embeddings` shard object exists" imply
+    # every shallower depth exists too, which is what lets _existing_shards
+    # stay the single resume oracle. Written the other way round, a crash
+    # would strand the shallow depths permanently because resume would see
+    # `embeddings` present and skip the shard forever.
+    for depth in depths:
+        store[depth_array_name(depth)][t, :, r : r + S, c : c + S] = emb_buf[:depth]
     store["embeddings"][t, :, r : r + S, c : c + S] = emb_buf
     store["scales"][t, r : r + S, c : c + S] = scales_buf
 
@@ -2389,6 +2555,7 @@ def _write_one_shard_worker(spec: ShardSpec) -> "bool | Dict[str, Any]":
         _worker_source_options,
         _worker_spill_dir,
         _worker_sample_cap,
+        _worker_depths,
     )
 
 
@@ -2444,6 +2611,7 @@ def _existing_shards(
     time_index: int,
     wanted: set,
     console: Optional["rich.console.Console"] = None,
+    array_name: str = "embeddings",
 ) -> set:
     """Which of *wanted* shard coordinates already exist in the store.
 
@@ -2457,8 +2625,13 @@ def _existing_shards(
     Prefers one listing of the time slice's prefix; falls back to probing
     each wanted shard when listing is refused, which credentials without
     ``s3:ListBucket`` will be.
+
+    *array_name* selects which array to interrogate. Nested-depth arrays are
+    also one shard wide on the band axis, so the ``/0/`` component is the same
+    for them; only ``embeddings`` is ever used as the resume oracle, because
+    the write order guarantees it is the last one to land.
     """
-    prefix = f"{zone_group}/embeddings/c/{time_index}/0"
+    prefix = f"{zone_group}/{array_name}/c/{time_index}/0"
 
     try:
         rows = store.listdir(prefix)
@@ -2587,9 +2760,15 @@ def extend_store(
     if not zone_names:
         raise ValueError(f"No UTM zone groups found in {store}")
 
+    # Nested depth arrays are time-indexed like embeddings and must grow with
+    # it, or a fill would write a year the prefixes have no room for.
+    depth_names = [depth_array_name(d) for d in store_depths(store)]
+
     if console:
         console.print(f"Extending [bold]{store}[/bold] with years {years}")
         console.print(f"  {len(zone_names)} zone group(s)")
+        if depth_names:
+            console.print(f"  Nested depths: {', '.join(depth_names)}")
 
     extended = 0
     skipped = 0
@@ -2626,10 +2805,23 @@ def extend_store(
                 f"--zones {name[3:]}` first, then re-run zarr-extend."
             )
 
+        # A declared depth whose array is missing means the root and the zone
+        # disagree about the layout. Growing the rest would bake that in, so
+        # stop rather than produce a store whose prefixes are short a year.
+        missing_depths = [d for d in depth_names if d not in group]
+        if missing_depths:
+            raise ValueError(
+                f"{name}: root declares nested depth array(s) "
+                f"{', '.join(missing_depths)} but the zone group has none. "
+                f"The store was initialised without them; re-initialising is "
+                f"the only way to add a depth, since every existing shard "
+                f"would need rewriting to populate it."
+            )
+
         # Order matters only for crash-safety: grow the data arrays before
         # advertising the year on the time axis, so a run interrupted midway
         # never leaves a year readers can select but not read.
-        for arr_name in ("embeddings", "scales", *STRETCH_ARRAY_NAMES):
+        for arr_name in ("embeddings", "scales", *depth_names, *STRETCH_ARRAY_NAMES):
             arr = group[arr_name]
             arr.resize((new_t,) + tuple(arr.shape[1:]))
 
@@ -2756,9 +2948,16 @@ def scan_store(
         raise ValueError("Store has no years (checked zone time coords)")
     scan_years = [y for y in (years or all_years) if y in all_years]
 
+    depths = store_depths(store)
+
     if console:
         console.print(f"Scanning [bold]{store}[/bold]")
         console.print(f"  Years: {scan_years}")
+        if depths:
+            console.print(
+                f"  Verifying nested depths: "
+                f"{', '.join(depth_array_name(d) for d in depths)}"
+            )
 
     transformer_cache: Dict[int, Any] = {}
     land_by_zone: Dict[int, List[Tuple[float, float]]] = {}
@@ -2840,6 +3039,29 @@ def scan_store(
                             "n_tiles": n_tiles,
                             "status": status,
                         }
+                    )
+
+            # Nested depths are written before the full depth, so every shard
+            # present in `embeddings` must be present in each prefix too. A
+            # disagreement means shards were written by a build with the wrong
+            # order, and is repaired by re-running the fill for the zone.
+            for depth in depths:
+                name = depth_array_name(depth)
+                depth_present = _existing_shards(
+                    store,
+                    zone_group,
+                    time_index,
+                    present,
+                    console=None,
+                    array_name=name,
+                )
+                lagging = present - depth_present
+                if lagging and console:
+                    console.print(
+                        f"  [red]utm{zone_num:02d} {scan_year}: {name} is "
+                        f"missing {len(lagging)} shard(s) that `embeddings` "
+                        f"has — re-run zarr-fill --zones {zone_num} "
+                        f"--rewrite-existing-shards to repair[/red]"
                     )
 
             if console:
@@ -2979,11 +3201,20 @@ def fill_store(
 
     fill_years = [year] if year is not None else all_years
 
+    # Nested depths are a property of the store, declared once at init, so a
+    # fill never chooses them — it writes whatever the root declares. Empty
+    # for every single-depth (v1/v1.1) store.
+    depths = store_depths(store)
+
     _warn_worker_memory(workers, console, spilled=bool(spill_dir))
 
     if console:
         console.print(f"Filling store at [bold]{store}[/bold]")
         console.print(f"  Years to fill: {fill_years}")
+        if depths:
+            console.print(
+                f"  Nested depths: {', '.join(depth_array_name(d) for d in depths)}"
+            )
         if source is not None and source.is_remote:
             console.print(f"  Streaming tiles from [bold]{source.embeddings_root}[/bold]")
 
@@ -3124,6 +3355,7 @@ def fill_store(
                 sample_cap=sample_cap,
                 stats_coords=catch_up,
                 time_index=time_index,
+                depths=depths,
             )
 
             total_shards_written += written_count
@@ -3198,6 +3430,7 @@ def _write_shards(
     sample_cap: int = 0,
     stats_coords: Optional[List[Tuple[int, int]]] = None,
     time_index: int = 0,
+    depths: Sequence[int] = (),
 ) -> Tuple[int, set, List[Dict[str, Any]]]:
     """Run shard writes — and stats catch-up reads — through a process pool.
 
@@ -3224,6 +3457,7 @@ def _write_shards(
         spill_dir,
         sample_cap,
         time_index,
+        tuple(depths),
     )
 
     # "spawn", not the Linux default of "fork": a forked worker inherits the

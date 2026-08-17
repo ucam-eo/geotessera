@@ -3835,6 +3835,19 @@ def zarr_init_command(args):
         f"[cyan]geoemb:model -> https://geotessera.org/model/{model_version}[/cyan]"
     )
 
+    depths = ()
+    if args.matryoshka_depths:
+        try:
+            depths = tuple(
+                int(p) for p in args.matryoshka_depths.replace(",", " ").split()
+            )
+        except ValueError:
+            console.print(
+                f"[red]Error:[/red] --matryoshka-depths expects a comma-separated "
+                f"list of integers, got {args.matryoshka_depths!r}"
+            )
+            return 1
+
     try:
         init_store(
             registry,
@@ -3846,8 +3859,12 @@ def zarr_init_command(args):
             storage_options=store_options,
             state_url=args.state_url,
             stretch_sample_size=args.stretch_sample_size or STRETCH_SAMPLE_K,
+            matryoshka_depths=depths,
         )
     except FileExistsError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+    except ValueError as e:
         console.print(f"[red]Error:[/red] {e}")
         return 1
     except (ImportError, *_object_store_errors()) as e:
@@ -4999,6 +5016,18 @@ Directory Structure:
         default=None,
         help="Per-(zone, year) capacity of the raw pixel sample kept for the "
         "global stretch quantiles (default: 20000)",
+    )
+    zarr_init_parser.add_argument(
+        "--matryoshka-depths",
+        type=str,
+        default=None,
+        metavar="N,M",
+        help="Also store the first N (and M, ...) dimensions of every "
+        "embedding as their own arrays, so a client can read a prefix "
+        "without decoding all 128 bands (e.g. 4,16). Requires "
+        "matryoshka-ordered dimensions, so v2 datasets and later only. "
+        "Costs (N+M)/128 extra storage; see "
+        "docs/specs/zarr-matryoshka-depths.md",
     )
     _add_source_args(zarr_init_parser)
     _add_storage_args(zarr_init_parser, "source", "Tile source")

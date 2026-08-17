@@ -959,6 +959,166 @@ check(
     ),
 )
 
+# ---------------------------------------------------------------------------
+# Nested embedding depths (docs/specs/zarr-matryoshka-depths.md)
+# ---------------------------------------------------------------------------
+
+from geotessera.zarr import (  # noqa: E402
+    N_BANDS,
+    SHARD_SIZE,
+    _create_zone_group,
+    _existing_shards,
+    depth_array_name,
+    depth_band_dim,
+    depth_inner_chunk,
+    depths_attr_value,
+    store_depths,
+    validate_matryoshka_depths,
+)
+
+# Chunk geometry: bytes per inner chunk stay at or below the depth-128 budget,
+# so no depth produces a chunk larger than the layout already in production.
+check("depth-128 keeps the 32px inner chunk", depth_inner_chunk(N_BANDS) == 32)
+check("depth-16 widens to 64px", depth_inner_chunk(16) == 64)
+check("depth-4 widens to 128px", depth_inner_chunk(4) == 128)
+check(
+    "no depth exceeds the chunk byte budget",
+    all(
+        d * depth_inner_chunk(d) ** 2 <= N_BANDS * 32 * 32
+        for d in (1, 4, 16, 32, 64, 128)
+    ),
+)
+check(
+    "every depth's chunk tiles the shard exactly",
+    all(SHARD_SIZE % depth_inner_chunk(d) == 0 for d in (1, 4, 16, 32, 64, 128)),
+)
+
+# Naming and the root attribute.
+check("full depth keeps the base array name", depth_array_name(N_BANDS) == "embeddings")
+check("nested depth gets a suffixed name", depth_array_name(4) == "embeddings_d4")
+check("nested depth gets its own band dim", depth_band_dim(4) == "band_d4")
+check("full depth keeps the plain band dim", depth_band_dim(N_BANDS) == "band")
+check(
+    "the depths attribute lists the full depth too",
+    depths_attr_value((4, 16))
+    == [
+        {"dimensions": 4, "array": "embeddings_d4"},
+        {"dimensions": 16, "array": "embeddings_d16"},
+        {"dimensions": 128, "array": "embeddings"},
+    ],
+)
+
+# Gating: v1/v1.1 dimensions are not ordered, so a prefix of them is an
+# arbitrary slice and the store would look correct while being meaningless.
+for bad_version in ("1.0", "1.1"):
+    try:
+        validate_matryoshka_depths((4,), bad_version)
+        refused = False
+    except ValueError:
+        refused = True
+    check(f"depths refused for dataset v{bad_version}", refused)
+
+check(
+    "depths accepted and sorted for v2.0",
+    validate_matryoshka_depths((16, 4), "2.0") == (4, 16),
+)
+check("no depths requested is always fine", validate_matryoshka_depths((), "1.0") == ())
+
+for bad, why in [((0,), "below 1"), ((4, 128), "at the full depth"), ((200,), "above")]:
+    try:
+        validate_matryoshka_depths(bad, "2.0")
+        refused = False
+    except ValueError:
+        refused = True
+    check(f"depth {why} is refused", refused)
+
+# A real store: create a zone group with depths and write one shard.
+depth_root = StoreLocation.resolve(url(TMP / "depths.zarr"))
+depth_root.open_group(mode="w-", zarr_format=3, use_consolidated=None)
+depth_grid = UnifiedZoneGrid(
+    zone=31,
+    years=[2024],
+    canonical_epsg=32631,
+    origin_x=0.0,
+    origin_y=100000.0,
+    width_px=SHARD_SIZE,
+    height_px=SHARD_SIZE,
+)
+zone = _create_zone_group(depth_grid, depth_root, 8, depths=(4, 16))
+
+check(
+    "every declared depth array exists",
+    all(depth_array_name(d) in zone for d in (4, 16, N_BANDS)),
+)
+check(
+    "depth arrays share the spatial shard grid with embeddings",
+    all(
+        zone[depth_array_name(d)].shards[2:] == zone["embeddings"].shards[2:]
+        for d in (4, 16)
+    ),
+)
+check(
+    "depth arrays carry the expected chunk geometry",
+    zone["embeddings_d4"].chunks == (1, 4, 128, 128)
+    and zone["embeddings_d16"].chunks == (1, 16, 64, 64),
+)
+check(
+    "scales is shared, not duplicated per depth",
+    "scales" in zone and not any(f"scales_d{d}" in zone for d in (4, 16)),
+)
+check(
+    "each depth band axis has a matching coordinate array",
+    all(zone[depth_band_dim(d)].shape == (d,) for d in (4, 16)),
+)
+
+# Write one shard the way _fill_and_write_shard does — prefixes first, full
+# depth last — and check the prefixes really are prefixes.
+rng = np.random.default_rng(0)
+emb = rng.integers(-128, 127, size=(N_BANDS, SHARD_SIZE, SHARD_SIZE), dtype=np.int8)
+
+_zone_rw = depth_root.open_group(mode="r+", path="utm31", zarr_format=3)
+for _d in (4, 16):
+    _zone_rw[depth_array_name(_d)][0, :, 0:SHARD_SIZE, 0:SHARD_SIZE] = emb[:_d]
+_zone_rw["embeddings"][0, :, 0:SHARD_SIZE, 0:SHARD_SIZE] = emb
+_zone_rw["scales"][0, 0:SHARD_SIZE, 0:SHARD_SIZE] = np.float32(0.05)
+
+check(
+    "depth-4 array is the first 4 dims of the full array",
+    np.array_equal(
+        np.asarray(_zone_rw["embeddings_d4"][0, :, :512, :512]),
+        np.asarray(_zone_rw["embeddings"][0, :4, :512, :512]),
+    ),
+)
+check(
+    "depth-16 array is the first 16 dims of the full array",
+    np.array_equal(
+        np.asarray(_zone_rw["embeddings_d16"][0, :, :512, :512]),
+        np.asarray(_zone_rw["embeddings"][0, :16, :512, :512]),
+    ),
+)
+
+# The resume oracle must address every depth with the same shard coordinate,
+# which is what lets `embeddings` alone stand for all of them.
+check(
+    "shard listing finds the same coord in every depth",
+    all(
+        _existing_shards(
+            depth_root, "utm31", 0, {(0, 0)}, array_name=depth_array_name(d)
+        )
+        == {(0, 0)}
+        for d in (4, 16, N_BANDS)
+    ),
+)
+
+# Root discovery.
+_droot = depth_root.open_group(mode="r+", zarr_format=3)
+_droot.attrs["geoemb:depths"] = depths_attr_value((4, 16))
+check("store_depths reads back the declared depths", store_depths(depth_root) == (4, 16))
+check(
+    "a store with no declaration has no depths",
+    store_depths(StoreLocation.resolve(url(TMP / "pyr_url.zarr"))) == (),
+)
+
 import shutil  # noqa: E402
 
 shutil.rmtree(TMP, ignore_errors=True)

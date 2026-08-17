@@ -13,6 +13,27 @@
   `spec_url`/`schema_url` registrations change. Existing published stores
   keep their dead URLs until their metadata is rewritten. Drops the
   `pydantic` and `structlog` transitive dependencies. (@avsm)
+- **`zarr-init --matryoshka-depths 4,16`**: also store the first N dimensions
+  of every embedding as their own arrays, so a client can read a 4- or
+  16-dimensional prefix without decoding all 128 bands. `embeddings` is one
+  chunk wide on the band axis, so a prefix read from it currently costs a full
+  read and discards 96.9% of what it decoded. Requires matryoshka-ordered
+  dimensions and is refused for v1/v1.1, whose dimensions are not ordered by
+  importance — a prefix of those is an arbitrary slice, and the store would
+  look correct while being meaningless.
+
+  The depth arrays share the shard grid with `embeddings` exactly, so one
+  source read fills them all from the same buffer and one shard coordinate
+  addresses the same pixels everywhere; only the inner chunk differs
+  (`128x128` at depth 4, `64x64` at 16), sized to hold chunk bytes at or below
+  the depth-128 budget. Keeping `32x32` at depth 4 would have meant a 256 KiB
+  sharding-index fetch to reach a 1-2 KiB chunk. `scales` is *not* duplicated:
+  quantisation is per-pixel, so every depth dequantises against the same
+  array. Depths are written before the full depth so that "the `embeddings`
+  shard exists" implies every prefix exists, leaving `_existing_shards` the
+  single resume oracle. Storage overhead measured at 16.2%. `zarr-fill`,
+  `zarr-extend` and `zarr-scan` all follow the root's `geoemb:depths`
+  declaration. See `docs/specs/zarr-matryoshka-depths.md`. (@avsm)
 - **`zarr-stretch --from-sample`**: take the covariance from the stored
   per-zone reservoir instead of the summed sufficient statistics. The sums
   are exact but unrepairable in place once a few out-of-range pixels have
