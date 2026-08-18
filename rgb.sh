@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Global RGB preview pyramid for one year of the Tessera v1 zarr store.
+# Global RGB preview pyramid for one year of a Tessera zarr store.
 #
 # Standalone: runs against an existing venv and never installs anything, so
 # it cannot silently swap the code underneath itself. It verifies up front
@@ -20,6 +20,7 @@
 # another.
 #
 # Usage:  ./rgb.sh [YEAR]
+#         VERSION=v1.1 FROM_SAMPLE=0 ./rgb.sh 2025
 #
 set -euo pipefail
 
@@ -28,14 +29,22 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 YEAR="${1:-2024}"
+VERSION="${VERSION:-v1}"                  # which published store to render
 PROFILE="${PROFILE:-sc-writer}"           # AWS profile with write access
 VENV="${VENV:-$HOME/.venvs/geotessera}"
 
-SRC="s3://tessera/tessera/zarr/v1"                                # via gateway
-DST="s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/v1" # backing bucket
+SRC="${SRC:-s3://tessera/tessera/zarr/$VERSION}"     # via gateway
+DST="${DST:-s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/$VERSION}"
 
-STATE="${STATE:-$HOME/tessera-preview-$YEAR.state}"   # local build state
-LOGDIR="${LOGDIR:-$HOME/tessera-preview-$YEAR.logs}"
+# v1 keeps its unversioned paths: its 2024 markers are already on disk under
+# that name, and a rename would silently re-render all 60 zones.
+if [ "$VERSION" = "v1" ]; then
+    STATE="${STATE:-$HOME/tessera-preview-$YEAR.state}"
+    LOGDIR="${LOGDIR:-$HOME/tessera-preview-$YEAR.logs}"
+else
+    STATE="${STATE:-$HOME/tessera-preview-$VERSION-$YEAR.state}"
+    LOGDIR="${LOGDIR:-$HOME/tessera-preview-$VERSION-$YEAR.logs}"
+fi
 
 # I/O bound on gateway round-trips, not CPU: workers sit ~99.8% idle pulling
 # ~2.4 MB/s each, so throughput scales with in-flight requests. 30 zones x 40
@@ -55,8 +64,13 @@ SATURATION="${SATURATION:-1.0}"
 # The summed statistics for the published v1 store are poisoned by a handful
 # of out-of-range scales and cannot be repaired without a multi-day rescan.
 # --from-sample takes the covariance from the stored reservoir instead, which
-# those rare pixels almost never land in. Set to 0 only after a rebuild.
-FROM_SAMPLE="${FROM_SAMPLE:-1}"
+# those rare pixels almost never land in. Stores filled by a build with
+# MAX_VALID_SCALE=1.0 (v1.1 onwards) have clean sums, so default this off for
+# them: the sums are exact where the reservoir is only a sample.
+case "$VERSION" in
+    v1) FROM_SAMPLE="${FROM_SAMPLE:-1}" ;;
+    *)  FROM_SAMPLE="${FROM_SAMPLE:-0}" ;;
+esac
 
 # Step 1 rescans every shard in the store — days of work, and already done for
 # 2024. It is off by default; set SKIP_STATS=0 for a year that has never had
@@ -135,7 +149,7 @@ elif [ -d "$STATE/_preview" ] && [ -n "$(ls -A "$STATE/_preview" 2>/dev/null)" ]
     echo "    has changed since they were rendered."
 fi
 
-echo "==> year=$YEAR  zones=1-60  parallel=$ZONE_JOBS x $WORKERS workers"
+echo "==> $VERSION year=$YEAR  zones=1-60  parallel=$ZONE_JOBS x $WORKERS workers"
 echo "    venv   $VENV"
 echo "    source $SRC"
 echo "    dest   $DST"
