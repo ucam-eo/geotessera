@@ -254,14 +254,17 @@ run_zones_scheduled() {
     # slots busy with 9 zones startable, and throughput down 1813 -> 648 MB/s.
     _reap_one() {
         local fpid="" rc=0 keep="" newin="" r p
+        # `|| rc=$?` rather than a bare `wait`: under `set -e` a wait that
+        # reports a failed child aborts the script on the spot, orphaning
+        # every zone still in flight.
         if [ "$HAVE_WAIT_N" = "1" ]; then
-            wait -n -p fpid; rc=$?
+            wait -n -p fpid || rc=$?
         fi
         if [ -z "$fpid" ]; then
             pair="${inflight%% *}"
             if [ "$pair" = "$inflight" ]; then inflight=""; else inflight="${inflight#* }"; fi
             fpid="${pair%%:*}"; zone="${pair##*:}"
-            wait "$fpid"; rc=$?
+            wait "$fpid" || rc=$?
         else
             zone=""
             for p in $inflight; do

@@ -186,11 +186,14 @@ echo "==> [2/3] Filling zones"
 failed=0 inflight="" n=0
 reap() {
     local fpid="" rc=0 zone="" newin="" p pair
-    if [ "$HAVE_WAIT_N" = "1" ]; then wait -n -p fpid; rc=$?; fi
+    # `|| rc=$?` rather than a bare `wait`: under `set -e` a wait that
+    # reports a failed child aborts this script on the spot, orphaning every
+    # zone still in flight instead of reporting the failure at the end.
+    if [ "$HAVE_WAIT_N" = "1" ]; then wait -n -p fpid || rc=$?; fi
     if [ -z "$fpid" ]; then
         pair="${inflight%% *}"
         if [ "$pair" = "$inflight" ]; then inflight=""; else inflight="${inflight#* }"; fi
-        fpid="${pair%%:*}"; zone="${pair##*:}"; wait "$fpid"; rc=$?
+        fpid="${pair%%:*}"; zone="${pair##*:}"; wait "$fpid" || rc=$?
     else
         for p in $inflight; do
             if [ "${p%%:*}" = "$fpid" ] && [ -z "$zone" ]; then zone="${p##*:}"; else newin="$newin $p"; fi
