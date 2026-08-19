@@ -14,10 +14,15 @@
 # uv, so the host needs only uv, curl and AWS credentials — with three v2
 # differences:
 #
-#   * The npy directory is `v2-2B-L~beta1` (version *and* variant), while the
-#     landmasks are keyed by version alone at `landmasks/v2/`. Neither is
-#     derivable from the other, so the preflight asks the library rather than
-#     guessing.
+#   * The npy directory is `v2-2B-L~beta1` — version *and* variant — which is
+#     not derivable from the version, so the preflight asks the library rather
+#     than guessing.
+#   * v2 inference covers every pixel of a tile it emits, so there is no
+#     landmask: a tile that exists is data all the way to its edges. The zone
+#     grid is therefore sized from the embeddings. That is required, not an
+#     optimisation — the published landmasks/v2 is a copy of v1.1's and stops
+#     at lat -59.55, while v2 reaches -89.95, so sizing from it would place
+#     880 Antarctic tiles outside the grid.
 #   * v2 dimensions are matryoshka-ordered, so the store also carries the
 #     first 4 and first 16 dimensions as their own arrays for ~16% extra
 #     storage (docs/specs/zarr-matryoshka-depths.md). A client can then read a
@@ -147,11 +152,10 @@ echo "    dataset dir: npy/$DATASET_DIR   commit: $("$VENV/bin/python" -c 'impor
 # Fetched with curl rather than left to fsspec: fsspec times out on these
 # through the gateway (FSTimeoutError after ~6 min) where curl takes seconds.
 #
-# Note the asymmetry — the manifest lives under the dataset directory
-# (version + variant), the landmasks under the version alone.
+# The manifest is the only registry this pipeline needs: with no landmask
+# there is nothing else to consult.
 
 MANIFEST="$WORKDIR/manifest-$SAFE_TAG.parquet"
-LANDMASKS="$WORKDIR/landmasks-$VERSION.parquet"
 BASE="https://data.source.coop/tessera/tessera"
 
 fetch() {  # url dest
@@ -162,10 +166,9 @@ fetch() {  # url dest
     mv "$2.part" "$2"
 }
 
-echo "==> Registries"
+echo "==> Manifest"
 fetch "$BASE/npy/$DATASET_DIR/manifest.parquet" "$MANIFEST"
-fetch "$BASE/landmasks/$VERSION/landmasks.parquet" "$LANDMASKS"
-REG=(--manifest-url "$MANIFEST" --landmasks-url "$LANDMASKS")
+REG=(--manifest-url "$MANIFEST")
 
 # Zones that actually carry tiles. Filling a zone with no tiles is harmless but
 # pointless, and the list makes the run's scope explicit in the log.
@@ -182,6 +185,7 @@ echo "==> $VERSION/$VARIANT  years=$YEARS  zones=$(echo "$ZONES" | wc -w)"
 echo "    source $SRC (npy/$DATASET_DIR)"
 echo "    dest   $DST"
 echo "    depths ${MATRYOSHKA_DEPTHS:-none (full 128 only)}"
+echo "    mask   none (grid sized from the embeddings)"
 echo "    fill   $ZONE_JOBS zones x $WORKERS workers, spilling to $SPILL"
 echo
 
@@ -193,7 +197,7 @@ echo
 # exits the script whenever the test is false and it happens to be the last
 # command in its context. Expanded below with the ${arr[@]+..} guard, because
 # bash before 4.4 treats an empty array as unset under `set -u`.
-INIT_FLAGS=()
+INIT_FLAGS=(--no-landmask)
 if [ -n "$MATRYOSHKA_DEPTHS" ]; then
     INIT_FLAGS+=(--matryoshka-depths "$MATRYOSHKA_DEPTHS")
 fi

@@ -1223,6 +1223,129 @@ check(
     _zone_for_lon(2.35) == 31 and _zone_for_lon(-120.5) == 10,
 )
 
+# ---------------------------------------------------------------------------
+# Landmask-free stores
+# ---------------------------------------------------------------------------
+# v2 inference covers every pixel of a tile it emits, so a present tile needs
+# no mask. The grid must then be sized from the embeddings: the published
+# landmask stops well north of v2's southernmost tiles.
+
+from geotessera.zarr import (  # noqa: E402
+    _fill_and_write_shard,
+    _gather_landmask_tiles_by_zone,
+    store_uses_landmask,
+)
+
+
+class _FakeRegistry:
+    """Just enough of Registry for the two coordinate accessors used here."""
+
+    def __init__(self, emb, land):
+        import pandas as pd
+
+        self._emb, self._land = emb, land
+        idx = pd.MultiIndex.from_tuples(
+            [(y, int(round(lo * 100)), int(round(la * 100))) for y, lo, la in emb],
+            names=["year", "lon_i", "lat_i"],
+        )
+        self._registry_gdf = pd.DataFrame(index=idx)
+
+    @property
+    def available_landmasks(self):
+        return self._land
+
+
+# Embeddings reach lat -80; the landmask stops at -20, as v2's does.
+reg = _FakeRegistry(
+    emb=[(2024, 3.05, -80.05), (2024, 3.05, 10.05), (2025, 3.05, -80.05)],
+    land=[(3.05, -20.05), (3.05, 10.05)],
+)
+by_land = _gather_landmask_tiles_by_zone(reg)
+by_emb = _gather_landmask_tiles_by_zone(reg, from_embeddings=True)
+check("landmask grid uses the landmask tiles", sorted(by_land[31]) == [(3.05, -20.05), (3.05, 10.05)])
+check(
+    "landmask-free grid uses the embedding tiles",
+    sorted(by_emb[31]) == [(3.05, -80.05), (3.05, 10.05)],
+)
+check(
+    "and so reaches tiles the landmask never covers",
+    min(la for _, la in by_emb[31]) < min(la for _, la in by_land[31]),
+)
+check("embedding tiles are deduplicated across years", len(by_emb[31]) == 2)
+
+# The flag round-trips through a store root, defaulting to "masked".
+lm_root = StoreLocation.resolve(url(TMP / "nolm.zarr"))
+_r = lm_root.open_group(mode="w-", zarr_format=3, use_consolidated=None)
+check("a store says masked unless told otherwise", store_uses_landmask(lm_root) is True)
+_r.attrs["geoemb:landmask"] = False
+check("a landmask-free store reports itself", store_uses_landmask(lm_root) is False)
+
+# Drive a real shard write both ways and count landmask reads.
+import geotessera.zarr as _z  # noqa: E402
+from geotessera.zarr import ShardSpec, ShardTileOverlap  # noqa: E402
+
+TW = 64  # tile side, in pixels
+grid2 = UnifiedZoneGrid(
+    zone=31, years=[2024], canonical_epsg=32631,
+    origin_x=0.0, origin_y=100000.0, width_px=SHARD_SIZE, height_px=SHARD_SIZE,
+)
+zone2 = _create_zone_group(grid2, lm_root, 8)
+
+ov = ShardTileOverlap(
+    embedding_path="emb", scales_path="sc", landmask_path="lm",
+    t_row_start=0, t_row_end=TW, t_col_start=0, t_col_end=TW,
+    s_row_start=0, s_row_end=TW, s_col_start=0, s_col_end=TW,
+)
+spec2 = ShardSpec(
+    time_index=0, sr=0, sc=0, row_px=0, col_px=0, tiles=[ov],
+)
+
+lm_calls = []
+_real_lm = _z._load_landmask_slice
+_real_npy = remote.read_npy_window
+# Landmask marks the whole tile as water, so if it is consulted the scales
+# come back NaN and the difference is visible in the data, not just the count.
+_z._load_landmask_slice = lambda *a, **k: (lm_calls.append(a[0]), np.zeros((TW, TW), np.uint8))[1]
+remote.read_npy_window = lambda path, r0, r1, c0, c1, storage_options=None: (
+    np.ones((r1 - r0, c1 - c0, N_BANDS), np.int8)
+    if "emb" in str(path)
+    else np.full((r1 - r0, c1 - c0), np.float32(0.05))
+)
+try:
+    for use_lm, label in ((True, "with"), (False, "without")):
+        lm_calls.clear()
+        buf = np.zeros((N_BANDS, SHARD_SIZE, SHARD_SIZE), np.int8)
+        sbuf = np.full((SHARD_SIZE, SHARD_SIZE), np.float32("inf"))
+        _fill_and_write_shard(spec2, zone2, buf, sbuf, None, 0, (), use_lm)
+        got = np.asarray(zone2["scales"][0, 0, 0])
+        if use_lm:
+            check("a masked fill reads the landmask", len(lm_calls) == 1)
+            check("and its water pixels become NaN", bool(np.isnan(got)))
+        else:
+            check("a landmask-free fill reads no landmask", lm_calls == [])
+            check("and its pixels keep real scales", float(got) == np.float32(0.05))
+finally:
+    _z._load_landmask_slice = _real_lm
+    remote.read_npy_window = _real_npy
+
+# The scale sanity check must survive: it rejects nodata inside the tile,
+# which is a different thing from water and is not the landmask's job.
+remote.read_npy_window = lambda path, r0, r1, c0, c1, storage_options=None: (
+    np.ones((r1 - r0, c1 - c0, N_BANDS), np.int8)
+    if "emb" in str(path)
+    else np.full((r1 - r0, c1 - c0), np.float32(1e6))  # sentinel-huge: nodata
+)
+try:
+    buf = np.zeros((N_BANDS, SHARD_SIZE, SHARD_SIZE), np.int8)
+    sbuf = np.full((SHARD_SIZE, SHARD_SIZE), np.float32("inf"))
+    _fill_and_write_shard(spec2, zone2, buf, sbuf, None, 0, (), False)
+    check(
+        "out-of-range scales are still rejected without a landmask",
+        bool(np.isnan(np.asarray(zone2["scales"][0, 0, 0]))),
+    )
+finally:
+    remote.read_npy_window = _real_npy
+
 import shutil  # noqa: E402
 
 shutil.rmtree(TMP, ignore_errors=True)

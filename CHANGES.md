@@ -1,6 +1,27 @@
 ## Unreleased
 
 ### Breaking Changes
+- **`zarr-init --no-landmask`**: for datasets whose inference covers every
+  pixel of a tile it emits, so a present tile is data all the way to its
+  edges. No landmask registry is fetched and no landmask GeoTIFF is read
+  during a fill; the mask would be all ones, so consulting it is a per-tile
+  round trip that can only confirm what the tile's presence already says. The
+  flag is recorded on the root as `geoemb:landmask: false` and `zarr-fill`
+  follows the store, so the two can never disagree. Absent means masked, which
+  is every store predating the flag.
+
+  The zone grid is then sized from the embeddings rather than the landmask.
+  That is required, not an optimisation: the published `landmasks/v2` is a
+  copy of v1.1's and stops at lat -59.55 while v2 reaches -89.95, so sizing
+  from it put 880 Antarctic tiles outside the grid — 49 of 60 zones failed
+  with `IndexError: index 376 is out of bounds for axis 0 with size 315` from
+  the stretch bookkeeping, after the shard writes had already run. Measured
+  over six v2 zones: 83 tiles outside the landmask-derived grid, 0 outside the
+  embedding-derived one.
+
+  The scale sanity check still runs. Rejecting out-of-range scales written
+  into a tile is a different thing from masking water, and only the latter is
+  the landmask's job. (@avsm)
 
 - **Convention metadata now comes from `zarr-cm`**, replacing
   `geozarr-toolkit`. Stores stamp `spatial:` and `proj:` at revision **r3**

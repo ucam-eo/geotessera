@@ -3769,13 +3769,20 @@ def _resolve_source(args, console: "Console"):
             _storage_options_for(args, "source", manifest_loc),
             console,
         )
-        landmasks_path = _sync_remote_file(
-            landmasks_loc,
-            cache_dir / "landmasks.parquet",
-            _storage_options_for(args, "source", landmasks_loc),
-            console,
-            optional=True,
-        )
+        # --no-landmask means exactly that: the 19 MB registry is not fetched,
+        # not fetched-and-ignored. Registry.available_landmasks then falls back
+        # to the embedding tiles, which is the coverage this mode wants.
+        if getattr(args, "no_landmask", False):
+            landmasks_path = None
+            console.print("[dim]No landmask: skipping the landmask registry[/dim]")
+        else:
+            landmasks_path = _sync_remote_file(
+                landmasks_loc,
+                cache_dir / "landmasks.parquet",
+                _storage_options_for(args, "source", landmasks_loc),
+                console,
+                optional=True,
+            )
         registry = Registry(
             version=dataset_version,
             variant=dataset_variant,
@@ -3860,6 +3867,7 @@ def zarr_init_command(args):
             state_url=args.state_url,
             stretch_sample_size=args.stretch_sample_size or STRETCH_SAMPLE_K,
             matryoshka_depths=depths,
+            use_landmask=not args.no_landmask,
         )
     except FileExistsError as e:
         console.print(f"[red]Error:[/red] {e}")
@@ -5016,6 +5024,16 @@ Directory Structure:
         default=None,
         help="Per-(zone, year) capacity of the raw pixel sample kept for the "
         "global stretch quantiles (default: 20000)",
+    )
+    zarr_init_parser.add_argument(
+        "--no-landmask",
+        action="store_true",
+        help="Treat every pixel of a present tile as data and never read a "
+        "landmask. For datasets whose inference covers the whole tile (v2 "
+        "onwards). The zone grid is then sized from the embeddings, which is "
+        "required rather than an optimisation: a landmask stopping short of "
+        "the embeddings places tiles outside the grid. Recorded in the store, "
+        "so fills follow it.",
     )
     zarr_init_parser.add_argument(
         "--matryoshka-depths",

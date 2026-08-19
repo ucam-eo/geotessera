@@ -834,13 +834,32 @@ def _chunks_for_shards(
         es = [origin_e + c0 * src_pixel, origin_e + c1 * src_pixel]
         ns = [origin_n - r0 * src_pixel, origin_n - r1 * src_pixel]
         # Corners plus edge midpoints: enough to bound the curved footprint.
-        pts_e = [es[0], es[1], es[0], es[1], (es[0] + es[1]) / 2,
-                 (es[0] + es[1]) / 2, es[0], es[1]]
-        pts_n = [ns[0], ns[0], ns[1], ns[1], ns[0], ns[1],
-                 (ns[0] + ns[1]) / 2, (ns[0] + ns[1]) / 2]
+        pts_e = [
+            es[0],
+            es[1],
+            es[0],
+            es[1],
+            (es[0] + es[1]) / 2,
+            (es[0] + es[1]) / 2,
+            es[0],
+            es[1],
+        ]
+        pts_n = [
+            ns[0],
+            ns[0],
+            ns[1],
+            ns[1],
+            ns[0],
+            ns[1],
+            (ns[0] + ns[1]) / 2,
+            (ns[0] + ns[1]) / 2,
+        ]
         lons, lats = to_4326.transform(pts_e, pts_n)
-        finite = [(lo, la) for lo, la in zip(lons, lats)
-                  if math.isfinite(lo) and math.isfinite(la)]
+        finite = [
+            (lo, la)
+            for lo, la in zip(lons, lats)
+            if math.isfinite(lo) and math.isfinite(la)
+        ]
         if not finite:
             continue
         la_min = min(p[1] for p in finite)
@@ -1242,6 +1261,24 @@ def depths_attr_value(depths: "Sequence[int]") -> List[Dict[str, Any]]:
     ]
 
 
+# v2 inference covers every pixel of a tile it emits, so a present tile needs
+# no landmask: the mask would be all ones. Older datasets masked water out of
+# partially-covered tiles and still need it. Recorded at init so a fill can
+# never disagree with the store it is filling.
+
+_LANDMASK_ATTR = "geoemb:landmask"
+
+
+def store_uses_landmask(store: "StoreLocation | zarr.Group") -> bool:
+    """Whether this store's tiles are masked against a landmask.
+
+    True unless the root says otherwise, which is every store predating the
+    flag.
+    """
+    root = store if hasattr(store, "attrs") else store.open_group(mode="r")
+    return bool(root.attrs.get(_LANDMASK_ATTR, True))
+
+
 def store_depths(store: "StoreLocation | zarr.Group") -> Tuple[int, ...]:
     """Nested depths declared by a store's root, excluding the full depth.
 
@@ -1466,12 +1503,20 @@ def build_shard_index(
 
 def _gather_landmask_tiles_by_zone(
     registry: "Registry",
+    from_embeddings: bool = False,
 ) -> Dict[int, List[Tuple[float, float]]]:
     """Group landmask tile coordinates by UTM zone.
 
     Returns dict mapping zone number to list of (lon, lat) centres.
+
+    With *from_embeddings* the coordinates are the embedding tiles over every
+    year, for stores whose tiles carry no water and so need no landmask.
     """
-    tiles = registry.available_landmasks  # [(lon, lat), ...]
+    if from_embeddings:
+        idx = registry._registry_gdf.index.droplevel("year").unique()
+        tiles = [(lon_i / 100.0, lat_i / 100.0) for lon_i, lat_i in idx]
+    else:
+        tiles = registry.available_landmasks  # [(lon, lat), ...]
     by_zone: Dict[int, List[Tuple[float, float]]] = {}
     for lon, lat in tiles:
         zone_num = int(math.floor((lon + 180) / 6)) + 1
@@ -1549,12 +1594,19 @@ def init_store(
     state_url: Optional[str] = None,
     stretch_sample_size: int = STRETCH_SAMPLE_K,
     matryoshka_depths: Sequence[int] = (),
+    use_landmask: bool = True,
 ) -> str:
     """Create a tessera store with time dimension from the landmask registry.
 
     Creates all UTM zones that have landmask coverage.  For each zone, the
     grid extent is computed from landmask tiles (not embeddings), so only
     the landmask registry is needed.
+
+    With ``use_landmask=False`` the extent comes from the embedding tiles
+    instead and no landmask is consulted at any stage: every pixel of a tile
+    that exists is data. Sizing the grid from the embeddings is not optional
+    in that mode — a landmask that stops short of the embeddings would place
+    tiles outside the grid, which truncates them on write.
 
     The scales array is initialised with sentinels:
     - NaN  = water (permanent, from landmask)
@@ -1604,14 +1656,24 @@ def init_store(
             )
             console.print(f"  Nested depths: {listed}")
 
-    # Get landmask coverage grouped by UTM zone
-    landmask_by_zone = _gather_landmask_tiles_by_zone(registry)
+    # Grid extent: landmask tiles, or the embeddings themselves when tiles are
+    # fully covered. Registry.available_landmasks already falls back to
+    # embedding tiles when no landmask registry is loaded, so the same call
+    # serves both once the caller has declined to load one.
+    landmask_by_zone = _gather_landmask_tiles_by_zone(
+        registry, from_embeddings=not use_landmask
+    )
 
     if not landmask_by_zone:
-        raise ValueError("No landmask tiles found in registry")
+        raise ValueError(
+            "No embedding tiles found in registry"
+            if not use_landmask
+            else "No landmask tiles found in registry"
+        )
 
     if console:
-        console.print(f"  {len(landmask_by_zone)} zone(s) with land coverage")
+        src = "embedding" if not use_landmask else "land"
+        console.print(f"  {len(landmask_by_zone)} zone(s) with {src} coverage")
 
     # Create root group via zarr API (not manual JSON) so consolidation
     # preserves attributes correctly. Mode "w-" creates but never clobbers:
@@ -1657,6 +1719,10 @@ def init_store(
     # not per-band, so a prefix dequantises against the identical scales.
     if depths:
         root.attrs[_DEPTHS_ATTR] = depths_attr_value(depths)
+    # Only written when false: absence means "masked", which is what every
+    # store predating the flag is.
+    if not use_landmask:
+        root.attrs[_LANDMASK_ATTR] = False
 
     # Create each zone group from landmask coverage
     for zone_num in sorted(landmask_by_zone.keys()):
@@ -1863,21 +1929,50 @@ def create_stretch_arrays(
     T = n_years
     specs = [
         ("stretch_stats_count", (T,), (1,), np.int64, 0, ["time"]),
-        ("stretch_stats_sum", (T, N_BANDS), (1, N_BANDS), np.float64, 0.0,
-         ["time", "band"]),
-        ("stretch_stats_prod", (T, N_BANDS, N_BANDS), (1, N_BANDS, N_BANDS),
-         np.float64, 0.0, ["time", "band", "band2"]),
-        ("stretch_sample", (T, k, N_BANDS), (1, k, N_BANDS), np.int8,
-         np.int8(0), ["time", "sample", "band"]),
+        (
+            "stretch_stats_sum",
+            (T, N_BANDS),
+            (1, N_BANDS),
+            np.float64,
+            0.0,
+            ["time", "band"],
+        ),
+        (
+            "stretch_stats_prod",
+            (T, N_BANDS, N_BANDS),
+            (1, N_BANDS, N_BANDS),
+            np.float64,
+            0.0,
+            ["time", "band", "band2"],
+        ),
+        (
+            "stretch_sample",
+            (T, k, N_BANDS),
+            (1, k, N_BANDS),
+            np.int8,
+            np.int8(0),
+            ["time", "sample", "band"],
+        ),
         # +inf matches the "land, no data" sentinel, so padding slots can
         # never be mistaken for real pixels even by a reader that ignores
         # stretch_sample_count.
-        ("stretch_sample_scales", (T, k), (1, k), np.float32,
-         np.float32("inf"), ["time", "sample"]),
+        (
+            "stretch_sample_scales",
+            (T, k),
+            (1, k),
+            np.float32,
+            np.float32("inf"),
+            ["time", "sample"],
+        ),
         ("stretch_sample_count", (T,), (1,), np.int64, 0, ["time"]),
-        ("stretch_stats_shards", (T, n_shard_rows, n_shard_cols),
-         (1, n_shard_rows, n_shard_cols), np.uint8, np.uint8(0),
-         ["time", "shard_row", "shard_col"]),
+        (
+            "stretch_stats_shards",
+            (T, n_shard_rows, n_shard_cols),
+            (1, n_shard_rows, n_shard_cols),
+            np.uint8,
+            np.uint8(0),
+            ["time", "shard_row", "shard_col"],
+        ),
     ]
     for name, shape, chunks, dtype, fill, dims in specs:
         group.create_array(
@@ -1911,11 +2006,7 @@ def ensure_stretch_arrays(
     T = group["time"].shape[0]
     H, W = group["embeddings"].shape[2], group["embeddings"].shape[3]
     n_sr, n_sc = math.ceil(H / SHARD_SIZE), math.ceil(W / SHARD_SIZE)
-    k = (
-        group["stretch_sample"].shape[1]
-        if "stretch_sample" in group
-        else sample_k
-    )
+    k = group["stretch_sample"].shape[1] if "stretch_sample" in group else sample_k
 
     had_untracked_sums = (
         "stretch_stats_shards" in absent
@@ -1928,24 +2019,53 @@ def ensure_stretch_arrays(
     comp = BloscCodec(cname="zstd", clevel=3)
     all_specs = {
         "stretch_stats_count": ((T,), (1,), np.int64, 0, ["time"]),
-        "stretch_stats_sum": ((T, N_BANDS), (1, N_BANDS), np.float64, 0.0,
-                              ["time", "band"]),
-        "stretch_stats_prod": ((T, N_BANDS, N_BANDS), (1, N_BANDS, N_BANDS),
-                               np.float64, 0.0, ["time", "band", "band2"]),
-        "stretch_sample": ((T, k, N_BANDS), (1, k, N_BANDS), np.int8,
-                           np.int8(0), ["time", "sample", "band"]),
-        "stretch_sample_scales": ((T, k), (1, k), np.float32,
-                                  np.float32("inf"), ["time", "sample"]),
+        "stretch_stats_sum": (
+            (T, N_BANDS),
+            (1, N_BANDS),
+            np.float64,
+            0.0,
+            ["time", "band"],
+        ),
+        "stretch_stats_prod": (
+            (T, N_BANDS, N_BANDS),
+            (1, N_BANDS, N_BANDS),
+            np.float64,
+            0.0,
+            ["time", "band", "band2"],
+        ),
+        "stretch_sample": (
+            (T, k, N_BANDS),
+            (1, k, N_BANDS),
+            np.int8,
+            np.int8(0),
+            ["time", "sample", "band"],
+        ),
+        "stretch_sample_scales": (
+            (T, k),
+            (1, k),
+            np.float32,
+            np.float32("inf"),
+            ["time", "sample"],
+        ),
         "stretch_sample_count": ((T,), (1,), np.int64, 0, ["time"]),
-        "stretch_stats_shards": ((T, n_sr, n_sc), (1, n_sr, n_sc), np.uint8,
-                                 np.uint8(0), ["time", "shard_row",
-                                               "shard_col"]),
+        "stretch_stats_shards": (
+            (T, n_sr, n_sc),
+            (1, n_sr, n_sc),
+            np.uint8,
+            np.uint8(0),
+            ["time", "shard_row", "shard_col"],
+        ),
     }
     for name in absent:
         shape, chunks, dtype, fill, dims = all_specs[name]
         group.create_array(
-            name, shape=shape, chunks=chunks, dtype=dtype, fill_value=fill,
-            compressors=comp, dimension_names=dims,
+            name,
+            shape=shape,
+            chunks=chunks,
+            dtype=dtype,
+            fill_value=fill,
+            compressors=comp,
+            dimension_names=dims,
         )
 
     if had_untracked_sums:
@@ -1961,9 +2081,7 @@ def ensure_stretch_arrays(
                 "goes.[/yellow]"
             )
     if console:
-        console.print(
-            f"    [dim]Created stretch array(s): {', '.join(absent)}[/dim]"
-        )
+        console.print(f"    [dim]Created stretch array(s): {', '.join(absent)}[/dim]")
 
 
 def _shard_sample_cap(k_slots: int, n_shards: int) -> int:
@@ -2362,6 +2480,7 @@ _worker_spill_dir: Optional[str] = None
 _worker_sample_cap: int = 0  # 0 = stats collection off
 _worker_time_index: int = 0
 _worker_depths: Tuple[int, ...] = ()  # nested depths to write alongside the full one
+_worker_use_landmask: bool = True
 
 
 def _init_shard_worker(
@@ -2373,6 +2492,7 @@ def _init_shard_worker(
     sample_cap: int = 0,
     time_index: int = 0,
     depths: Sequence[int] = (),
+    use_landmask: bool = True,
 ) -> None:
     """Process pool initializer: open the zone group once per worker.
 
@@ -2381,6 +2501,7 @@ def _init_shard_worker(
     """
     global _worker_store, _worker_source_options, _worker_spill_dir
     global _worker_sample_cap, _worker_time_index, _worker_depths
+    global _worker_use_landmask
 
     from . import remote
 
@@ -2396,6 +2517,7 @@ def _init_shard_worker(
     _worker_sample_cap = sample_cap
     _worker_time_index = time_index
     _worker_depths = tuple(depths)
+    _worker_use_landmask = use_landmask
 
 
 def _write_one_shard(
@@ -2405,6 +2527,7 @@ def _write_one_shard(
     spill_dir: Optional[str] = None,
     sample_cap: int = 0,
     depths: Sequence[int] = (),
+    use_landmask: bool = True,
 ) -> "bool | Dict[str, Any]":
     """Write one shard in NCHW layout: (T, B, H, W).
 
@@ -2437,7 +2560,14 @@ def _write_one_shard(
 
     try:
         return _fill_and_write_shard(
-            spec, store, emb_buf, scales_buf, source_options, sample_cap, depths
+            spec,
+            store,
+            emb_buf,
+            scales_buf,
+            source_options,
+            sample_cap,
+            depths,
+            use_landmask,
         )
     finally:
         del emb_buf, scales_buf
@@ -2463,6 +2593,7 @@ def _fill_and_write_shard(
     source_options: Optional[Dict[str, Any]] = None,
     sample_cap: int = 0,
     depths: Sequence[int] = (),
+    use_landmask: bool = True,
 ) -> "bool | Dict[str, Any]":
     """Populate the shard buffers from their tiles and write them out.
 
@@ -2505,16 +2636,21 @@ def _fill_and_write_shard(
             dtype=np.float32,
         )
 
-        # Landmask
-        lm = _load_landmask_slice(
-            ov.landmask_path,
-            ov.t_row_start,
-            ov.t_row_end,
-            ov.t_col_start,
-            ov.t_col_end,
-            storage_options=source_options,
-        )
-        s[lm == 0] = np.float32("nan")
+        # Landmask. Skipped entirely when the store declares its tiles fully
+        # covered: the mask would be all ones, so reading it is a per-tile
+        # round trip that can only confirm what the tile's presence already
+        # says. The scale check below still runs — it rejects nodata written
+        # into the tile itself, which is a different thing from water.
+        if use_landmask:
+            lm = _load_landmask_slice(
+                ov.landmask_path,
+                ov.t_row_start,
+                ov.t_row_end,
+                ov.t_col_start,
+                ov.t_col_end,
+                storage_options=source_options,
+            )
+            s[lm == 0] = np.float32("nan")
         # Non-finite, non-positive and sentinel-huge scales are all nodata;
         # storing them as NaN keeps every reader's isfinite() test honest.
         s[~valid_scale_mask(s)] = np.float32("nan")
@@ -2556,6 +2692,7 @@ def _write_one_shard_worker(spec: ShardSpec) -> "bool | Dict[str, Any]":
         _worker_spill_dir,
         _worker_sample_cap,
         _worker_depths,
+        _worker_use_landmask,
     )
 
 
@@ -2949,6 +3086,14 @@ def scan_store(
     scan_years = [y for y in (years or all_years) if y in all_years]
 
     depths = store_depths(store)
+    # A store with no landmask has no "ocean" class: a shard either holds a
+    # tile or it does not, so coverage must come from the manifest.
+    if registry is None and not store_uses_landmask(store):
+        raise ValueError(
+            "This store declares no landmask, so coverage cannot be read from "
+            "the landmask registry. Re-run with a tile source, so that "
+            "coverage comes from the manifest instead."
+        )
 
     if console:
         console.print(f"Scanning [bold]{store}[/bold]")
@@ -3201,10 +3346,12 @@ def fill_store(
 
     fill_years = [year] if year is not None else all_years
 
-    # Nested depths are a property of the store, declared once at init, so a
-    # fill never chooses them — it writes whatever the root declares. Empty
-    # for every single-depth (v1/v1.1) store.
+    # Both are properties of the store, declared once at init, so a fill never
+    # chooses them — it follows whatever the root says. Depths are empty for
+    # every single-depth (v1/v1.1) store, and the landmask is on unless the
+    # root switched it off.
     depths = store_depths(store)
+    use_landmask = store_uses_landmask(store)
 
     _warn_worker_memory(workers, console, spilled=bool(spill_dir))
 
@@ -3215,8 +3362,14 @@ def fill_store(
             console.print(
                 f"  Nested depths: {', '.join(depth_array_name(d) for d in depths)}"
             )
+        if not use_landmask:
+            console.print(
+                "  [dim]No landmask: every pixel of a present tile is data[/dim]"
+            )
         if source is not None and source.is_remote:
-            console.print(f"  Streaming tiles from [bold]{source.embeddings_root}[/bold]")
+            console.print(
+                f"  Streaming tiles from [bold]{source.embeddings_root}[/bold]"
+            )
 
     total_shards_written = 0
     total_shards_failed = 0
@@ -3300,9 +3453,7 @@ def fill_store(
                     {(s.sr, s.sc) for s in shard_specs},
                     console=console,
                 )
-                shard_specs = [
-                    s for s in shard_specs if (s.sr, s.sc) not in present
-                ]
+                shard_specs = [s for s in shard_specs if (s.sr, s.sc) not in present]
 
             # Stretch statistics. The coverage mask says which store shards
             # are already folded into the sums; anything present but unseen
@@ -3356,6 +3507,7 @@ def fill_store(
                 stats_coords=catch_up,
                 time_index=time_index,
                 depths=depths,
+                use_landmask=use_landmask,
             )
 
             total_shards_written += written_count
@@ -3431,6 +3583,7 @@ def _write_shards(
     stats_coords: Optional[List[Tuple[int, int]]] = None,
     time_index: int = 0,
     depths: Sequence[int] = (),
+    use_landmask: bool = True,
 ) -> Tuple[int, set, List[Dict[str, Any]]]:
     """Run shard writes — and stats catch-up reads — through a process pool.
 
@@ -3458,6 +3611,7 @@ def _write_shards(
         sample_cap,
         time_index,
         tuple(depths),
+        use_landmask,
     )
 
     # "spawn", not the Linux default of "fork": a forked worker inherits the
@@ -3526,8 +3680,8 @@ def _write_shards(
                 console=console,
             ) as progress:
                 task = progress.add_task(
-                label, total=len(shard_specs) + len(stats_coords)
-            )
+                    label, total=len(shard_specs) + len(stats_coords)
+                )
                 _drain(pool, advance=lambda: progress.advance(task))
         else:
             _drain(pool)
@@ -4856,9 +5010,7 @@ def _init_reproj_worker(
     remote.reset_after_fork()
     remote.die_with_parent()
 
-    dest = StoreLocation(dest_url, dest_options).open_group(
-        mode="r+", zarr_format=3
-    )
+    dest = StoreLocation(dest_url, dest_options).open_group(mode="r+", zarr_format=3)
     _reproj_global_arr = dest["global_rgb/0/rgb"]
     zone = StoreLocation(source_url, source_options).open_group(
         mode="r", path=zone_group
