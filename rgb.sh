@@ -28,8 +28,10 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-YEAR="${1:-2024}"
+YEAR="${1:-2025}"
 VERSION="${VERSION:-v1}"                  # which published store to render
+SAFE_VERSION="${VERSION//\~/-}"           # local paths: the tilde in a v2 tag
+                                          # is legal but invites quoting bugs
 PROFILE="${PROFILE:-sc-writer}"           # AWS profile with write access
 VENV="${VENV:-$HOME/.venvs/geotessera}"
 
@@ -42,8 +44,8 @@ if [ "$VERSION" = "v1" ]; then
     STATE="${STATE:-$HOME/tessera-preview-$YEAR.state}"
     LOGDIR="${LOGDIR:-$HOME/tessera-preview-$YEAR.logs}"
 else
-    STATE="${STATE:-$HOME/tessera-preview-$VERSION-$YEAR.state}"
-    LOGDIR="${LOGDIR:-$HOME/tessera-preview-$VERSION-$YEAR.logs}"
+    STATE="${STATE:-$HOME/tessera-preview-$SAFE_VERSION-$YEAR.state}"
+    LOGDIR="${LOGDIR:-$HOME/tessera-preview-$SAFE_VERSION-$YEAR.logs}"
 fi
 
 # I/O bound on gateway round-trips, not CPU: workers sit ~99.8% idle pulling
@@ -55,9 +57,15 @@ ZONE_JOBS="${ZONE_JOBS:-30}"
 WORKERS="${WORKERS:-40}"
 COARSEN_WORKERS="${COARSEN_WORKERS:-32}"  # threads, I/O bound
 
-# Colour appearance. --mode pca decorrelates the embedding bands, which is
-# what stops the mosaic looking grey.
-STRETCH_MODE="${STRETCH_MODE:-pca}"
+# Colour appearance. For v1/v1.1 the 128 dimensions are unordered and highly
+# correlated, so --mode pca decorrelates them; without it the mosaic looks
+# grey. v2 is matryoshka-trained, so dimensions 0-2 already are the colour
+# channels: --mode bands reads them directly, and the preview then reads
+# embeddings_d4 rather than all 128 bands.
+case "$VERSION" in
+    v2*) STRETCH_MODE="${STRETCH_MODE:-bands}" ;;
+    *)   STRETCH_MODE="${STRETCH_MODE:-pca}" ;;
+esac
 GAMMA="${GAMMA:-0.7}"
 SATURATION="${SATURATION:-1.0}"
 

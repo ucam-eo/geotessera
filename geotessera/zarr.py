@@ -1269,6 +1269,31 @@ def depths_attr_value(depths: "Sequence[int]") -> List[Dict[str, Any]]:
 _LANDMASK_ATTR = "geoemb:landmask"
 
 
+def preview_source_array(
+    root: "StoreLocation | zarr.Group",
+    band_indices: Sequence[int] = (0, 1, 2),
+    mode: str = "bands",
+) -> str:
+    """Array a preview should read its colour bands from.
+
+    In ``bands`` mode the preview only ever touches the first few dimensions,
+    and a nested-depth array holds exactly those, byte-identical to the same
+    bands of ``embeddings``. Reading depth 4 instead of 128 fetches a
+    thirty-second of the data and a sixteenth of the sharding index, which is
+    what makes a preview over a matryoshka store cheap.
+
+    ``pca`` mode projects all ``N_BANDS`` dimensions, so it always reads the
+    full array.
+    """
+    if mode != "bands":
+        return "embeddings"
+    need = max(band_indices) + 1
+    for depth in store_depths(root):
+        if depth >= need:
+            return depth_array_name(depth)
+    return "embeddings"
+
+
 def store_uses_landmask(store: "StoreLocation | zarr.Group") -> bool:
     """Whether this store's tiles are masked against a landmask.
 
@@ -4542,7 +4567,7 @@ def compute_global_stretch(
         if zones is not None and zone_num not in zones:
             continue
         try:
-            emb_arr = root[name]["embeddings"]
+            emb_arr = root[name][preview_source_array(root, band_indices, mode)]
             _, _, H, W = emb_arr.shape
         except (KeyError, ValueError):
             continue
@@ -4991,6 +5016,7 @@ def _init_reproj_worker(
     zone_epsg: int,
     time_index: int,
     stretch: dict,
+    emb_array: str = "embeddings",
 ) -> None:
     """Process pool initializer: open stores and create transformer.
 
@@ -5015,7 +5041,7 @@ def _init_reproj_worker(
     zone = StoreLocation(source_url, source_options).open_group(
         mode="r", path=zone_group
     )
-    _reproj_emb_arr = zone["embeddings"]
+    _reproj_emb_arr = zone[emb_array]
     _reproj_scales_arr = zone["scales"]
     _reproj_to_utm = Transformer.from_crs(
         "EPSG:4326",
@@ -5248,6 +5274,7 @@ def _reproject_zone(
     present: set,
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
+    emb_array: str = "embeddings",
 ) -> Tuple[set, bool]:
     """Reproject one zone's embeddings into global level 0.
 
@@ -5331,6 +5358,7 @@ def _reproject_zone(
                 zone_epsg,
                 time_index,
                 stretch,
+                emb_array,
             ),
         ) as pool:
             futures = {pool.submit(_reproject_chunk_worker, it): it for it in items}
@@ -5675,6 +5703,21 @@ def build_global_preview(
             f"{year}` first for seamless colours.[/yellow]"
         )
 
+    # Which array the colour bands come from. Follows the stretch's own mode
+    # and band list, so the two can never disagree: a pca stretch projects all
+    # 128 dimensions and must read the full array, while a bands stretch only
+    # ever touches the first few and can read a nested-depth prefix instead.
+    emb_array = preview_source_array(
+        source.open_group(mode="r"),
+        (global_stretch or {}).get("bands", RGB_PREVIEW_BANDS),
+        (global_stretch or {}).get("mode", "bands"),
+    )
+    if console and emb_array != "embeddings":
+        console.print(
+            f"  Reading colour bands from [bold]{emb_array}[/bold] "
+            f"[dim](identical pixels, a fraction of the bytes)[/dim]"
+        )
+
     # Reproject each zone and build pyramid
     for zone_num, info in sorted(zone_infos.items()):
         if console:
@@ -5731,6 +5774,7 @@ def build_global_preview(
             present=present,
             console=console,
             force=force,
+            emb_array=emb_array,
         )
 
         if did_work:

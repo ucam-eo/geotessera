@@ -1,9 +1,11 @@
 # Nested embedding depths (matryoshka prefixes) in the Zarr store
 
-**Status:** Storage layer implemented (`zarr-init`, `zarr-fill`, `zarr-extend`,
-`zarr-scan`). The preview-pipeline simplification in "Consequences for the RGB
-preview" is **proposed** — it is specified here but not built, because no v2
-data exists yet to validate it against.
+**Status:** Implemented. The storage layer covers `zarr-init`, `zarr-fill`,
+`zarr-extend` and `zarr-scan`; `zarr-global-preview` reads its colour bands
+from the shallowest adequate depth array. The stretch-machinery retirement
+described under "Consequences for the RGB preview" is **partly done** —
+step 2 (percentiles from a coarse pyramid level) is not built, because the
+existing fill-time statistics already answer it without reading embeddings.
 **Scope:** `geotessera-registry` subcommands `zarr-init`, `zarr-fill`, `zarr-extend`
 **Store convention:** additions to the per-zone group layout and to the root `geoemb:` attributes
 **Applies to:** v2 embeddings and later. Refused for v1/v1.1.
@@ -169,7 +171,7 @@ implied, not listed).
 
 ## Consequences for the RGB preview
 
-**Proposed; not implemented.**
+**Implemented, except where noted.**
 
 `zarr-stretch` currently derives the preview colouring by reducing 128 bands to
 3 via PCA, which is why the store carries `stretch_stats_count`,
@@ -178,13 +180,20 @@ implied, not listed).
 `stretch_stats_shards`, and why fills carry a reservoir sampler.
 
 With ordered dimensions, bands 0–2 *are* the colour channels and the reduction
-disappears. The preview becomes:
+disappears. `zarr-stretch --mode bands` computes per-channel percentiles from
+the fill-time statistics without reading a single embedding, and
+`zarr-global-preview` then reprojects from `embeddings_d4` instead of
+`embeddings` — a thirty-second of the bytes and a sixteenth of the sharding
+index for byte-identical pixels.
 
-1. coarsen `embeddings_d4` in the native zone CRS — pure spatial reduction,
-   no statistics;
-2. take per-channel stretch percentiles from a **coarse pyramid level**, which
-   is megabytes, rather than from a sampling pass over the full store;
-3. reproject into `global_rgb` as now.
+The array is chosen from the stretch's own `mode` and `bands`, so the two
+cannot disagree: a `pca` stretch projects all 128 dimensions and always reads
+the full array, while a `bands` stretch reads the shallowest depth that still
+holds the bands it names.
+
+Step 2 of the original sketch — percentiles from a coarse pyramid level — was
+not needed. The fill-time statistics already cover it at lower cost, since
+they are collected while every pixel is resident rather than read back.
 
 That removes the sampling apparatus and with it a whole bug class: there is no
 covariance to poison, so a bad dequantisation scale can no longer contaminate a

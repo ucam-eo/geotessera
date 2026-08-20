@@ -1346,6 +1346,63 @@ try:
 finally:
     remote.read_npy_window = _real_npy
 
+# ---------------------------------------------------------------------------
+# Preview source selection
+# ---------------------------------------------------------------------------
+# A bands-mode preview only touches the first few dimensions, so it can read a
+# nested-depth prefix instead of all 128. A pca preview projects every
+# dimension and must not.
+
+from geotessera.zarr import RGB_PREVIEW_BANDS, preview_source_array  # noqa: E402
+
+_dr = depth_root.open_group(mode="r", zarr_format=3)
+check(
+    "bands mode reads the shallowest adequate depth",
+    preview_source_array(_dr, RGB_PREVIEW_BANDS, "bands") == "embeddings_d4",
+)
+check(
+    "pca mode always reads the full array",
+    preview_source_array(_dr, RGB_PREVIEW_BANDS, "pca") == "embeddings",
+)
+check(
+    "a depth too shallow for the bands is skipped",
+    preview_source_array(_dr, (0, 1, 2, 3, 4, 5), "bands") == "embeddings_d16",
+)
+check(
+    "a single-depth store falls back to embeddings",
+    preview_source_array(
+        StoreLocation.resolve(url(TMP / "pyr_url.zarr")).open_group(mode="r"),
+        RGB_PREVIEW_BANDS,
+        "bands",
+    )
+    == "embeddings",
+)
+
+# The whole point: the bands a preview reads must be identical either way.
+_zrw = depth_root.open_group(mode="r+", path="utm31", zarr_format=3)
+check(
+    "d4 colour bands are byte-identical to the full array's",
+    np.array_equal(
+        np.asarray(_zrw["embeddings_d4"][0, 0:3, :256, :256]),
+        np.asarray(_zrw["embeddings"][0, 0:3, :256, :256]),
+    ),
+)
+check(
+    "and the RGB chunk built from each is the same",
+    np.array_equal(
+        _z._compute_rgb_chunk(
+            np.asarray(_zrw["embeddings_d4"][0, 0:3, :64, :64]),
+            np.asarray(_zrw["scales"][0, :64, :64]),
+            RGB_PREVIEW_BANDS, [-1.0] * 3, [1.0] * 3,
+        ),
+        _z._compute_rgb_chunk(
+            np.asarray(_zrw["embeddings"][0, 0:3, :64, :64]),
+            np.asarray(_zrw["scales"][0, :64, :64]),
+            RGB_PREVIEW_BANDS, [-1.0] * 3, [1.0] * 3,
+        ),
+    ),
+)
+
 import shutil  # noqa: E402
 
 shutil.rmtree(TMP, ignore_errors=True)
