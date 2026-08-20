@@ -78,6 +78,18 @@ WORKERS="${WORKERS:-4}"                   # shard workers per zone
 
 RETRIES="${RETRIES:-3}"                   # whole-zone retries
 
+# Fill-time stretch statistics. Worth collecting for a store whose preview
+# needs a PCA over all 128 dimensions; v2's preview reads bands 0-2 of
+# embeddings_d4 directly, so they earn much less here.
+#
+# Turning them off also avoids a deadlock on resume. With statistics on, a
+# zone that already has shards in the store submits catch-up *reads* into the
+# same pool as the shard *writes*, and that mixed workload hangs: three zones
+# sat in futex_do_wait with zero CPU for hours, at exactly the point the log
+# reports "N stats catch-up read(s)". A first-pass zone has nothing to catch
+# up and never hits it, which is why it only appears on a retry.
+STRETCH_STATS="${STRETCH_STATS:-1}"
+
 # The gateway returns 429/525 under load; adaptive mode adds client-side rate
 # limiting that backs off when throttled.
 export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
@@ -186,6 +198,7 @@ echo "    source $SRC (npy/$DATASET_DIR)"
 echo "    dest   $DST"
 echo "    depths ${MATRYOSHKA_DEPTHS:-none (full 128 only)}"
 echo "    mask   none (grid sized from the embeddings)"
+echo "    stats  $([ "$STRETCH_STATS" = "1" ] && echo "collected at fill time" || echo "off (--no-stretch-stats)")"
 echo "    fill   $ZONE_JOBS zones x $WORKERS workers, spilling to $SPILL"
 echo
 
@@ -234,11 +247,17 @@ fi
 # 2. Fill, one zone per process
 # ---------------------------------------------------------------------------
 
+FILL_FLAGS=()
+if [ "$STRETCH_STATS" != "1" ]; then
+    FILL_FLAGS+=(--no-stretch-stats)
+fi
+
 run_zone() {
     local z="$1" log="$LOGDIR/zone-z$1.log" attempt
     for attempt in $(seq 1 "$RETRIES"); do
         if "$GT" zarr-fill "$SRC" "$DST" --zones "$z" --workers "$WORKERS" \
                 --spill-dir "$SPILL/z$z" --no-consolidate \
+                ${FILL_FLAGS[@]+"${FILL_FLAGS[@]}"} \
                 "${DATASET[@]}" "${REG[@]}" "${SRC_FLAGS[@]}" "${STORE_FLAGS[@]}" \
                 >>"$log" 2>&1; then
             return 0

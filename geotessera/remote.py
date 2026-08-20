@@ -308,12 +308,37 @@ def _filesystem_cached(protocol: str, options_key: str):
         # pass. Callers can still override via storage options.
         config_kwargs = options.setdefault("config_kwargs", {})
         config_kwargs.setdefault("retries", {"max_attempts": 8, "mode": "adaptive"})
+        # Bound every request. Without a timeout a worker can block in
+        # fsspec.asyn.sync forever — captured with py-spy on three v2 fills
+        # that had sat in futex_do_wait for hours, each stopped at
+        # read_npy_window -> sync after doing real work. The parent then waits
+        # in as_completed and the zone stalls, which whole-zone retries cannot
+        # recover from because nothing ever fails. Retries above only help
+        # once a request *returns*.
+        config_kwargs.setdefault(
+            "connect_timeout", int(os.environ.get("GEOTESSERA_CONNECT_TIMEOUT", 20))
+        )
+        config_kwargs.setdefault(
+            "read_timeout", int(os.environ.get("GEOTESSERA_READ_TIMEOUT", 120))
+        )
     if protocol in ("http", "https"):
         # The Source Cooperative CDN rejects some default user agents.
         from . import __version__
 
         options.setdefault(
             "client_kwargs", {"headers": {"User-Agent": f"geotessera/{__version__}"}}
+        )
+        # aiohttp defaults to no total timeout, so the same indefinite hang is
+        # possible here; sock_read bounds the gap between bytes rather than
+        # the whole transfer, so a large slow tile is not cut off.
+        import aiohttp
+
+        options.setdefault(
+            "timeout",
+            aiohttp.ClientTimeout(
+                connect=int(os.environ.get("GEOTESSERA_CONNECT_TIMEOUT", 20)),
+                sock_read=int(os.environ.get("GEOTESSERA_READ_TIMEOUT", 120)),
+            ),
         )
     try:
         return fsspec.filesystem(protocol, **options)

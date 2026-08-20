@@ -1,6 +1,10 @@
 ## Unreleased
 
 ### Breaking Changes
+- **`convertv2.sh STRETCH_STATS=0`**: skip fill-time stretch statistics. v2's
+  preview reads bands 0-2 of `embeddings_d4` directly, so the statistics that
+  exist to support a 128-band PCA earn much less there. (@avsm)
+
 - **`zarr-init --no-landmask`**: for datasets whose inference covers every
   pixel of a tile it emits, so a present tile is data all the way to its
   edges. No landmask registry is fetched and no landmask GeoTIFF is read
