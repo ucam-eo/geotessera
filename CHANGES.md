@@ -5,27 +5,17 @@
   preview reads bands 0-2 of `embeddings_d4` directly, so the statistics that
   exist to support a 128-band PCA earn much less there. (@avsm)
 
-- **`zarr-init --no-landmask`**: for datasets whose inference covers every
-  pixel of a tile it emits, so a present tile is data all the way to its
-  edges. No landmask registry is fetched and no landmask GeoTIFF is read
-  during a fill; the mask would be all ones, so consulting it is a per-tile
-  round trip that can only confirm what the tile's presence already says. The
-  flag is recorded on the root as `geoemb:landmask: false` and `zarr-fill`
-  follows the store, so the two can never disagree. Absent means masked, which
-  is every store predating the flag.
+### Breaking Changes
 
-  The zone grid is then sized from the embeddings rather than the landmask.
-  That is required, not an optimisation: the published `landmasks/v2` is a
-  copy of v1.1's and stops at lat -59.55 while v2 reaches -89.95, so sizing
-  from it put 880 Antarctic tiles outside the grid — 49 of 60 zones failed
-  with `IndexError: index 376 is out of bounds for axis 0 with size 315` from
-  the stretch bookkeeping, after the shard writes had already run. Measured
-  over six v2 zones: 83 tiles outside the landmask-derived grid, 0 outside the
-  embedding-derived one.
+- `s3://` locations need the new optional `s3` extra
+  (`pip install 'geotessera[s3]'`), which pulls in `s3fs` and `botocore`. The
+  core install stays free of both, and `https://` sources work without it.
+  (@avsm)
 
-  The scale sanity check still runs. Rejecting out-of-range scales written
-  into a tile is a different thing from masking water, and only the latter is
-  the landmask's job. (@avsm)
+- Stretch statistics collected before this release must be rebuilt with
+  `zarr-fill --backfill-stretch-stats`, because `MAX_VALID_SCALE` has changed
+  (see Bug Fixes). Shards themselves are unaffected. `zarr-stretch` refuses
+  poisoned statistics outright and names the zones to rebuild. (@avsm)
 
 - **Convention metadata now comes from `zarr-cm`**, replacing
   `geozarr-toolkit`. Stores stamp `spatial:` and `proj:` at revision **r3**
@@ -141,14 +131,6 @@
   (`--force-lock` to take over a dead run's), and root-metadata
   consolidation is skipped by default for a zone-restricted fill. See
   the architecture guide for the sweep recipe. (@avsm)
-- **The store now contains only Zarr**: build bookkeeping — the ingestion
-  registry, fill locks and global-preview resume markers — moved out of the
-  store into a sibling location, `<store>.build` by default and relocatable
-  with `--state-url`. Previously these sat at the store root, where every
-  hierarchy listing and `consolidate_metadata` call warned about
-  unrecognised objects and readers saw non-Zarr entries. A `_registry.parquet`
-  left inside an older store is still read, so existing stores resume
-  correctly; nothing is written back into them. (@avsm)
 - **`geotessera-registry zarr-scan`**: New subcommand that inventories a
   store's shards without writing anything, classifying each as `written`,
   `missing`, or `empty` (no land falls in it, so it is ocean or outside
@@ -159,18 +141,6 @@
   landmask registry (~19 MB, cached), so no tile mirror or manifest is
   needed. An optional tile mirror switches the denominator to each year's
   actual embedding coverage from the manifest. (@avsm)
-- **`zarr-fill` scans before writing and uploads only what is missing.**
-  The ingestion registry is written only when a (zone, year) finishes, so a
-  run killed partway loses that year's bookkeeping and would re-upload
-  everything — for a zone that is 97% done, rebuilding 1,398 shards to add
-  48. The shard objects survive anything and a shard is always written from
-  every tile covering it, so their presence is proof of completeness. Fills
-  now scan for them by default and skip what is there; falls back to
-  probing just the shards in hand where the credentials cannot list the
-  store. `--rewrite-existing-shards` forces a rebuild, needed only when the
-  tile inventory has grown, since a newly-added tile falls inside an
-  existing shard. `--skip-existing-shards` is still accepted as a no-op.
-  (@avsm)
 - **Sentinel scales no longer count as data.** Some published v1 scales
   files carry a huge-finite nodata sentinel (~FLT_MAX) that passes
   `isfinite()`: those pixels inflated valid-pixel counts up to 100x,
@@ -184,21 +154,6 @@
   that rebuild (shards themselves are unaffected). The aiohttp
   "Unclosed client session" destructor noise that flooded preview output
   is also silenced. (@avsm)
-- **`zarr-global-preview` streams from remote stores.** The pyramid source
-  and destination are now separate: `--output <local-store>` builds the
-  EPSG:4326 RGB pyramid locally while reading zone embeddings straight from
-  a remote store (anonymously or with credentials) as sub-shard byte
-  ranges — no copy of the source is made. If the store has no persisted
-  `geoemb:stretch` for the year, one is derived on the fly from the
-  per-zone stretch statistics (a few MiB of reads, not persisted), so a
-  read-only consumer can preview a store it cannot write to without any
-  prior `zarr-stretch` step. Reprojection workers now spawn rather than
-  fork, for the same fsspec event-loop reason as the fill workers. The
-  work list is now derived from the footprints of the shards that exist,
-  not the zone's bounding rectangle — at high latitude a zone's rectangle
-  back-projects across most longitudes, and utm02 enqueued ~5.6 million
-  candidate chunks (22 GiB of queued futures) to render 28 shards of
-  actual data. (@avsm)
 - **Fills are stateless and stretch statistics collect themselves.** The
   ingestion registry and advisory locks are gone from `zarr-fill`: the
   store's shard objects are the only record of progress, so a preemptible
@@ -271,8 +226,6 @@
   Years may only be appended (inserting an earlier one would renumber every
   chunk, so it is refused), and it will not run while a fill lock is held.
   (@avsm)
-### Bug Fixes
-
 - **Incremental fills no longer erase neighbouring tiles**: a shard write
   replaces the whole shard, so a fill that touched a shard already holding
   data would zero out the tiles it did not re-read. Touched shards are now
@@ -283,6 +236,161 @@
   failed shard now reports an error. (@avsm)
 - **`geotessera-registry` propagates exit status**: command return codes
   were discarded, so failures reported success to the shell. (@avsm)
+- Build bookkeeping no longer lives inside the store, which now contains only
+  Zarr. Anything an older build left at the store root is still read so
+  existing stores resume correctly, but nothing is written back into them.
+  (@avsm)
+
+### New Features
+
+- `zarr-init` and `zarr-fill` take locations rather than paths, so a store on
+  one S3 node can be filled from tiles on another with no local mirror.
+  Remote tiles are read with byte-range GETs sized to the rows each shard
+  needs, so no scratch disk is involved. `--source-*` and `--store-*` flags
+  configure the two endpoints independently; credentials come from the
+  environment, a named profile (`--store-profile`), or an instance role rather
+  than argv, and `--store-acl` stamps a canned ACL such as
+  `bucket-owner-full-control` on every object written. (@avsm)
+
+- `zarr-fill --zones N` is safe to run as one process per UTM zone against a
+  shared store, and fills are stateless: the shard objects are the only record
+  of progress, so a run killed outright leaves nothing to clean up and
+  relaunching the same command scans and continues. Fills skip shards already
+  in the store by default, falling back to probing just the shards in hand
+  where the credentials cannot list. `--rewrite-existing-shards` forces a
+  rebuild, needed only when the tile inventory has grown. `--state-url`,
+  `--force-lock` and `--skip-existing-shards` are accepted as no-ops for
+  existing scripts. Root-metadata consolidation is skipped for a
+  zone-restricted fill; run `zarr-consolidate` once after the sweep. (@avsm)
+
+- Each zone group carries stretch statistics collected during the fill, at no
+  extra I/O: exact mean and covariance sufficient statistics per (zone, year),
+  additive across zones, plus a weighted 20,000-pixel sample for quantiles.
+  `zarr-stretch` aggregates these by default — a few MiB of reads and an exact
+  global PCA, instead of terabytes of shard re-reads — and works against
+  remote stores. A coverage mask records which shards have been folded in, so
+  interrupted runs converge automatically on the next fill. `--from-shards`
+  keeps the legacy sampling path, `--from-sample` derives the covariance from
+  the stored sample when the sums are known to be damaged, and
+  `zarr-init --stretch-sample-size` tunes the sample. See
+  `docs/specs/zarr-stretch-stats.md`. (@avsm)
+
+- `zarr-global-preview` builds the EPSG:4326 RGB pyramid from a remote store.
+  Source and destination are independent: `--output` takes a path or a URL
+  with its own `--output-endpoint-url`/`--output-profile`/`--output-region`/
+  `--output-anon`/`--output-acl` credentials, so embeddings can stream
+  anonymously from a read-only mirror while the pyramid lands in a
+  credentialed bucket. If the store has no persisted stretch for the year, one
+  is derived on the fly from the per-zone statistics, so a read-only consumer
+  can preview a store it cannot write to. `--state-url` relocates the per-zone
+  resume markers off the store. `--reproject-only` and `--coarsen-only` split
+  the build so zones can render in parallel: reprojection stops at the level
+  where zones stay disjoint, then a single-writer pass builds the shared upper
+  levels. Separate `--zones N` invocations against one destination are safe
+  sequentially but must not run concurrently. (@avsm)
+
+- `zarr-init --matryoshka-depths 4,16` stores the first N dimensions of every
+  embedding as their own arrays, so a client can read a 4- or 16-dimensional
+  prefix without decoding all 128 bands. Depth arrays share the shard grid
+  with `embeddings` and are dequantised by the same `scales`, so a shard
+  coordinate means the same thing in each; storage overhead is about 16%.
+  Requires matryoshka-ordered dimensions and is refused below v2, where a
+  prefix would be an arbitrary slice. `zarr-fill`, `zarr-extend` and
+  `zarr-scan` all follow the store's declaration, and `zarr-global-preview`
+  reads its colour bands from the shallowest array that holds them. See
+  `docs/specs/zarr-matryoshka-depths.md`. (@avsm)
+
+- `zarr-init --no-landmask` is for datasets whose inference covers every pixel
+  of a tile it emits, so a present tile is data all the way to its edges. No
+  landmask is fetched or read, and the zone grid is sized from the embeddings
+  instead — which is required rather than an optimisation, since a landmask
+  that stops short of the embeddings would place tiles outside the grid. The
+  choice is recorded in the store and fills follow it. (@avsm)
+
+- `geotessera-registry zarr-scan` inventories a store's shards without writing
+  anything, classifying each as `written`, `missing`, or `empty` (no land
+  falls in it, so it will never be filled). It prints per-zone/year and
+  per-year summaries of how much is left to fill, as percentages over land
+  rather than over each zone's bounding box, and optionally writes the
+  per-shard index as parquet. It needs only the store: the land denominator
+  comes from the cached landmask registry, and an optional tile mirror
+  switches it to each year's actual embedding coverage. (@avsm)
+
+- `geotessera-registry zarr-extend` appends years to an existing store's time
+  axis, so a new year can be added without rebuilding. Time is chunked one
+  year per chunk, making this a metadata-only edit. Years may only be
+  appended; inserting an earlier one would renumber every chunk and is
+  refused. (@avsm)
+
+- `convert.sh`, `convertv2.sh` and `rgb.sh` in the repository root are
+  standalone pipeline scripts for a deployment host, needing only `uv`, `curl`
+  and credentials. They install a pinned revision, verify it carries the fixes
+  they depend on, and drive a whole conversion or preview build with per-zone
+  parallelism and retries. (@avsm)
+
+- `zarr-fill` reports the shard arithmetic it is about to perform, warns when
+  the worker count will not fit in available memory (an OOM kill leaves no
+  traceback, so the warning is the only diagnosis), and exits cleanly with
+  status 130 on Ctrl-C rather than blocking until every in-flight shard
+  finishes. (@avsm)
+
+- Out-of-range scales no longer poison the stretch statistics. Some published
+  scales files carry a huge-but-finite nodata sentinel that passes
+  `isfinite()`; those pixels inflated valid-pixel counts, drove the sums to
+  1e37 and overflowed the product matrices, which surfaced as a NaN drift
+  check and a garbage PCA — 47 of 60 zones in the published v1 store, and so
+  every colour derived from them. Real scales run median 0.064 and p99.99
+  0.137, so the limit is now 1.0, and the stored sample is re-filtered on read
+  since a reservoir written under the old limit can still hold a few. (@avsm)
+
+- Fills no longer deadlock against an object store. `s3fs` runs its client on
+  a background event-loop thread and `fsspec` caches both the loop and its
+  filesystem instances globally, so a forked worker inherited those objects
+  but not the thread running the loop and waited forever on its first call.
+  Workers now start with "spawn" and reset any inherited fsspec state. (@avsm)
+
+- Workers die with their parent. A fill killed outright left its workers
+  running, each holding gigabytes and accumulating across runs. (@avsm)
+
+- `zarr-global-preview` no longer races itself creating the pyramid. Zarr's
+  create is check-then-write, so a parallel zone sweep had several callers
+  pass the existence check before any wrote and the losers died. Every
+  creation step is now idempotent. (@avsm)
+
+- Zones at the antimeridian no longer enqueue the whole globe. A shard
+  straddling 180 degrees samples corners near both -180 and +180, and the
+  naive span of those claimed every chunk column at that latitude — utm60
+  enqueued 1.4M level-0 chunks from 360 shards, most of it reprojecting to
+  nothing. The wrap is now detected and split into two column ranges, while a
+  polar shard that genuinely spans most longitudes keeps the full range. The
+  coarsening pass splits the same way. Every other zone is bit-identical.
+  (@avsm)
+
+- The reprojection work list comes from the footprints of the shards that
+  exist rather than the zone's bounding rectangle. At high latitude a zone's
+  rectangle back-projects across most longitudes, so utm02 enqueued 5.6M
+  candidate chunks to render 28 shards of actual data. (@avsm)
+
+- Pyramid levels keep their per-level geometry. `zarr-global-preview` computed
+  `spatial:shape` and `spatial:transform` for each multiscale level, but the
+  layout builder silently dropped both, so every level advertised only its
+  scale factor. (@avsm)
+
+- Incremental fills no longer erase neighbouring tiles. A shard write replaces
+  the whole shard, so a fill touching a shard that already held data would
+  zero out the tiles it did not re-read; touched shards are now rebuilt from
+  every tile overlapping them. (@avsm)
+
+- Failed shards are no longer recorded as written, so re-running a fill
+  retries exactly the unfinished work. A fill with any failed shard now
+  reports an error. (@avsm)
+
+- Object-store libraries no longer log over the progress bar. botocore, boto3,
+  aiobotocore, s3fs, urllib3 and aiohttp are capped at WARNING in both the
+  parent and the workers. (@avsm)
+
+- `geotessera-registry` propagates exit status. Command return codes were
+  discarded, so failures reported success to the shell. (@avsm)
 
 - **`zarr-consolidate` merges registries and works remotely**: the
   subcommand (introduced in 0.10.0) now also merges the per-zone ingestion
