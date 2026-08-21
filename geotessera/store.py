@@ -1,10 +1,22 @@
 """
 GeoTesseraZarr — read embeddings from a Tessera zarr store.
 
-Provides ``GeoTesseraZarr`` for store-level access (zone routing, point
-sampling, region reading) and a ``tessera`` xarray accessor for per-zone
-operations.  All spatial indexing uses xarray coordinate-based selection
-(``sel(method='nearest')``), with no manual affine math.
+The store is UTM-native: embeddings live under one ``utm{NN}`` group per UTM
+zone, on the grid they were produced on.  Nothing here reprojects pixels, and
+the two layers each speak one coordinate system:
+
+``GeoTesseraZarr``
+    Takes **longitude and latitude**, routes each query to the ``utm{NN}``
+    group that holds it, and hands back that zone's native UTM pixels.  This
+    is the layer to use unless you already know your zone.
+
+``.tessera`` accessor
+    Takes **eastings and northings in that zone's own CRS**.  Once a zone is
+    open there is nothing left to route, so no projection happens at all.
+
+Coordinates crossing between the two are projected — one cheap point
+transform — but the embeddings themselves are always returned on their
+native grid, never resampled.
 
 Usage::
 
@@ -12,17 +24,21 @@ Usage::
 
     gt = GeoTesseraZarr()  # default public store
     X = gt.sample_points([(-2.97, 53.44), (-2.96, 53.43)], year=2025)
-    mosaic, transform, crs = gt.read_region(bbox, year=2025)
+    mosaic, transform, crs = gt.read_region(bbox, year=2025)  # bbox in lon/lat
 
-    # Direct zone access
+    # Direct zone access, in that zone's UTM
     ds = gt.open_zone(lon=-2.97)
-    emb = ds.tessera.sample_at(-2.97, 53.44, year=2025)
+    emb = ds.tessera.sample_at(500_000.0, 5_921_000.0, year=2025)
+
+Working from another CRS?  Project your points to lon/lat once, up front,
+rather than per call.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from functools import lru_cache
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -59,28 +75,28 @@ def enable_http_logging(level: int = logging.DEBUG) -> None:
     log.setLevel(level)
 
 
+@lru_cache(maxsize=None)
+def _transformer(src_crs: str, dst_crs: str) -> Transformer:
+    """A pyproj transformer for this CRS pair, built once and reused.
+
+    Building one costs milliseconds — enough that constructing a fresh
+    transformer per point made ``sample_points`` spend most of its time in
+    PROJ setup rather than reading data.  Transformers are not thread-safe,
+    so a threaded caller needs its own.
+    """
+    return Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+
+
+def _project(x: float, y: float, src_crs: str, dst_crs: str):
+    """Project ``(x, y)`` between two CRS, a no-op when they match."""
+    if src_crs == dst_crs:
+        return x, y
+    return _transformer(src_crs, dst_crs).transform(x, y)
+
+
 def _zone_for_lon(lon: float) -> int:
     """UTM zone number (1-60) for a WGS84 longitude."""
     return max(1, min(60, int(math.floor((lon + 180) / 6)) + 1))
-
-
-def _zone_for_point(x: float, y: float, crs: str = "EPSG:4326") -> int:
-    """Determine UTM zone for a point in any CRS.
-
-    For UTM EPSG codes (326xx/327xx), extracts the zone directly.
-    Otherwise projects to WGS84 and computes from longitude.
-    """
-    from pyproj import CRS as ProjCRS
-
-    if crs != "EPSG:4326":
-        proj_crs = ProjCRS.from_user_input(crs)
-        utm_zone = proj_crs.utm_zone
-        if utm_zone is not None:
-            return int(utm_zone[:-1])
-        lon, _ = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(x, y)
-    else:
-        lon = x
-    return _zone_for_lon(lon)
 
 
 # Tiles are 0.1 degrees and UTM zones 6 degrees, so round coordinates land on
@@ -99,6 +115,41 @@ SEAM_SEARCH_PX = 1  # nearest-valid-pixel radius
 SEAM_DEGREES = 0.1
 
 VALID, WATER, NODATA, OUTSIDE = "valid", "water", "nodata", "outside"
+
+
+def _sample_each(sample_at, coords, progress: bool) -> np.ndarray:
+    """Apply a per-point ``sample_at(x, y)`` across *coords*, giving ``(N, B)``."""
+    it = coords
+    if progress:
+        it = track(coords, description="Sampling points...", transient=True)
+    return np.array([sample_at(x, y) for x, y in it])
+
+
+def _resolve_zone(
+    zone: Optional[int],
+    lon: Optional[float],
+    bbox: Optional[Tuple[float, float, float, float]],
+) -> int:
+    """UTM zone from exactly one of ``zone``, ``lon`` or ``bbox``.
+
+    Accepts a plain ``int`` longitude as readily as a ``float``; the old
+    structural match rejected ``lon=-3`` as if no argument had been given.
+    """
+    given = [
+        name
+        for name, value in (("zone", zone), ("lon", lon), ("bbox", bbox))
+        if value is not None
+    ]
+    if len(given) != 1:
+        raise TypeError(
+            "Provide exactly one of zone=, lon=, or bbox="
+            + (f" (got {', '.join(given)})" if given else "")
+        )
+    if zone is not None:
+        return int(zone)
+    if lon is not None:
+        return _zone_for_lon(float(lon))
+    return _zone_for_lon((bbox[0] + bbox[2]) / 2)
 
 
 def _seam_neighbours(lon: float) -> List[int]:
@@ -139,15 +190,7 @@ def open_zone(
         ds = open_zone(bbox=(-3.0, 53.4, -2.9, 53.5))
         ds = open_zone(zone=30)
     """
-    match (zone, lon, bbox):
-        case (int(), None, None):
-            z = zone
-        case (None, float(), None):
-            z = _zone_for_lon(lon)
-        case (None, None, tuple()):
-            z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
-        case _:
-            raise TypeError("Provide exactly one of zone=, lon=, or bbox=")
+    z = _resolve_zone(zone, lon, bbox)
 
     log.debug("open_zone: utm%02d from %s", z, store_url)
     ds = xr.open_zarr(
@@ -180,11 +223,6 @@ class TesseraAccessor:
         self._ds = ds
         attrs = ds.attrs
         self._epsg: int = int(attrs["proj:code"].split(":")[1])
-        self._to_utm = Transformer.from_crs(
-            "EPSG:4326",
-            f"EPSG:{self._epsg}",
-            always_xy=True,
-        )
         # Derive years from the time coordinate
         if "time" in ds.coords:
             self._years: list[int] = [int(v) for v in ds.coords["time"].values]
@@ -238,34 +276,25 @@ class TesseraAccessor:
 
     def sample_at(
         self,
-        x: float,
-        y: float,
+        e: float,
+        n: float,
         year: int,
         *,
-        crs: str = "EPSG:4326",
         search_px: int = SEAM_SEARCH_PX,
     ) -> np.ndarray:
         """Sample a single dequantised embedding.  Returns ``(B,)`` float32.
 
         Args:
-            x: Easting or longitude.
-            y: Northing or latitude.
+            e: Easting in this zone's CRS.
+            n: Northing in this zone's CRS.
             year: Year to sample.
-            crs: Input coordinate CRS (default WGS84).  Accepts any
-                pyproj-compatible CRS string.
             search_px: Nearest-valid-pixel radius for unwritten pixels;
                 0 disables.  See :meth:`probe`.
+
+        Coordinates are this zone's own UTM, matching the grid the data is
+        stored on.  For longitude and latitude use
+        :meth:`GeoTesseraZarr.sample_at`, which routes a point to its zone.
         """
-        if crs == f"EPSG:{self._epsg}":
-            e, n = x, y
-        elif crs == "EPSG:4326":
-            e, n = self._to_utm.transform(x, y)
-        else:
-            proj = Transformer.from_crs(crs, f"EPSG:{self._epsg}", always_xy=True)
-            e, n = proj.transform(x, y)
-
-        log.debug("sample_at(%.6f, %.6f, crs=%s) → UTM(%.1f, %.1f)", x, y, crs, e, n)
-
         vec, _status = self.probe(e, n, year, search_px=search_px)
         return vec if vec is not None else np.full(self.n_bands, np.nan, np.float32)
 
@@ -324,19 +353,14 @@ class TesseraAccessor:
         coords: List[Tuple[float, float]],
         year: int,
         *,
-        crs: str = "EPSG:4326",
         progress: bool = True,
     ) -> np.ndarray:
         """Sample embeddings at points.  Returns ``(N, B)`` float32.
 
         Args:
-            coords: List of (x, y) tuples in the given CRS.
-            crs: Input coordinate CRS (default WGS84).
+            coords: List of ``(easting, northing)`` in this zone's CRS.
         """
-        it = coords
-        if progress:
-            it = track(coords, description="Sampling points...", transient=True)
-        return np.array([self.sample_at(x, y, year, crs=crs) for x, y in it])
+        return _sample_each(lambda e, n: self.sample_at(e, n, year), coords, progress)
 
     # -- Region reading -----------------------------------------------------
 
@@ -345,31 +369,19 @@ class TesseraAccessor:
         bbox: Tuple[float, float, float, float],
         year: int,
         *,
-        crs: str = "EPSG:4326",
         progress: bool = False,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine]:
         """Read and dequantise a bbox region.
 
         Args:
-            bbox: (x_min, y_min, x_max, y_max) in the given CRS.
-            crs: Input bbox CRS (default WGS84).
+            bbox: ``(e_min, n_min, e_max, n_max)`` in this zone's CRS.
 
         Returns ``(mosaic, transform)`` where mosaic is ``(H, W, B)``
-        float32 and transform is a rasterio Affine for the window.
+        float32 and transform is a rasterio Affine for the window.  Both are
+        in this zone's UTM — nothing is resampled on the way out.
         """
-        zone_crs = f"EPSG:{self._epsg}"
-        if crs == zone_crs:
-            e_nw, n_nw = bbox[0], bbox[3]
-            e_se, n_se = bbox[2], bbox[1]
-        elif crs == "EPSG:4326":
-            e_nw, n_nw = self._to_utm.transform(bbox[0], bbox[3])
-            e_se, n_se = self._to_utm.transform(bbox[2], bbox[1])
-        else:
-            proj = Transformer.from_crs(crs, zone_crs, always_xy=True)
-            e_nw, n_nw = proj.transform(bbox[0], bbox[3])
-            e_se, n_se = proj.transform(bbox[2], bbox[1])
-        e_min, e_max = min(e_nw, e_se), max(e_nw, e_se)
-        n_min, n_max = min(n_nw, n_se), max(n_nw, n_se)
+        e_min, e_max = min(bbox[0], bbox[2]), max(bbox[0], bbox[2])
+        n_min, n_max = min(bbox[1], bbox[3]), max(bbox[1], bbox[3])
 
         # y is descending (north→south), so slice is (n_max, n_min)
         sub = self._ds.sel(time=year, x=slice(e_min, e_max), y=slice(n_max, n_min))
@@ -475,16 +487,7 @@ class GeoTesseraZarr:
         Provide exactly one of ``zone``, ``lon``, or ``bbox``.
         Datasets are cached for the lifetime of this instance.
         """
-        match (zone, lon, bbox):
-            case (int(), None, None):
-                z = zone
-            case (None, float(), None):
-                z = _zone_for_lon(lon)
-            case (None, None, tuple()):
-                z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
-            case _:
-                raise TypeError("Provide exactly one of zone=, lon=, or bbox=")
-
+        z = _resolve_zone(zone, lon, bbox)
         if z not in self._cache:
             ds = open_zone(self.url, zone=z)
             self._cache[z] = ds
@@ -494,20 +497,18 @@ class GeoTesseraZarr:
 
     def sample_at(
         self,
-        x: float,
-        y: float,
+        lon: float,
+        lat: float,
         year: int,
         *,
-        crs: str = "EPSG:4326",
         cross_zone: bool = True,
         search_px: int = SEAM_SEARCH_PX,
     ) -> np.ndarray:
-        """Sample a single embedding, routing to the correct zone.
+        """Sample a single embedding, routing the point to its UTM zone.
 
         Args:
-            x: Easting or longitude.
-            y: Northing or latitude.
-            crs: Input CRS (default WGS84).
+            lon: Longitude (WGS84).
+            lat: Latitude (WGS84).
             cross_zone: Also try the neighbouring zone near a seam.  A tile
                 belongs to the zone holding its centre, so a point on a seam
                 is often covered by the zone next door.
@@ -517,17 +518,16 @@ class GeoTesseraZarr:
         locations outside coverage.  Use :meth:`probe` to tell those apart.
         """
         vec, _status = self.probe(
-            x, y, year, crs=crs, cross_zone=cross_zone, search_px=search_px
+            lon, lat, year, cross_zone=cross_zone, search_px=search_px
         )
         return vec if vec is not None else np.full(self.n_bands, np.nan, np.float32)
 
     def probe(
         self,
-        x: float,
-        y: float,
+        lon: float,
+        lat: float,
         year: int,
         *,
-        crs: str = "EPSG:4326",
         cross_zone: bool = True,
         search_px: int = SEAM_SEARCH_PX,
     ) -> Tuple[Optional[np.ndarray], str]:
@@ -537,13 +537,7 @@ class GeoTesseraZarr:
         Use it in place of testing ``sample_at`` for NaN, which cannot tell
         open water from a location missing from the store.
         """
-        lon = x
-        if crs != "EPSG:4326":
-            lon, _ = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(
-                x, y
-            )
-
-        zones = [_zone_for_point(x, y, crs)]
+        zones = [_zone_for_lon(lon)]
         if cross_zone:
             zones += [z for z in _seam_neighbours(lon) if z not in zones]
 
@@ -559,16 +553,11 @@ class GeoTesseraZarr:
                 # instead of saying what is wrong.
                 log.debug("probe: zone %d not in this store (%s)", z, exc)
                 continue
-            if crs == acc.crs:
-                e, n = x, y
-            else:
-                e, n = Transformer.from_crs(crs, acc.crs, always_xy=True).transform(
-                    x, y
-                )
+            e, n = _project(lon, lat, "EPSG:4326", acc.crs)
             vec, status = acc.probe(e, n, year, search_px=search_px)
             if status == VALID:
                 if z != zones[0]:
-                    log.debug("probe: %.6f,%.6f served from zone %d", x, y, z)
+                    log.debug("probe: %.6f,%.6f served from zone %d", lon, lat, z)
                 return vec, VALID
             seen.add(status)
 
@@ -584,7 +573,6 @@ class GeoTesseraZarr:
         coords: List[Tuple[float, float]],
         year: int,
         *,
-        crs: str = "EPSG:4326",
         progress: bool = True,
         cross_zone: bool = True,
         search_px: int = SEAM_SEARCH_PX,
@@ -592,23 +580,18 @@ class GeoTesseraZarr:
         """Sample embeddings at points, routing each to its zone.
 
         Args:
-            coords: List of (x, y) tuples in the given CRS.
-            crs: Input CRS (default WGS84).
+            coords: List of ``(lon, lat)`` tuples in WGS84.
             cross_zone: See :meth:`sample_at`.
             search_px: See :meth:`sample_at`.
 
         Returns ``(N, B)`` float32.  Points without an embedding get NaN rows.
         """
-        it = coords
-        if progress:
-            it = track(coords, description="Sampling points...", transient=True)
-        return np.array(
-            [
-                self.sample_at(
-                    x, y, year, crs=crs, cross_zone=cross_zone, search_px=search_px
-                )
-                for x, y in it
-            ]
+        return _sample_each(
+            lambda lon, lat: self.sample_at(
+                lon, lat, year, cross_zone=cross_zone, search_px=search_px
+            ),
+            coords,
+            progress,
         )
 
     # -- Region reading (dominant zone) -------------------------------------
@@ -618,24 +601,34 @@ class GeoTesseraZarr:
         bbox: Tuple[float, float, float, float],
         year: int,
         *,
-        crs: str = "EPSG:4326",
         progress: bool = False,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Read and dequantise a bbox region.
 
         Args:
-            bbox: (x_min, y_min, x_max, y_max) in the given CRS.
-            crs: Input bbox CRS (default WGS84).
+            bbox: ``(min_lon, min_lat, max_lon, max_lat)`` in WGS84.
 
-        Uses the dominant UTM zone (from bbox centre).  Returns
-        ``(mosaic, transform, crs)`` where mosaic is ``(H, W, B)`` float32.
+        Routes to the zone holding the bbox centre and returns
+        ``(mosaic, transform, crs)`` with mosaic ``(H, W, B)`` float32.  The
+        mosaic is in that zone's UTM, not in WGS84: the bbox is projected to
+        pick the window, and the pixels come back on their native grid
+        untouched.
         """
-        # Convert bbox centre to WGS84 for zone routing
-        cx, cy = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-        z = _zone_for_point(cx, cy, crs)
-
+        z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
         ds = self.open_zone(zone=z)
-        mosaic, transform = ds.tessera.read_region(
-            bbox, year, crs=crs, progress=progress
+        zone_crs = ds.tessera.crs
+
+        # Project the corners to pick the window; the data itself is never
+        # resampled.  A lon/lat box is not axis-aligned in UTM, so take the
+        # enclosing easting/northing extent.
+        e_nw, n_nw = _project(bbox[0], bbox[3], "EPSG:4326", zone_crs)
+        e_se, n_se = _project(bbox[2], bbox[1], "EPSG:4326", zone_crs)
+        utm_bbox = (
+            min(e_nw, e_se),
+            min(n_nw, n_se),
+            max(e_nw, e_se),
+            max(n_nw, n_se),
         )
-        return mosaic, transform, ds.tessera.crs
+
+        mosaic, transform = ds.tessera.read_region(utm_bbox, year, progress=progress)
+        return mosaic, transform, zone_crs

@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoTessera Globe Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        #globeViz {
+            width: 100vw;
+            height: 100vh;
+        }
+        .controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 100;
+            max-width: 300px;
+        }
+        .controls h3 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+        }
+        .controls label {
+            display: block;
+            margin: 8px 0;
+            font-size: 12px;
+        }
+        .controls input[type="range"] {
+            width: 100%;
+        }
+        .controls select {
+            width: 100%;
+            padding: 4px;
+        }
+        .controls button {
+            width: 100%;
+            margin-top: 10px;
+            padding: 8px 12px;
+            cursor: pointer;
+            background: #4CAF50;
+            border: none;
+            color: white;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .controls button:hover {
+            background: #45a049;
+        }
+        .controls button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        .info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 12px;
+            z-index: 100;
+        }
+        .hover-tooltip {
+            position: absolute;
+            background: linear-gradient(135deg, rgba(0, 0, 0, 0.95), rgba(20, 20, 40, 0.95));
+            color: white;
+            padding: 10px 14px;
+            border-radius: 8px;
+            pointer-events: none;
+            font-size: 12px;
+            z-index: 1000;
+            display: none;
+            border: 1px solid rgba(100, 150, 255, 0.5);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            min-width: 180px;
+            backdrop-filter: blur(10px);
+        }
+        .hover-tooltip.visible {
+            display: block;
+        }
+        .hover-tooltip .tile-name {
+            font-weight: bold;
+            font-size: 13px;
+            color: #4FC3F7;
+            margin-bottom: 6px;
+            font-family: 'Courier New', monospace;
+        }
+        .hover-tooltip .coverage-info {
+            margin: 3px 0 0 0;
+            line-height: 1.5;
+        }
+        .hover-tooltip .year-badge {
+            display: inline-block;
+            background: rgba(79, 195, 247, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+            margin: 2px;
+            font-size: 11px;
+            border: 1px solid rgba(79, 195, 247, 0.4);
+        }
+        .hover-tooltip .no-data {
+            color: #FF9800;
+            font-style: italic;
+        }
+        .hover-tooltip .water {
+            color: #03A9F4;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div id="globeViz"></div>
+    <div class="hover-tooltip" id="hoverTooltip"></div>
+
+    <div class="controls">
+        <h3>GeoTessera Coverage</h3>
+        <div style="font-size: 11px; opacity: 0.8; margin-bottom: 10px;">
+            Hover over tiles to see coverage details
+        </div>
+        <label>
+            Overlay Opacity:
+            <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.8">
+            <span id="opacityValue">0.8</span>
+        </label>
+        <label>
+            <input type="checkbox" id="showBorders" checked>
+            Show country borders
+        </label>
+    </div>
+
+    <div class="info">
+        <div><strong>Coverage Tiles:</strong> <span id="tileCount">0</span></div>
+        <div><span id="status">Initializing...</span></div>
+        <div id="layerToggle" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.3); font-size: 12px;">
+            <strong>Layers</strong>
+            <div id="layerList" style="margin-top: 6px;">Loading…</div>
+        </div>
+        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.3); font-size: 11px; opacity: 0.7;">
+            Tiles shown where datasets have land coverage; toggle layers above to compare.
+        </div>
+    </div>
+
+    <!--
+      Modern ES-module loading via an import map. esm.sh's ?deps= pins the
+      peer-dependency Three version so globe.gl and our code share the same
+      THREE instance (no "Multiple instances of Three.js" warning) and no
+      UMD/Timer breakage. Pinned versions for reproducibility.
+    -->
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://esm.sh/three@0.179.0",
+        "globe.gl": "https://esm.sh/globe.gl@2.46.1?deps=three@0.179.0",
+        "topojson-client": "https://esm.sh/topojson-client@3.1.0"
+      }
+    }
+    </script>
+    <script type="module">
+        import Globe from 'globe.gl';
+        import * as THREE from 'three';
+        import * as topojson from 'topojson-client';
+
+        // GeoTessera tile configuration
+        const TILE_SIZE = 0.1; // 0.1 degree tiles
+        const TILE_OFFSET = 0.05; // centered at 0.05-degree offsets
+
+        // Configuration
+        let currentOpacity = 0.8;
+        // One entry per (version, variant) layer. Populated by initLayers().
+        // Each entry: {id, version, variant, color, years, tilesByYear, mesh, material, visible}
+        let datasets = [];
+        let textureImageData = null; // Pixel data from FIRST loaded texture for ocean detection
+        let countriesData = null; // GeoJSON with country boundaries
+        let tileCountryCache = new Map(); // Cache tile -> country lookups
+        let mouse = { x: 0, y: 0 };
+        let raycaster = null;
+
+        // Load the coverage index (coverage.json) — schema v2 lists multiple
+        // datasets; older single-dataset format is auto-promoted into a single
+        // entry so this viewer works against both shapes.
+        async function loadCoverageIndex(url = 'coverage.json') {
+            try {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    console.warn(`Coverage index not found at ${url}`);
+                    return [];
+                }
+                const main = await response.json();
+                if (main.schema_version === 2 && Array.isArray(main.datasets)) {
+                    return main.datasets;
+                }
+                // Legacy single-dataset shape: { years, metadata, year_file_prefix?, dataset_id? }
+                return [{
+                    id: main.dataset_id || 'default',
+                    version: main.metadata?.version || '',
+                    version_path: '',
+                    variant: '',
+                    color: [200, 60, 60],
+                    years: main.years || [],
+                    coverage_json: url.split('/').pop(),
+                    texture_png: 'coverage_texture.png',
+                    year_file_prefix: main.year_file_prefix || 'coverage_',
+                }];
+            } catch (e) {
+                console.warn(`Failed to load coverage index: ${e.message}`);
+                return [];
+            }
+        }
+
+        // Fetch per-year tile lists for a single dataset and pivot into a
+        // { "lon,lat": [year, year, …] } map for tooltip lookups.
+        async function loadDatasetTiles(ds) {
+            const tiles = {};
+            const prefix = ds.year_file_prefix || `coverage_${ds.id}_`;
+            const fetches = ds.years.map(async (year) => {
+                const resp = await fetch(`${prefix}${year}.json`);
+                if (!resp.ok) return [];
+                return resp.json();
+            });
+            const results = await Promise.allSettled(fetches);
+            for (let i = 0; i < ds.years.length; i++) {
+                if (results[i].status !== 'fulfilled') continue;
+                const year = ds.years[i];
+                for (const key of results[i].value) {
+                    if (!tiles[key]) tiles[key] = [];
+                    tiles[key].push(year);
+                }
+            }
+            return tiles;
+        }
+
+        // Create one overlay sphere per dataset; renderOrder is staggered so
+        // layers composite predictably when multiple are visible.
+        function createDatasetMesh(ds, img, renderOrder) {
+            const texture = new THREE.Texture(img);
+            texture.needsUpdate = true;
+            const geometry = new THREE.SphereGeometry(102, 64, 64);
+            const material = new THREE.MeshBasicMaterial({
+                map: texture,
+                transparent: true,
+                opacity: currentOpacity,
+                side: THREE.FrontSide,
+                depthTest: true,
+                depthWrite: false,
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.name = `tilesOverlay_${ds.id}`;
+            mesh.renderOrder = renderOrder;
+            mesh.rotation.y = 4.71; // 3π/2 to match globe.gl coords
+            globe.scene().add(mesh);
+            ds.material = material;
+            return mesh;
+        }
+
+        function renderLayerToggles() {
+            const root = document.getElementById('layerList');
+            root.innerHTML = '';
+            for (const ds of datasets) {
+                const id = `ds_${ds.id}`;
+                const [r, g, b] = ds.color;
+                const colorRgb = `rgb(${r},${g},${b})`;
+                // Shade scale mirrors the server-side rendering: tiles with
+                // 1/N years are blended 50% toward white; tiles with N/N
+                // years stay at full tint. Show the gradient inline so the
+                // legend self-documents what the on-globe shades mean.
+                const palest = `rgb(${Math.round(r*0.5+255*0.5)},${Math.round(g*0.5+255*0.5)},${Math.round(b*0.5+255*0.5)})`;
+                const gradient = `linear-gradient(90deg, ${palest}, ${colorRgb})`;
+                const totalYears = ds.years.length;
+                const wrap = document.createElement('div');
+                wrap.style.cssText = 'margin:8px 0;';
+                wrap.innerHTML = `
+                    <label style="display:flex;align-items:center;gap:6px;">
+                        <input type="checkbox" id="${id}" checked>
+                        <span style="color:${colorRgb};font-size:14px;">■</span>
+                        <span>v${ds.version}${ds.variant ? ' / ' + ds.variant : ''}</span>
+                    </label>
+                    <div style="display:flex;align-items:center;gap:6px;margin:3px 0 0 24px;font-size:10px;opacity:0.85;">
+                        <span>1 yr</span>
+                        <span style="flex:1;height:8px;background:${gradient};border:1px solid rgba(255,255,255,0.3);border-radius:2px;"></span>
+                        <span>${totalYears} yr</span>
+                    </div>`;
+                root.appendChild(wrap);
+                wrap.querySelector('input').addEventListener('change', (e) => {
+                    ds.visible = e.target.checked;
+                    if (ds.mesh) ds.mesh.visible = ds.visible;
+                });
+            }
+        }
+
+        // Check if a tile coordinate is land using the coverage texture pixel data
+        function isLandFromTexture(lon, lat) {
+            if (!textureImageData) return false;
+            // Convert lon/lat to pixel coordinates (equirectangular, matching texture generation)
+            const x = Math.floor(((lon - TILE_OFFSET + 180) / 360) * 3600);
+            const y = Math.floor(((90 - (lat + TILE_OFFSET)) / 180) * 1800);
+            if (x < 0 || x >= 3600 || y < 0 || y >= 1800) return false;
+            const idx = (y * 3600 + x) * 4;
+            return textureImageData.data[idx + 3] > 0; // alpha > 0 means land
+        }
+
+        // Load countries GeoJSON
+        async function loadCountriesData() {
+            try {
+                // Use Natural Earth data from CDN
+                const response = await fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json');
+                if (!response.ok) {
+                    console.warn('Could not load country boundaries');
+                    return null;
+                }
+                const data = await response.json();
+                // Convert TopoJSON to GeoJSON
+                const countries = topojson.feature(data, data.objects.countries);
+                console.log(`Loaded ${countries.features.length} countries`);
+                return countries;
+            } catch (e) {
+                console.warn(`Failed to load countries: ${e.message}`);
+                return null;
+            }
+        }
+
+        // Find which country a point (lon, lat) is in
+        function findCountry(lon, lat) {
+            if (!countriesData) return null;
+
+            const key = `${lon.toFixed(2)},${lat.toFixed(2)}`;
+
+            // Check cache first
+            if (tileCountryCache.has(key)) {
+                return tileCountryCache.get(key);
+            }
+
+            // Point-in-polygon test
+            const point = [lon, lat];
+
+            for (const feature of countriesData.features) {
+                if (feature.geometry.type === 'Polygon') {
+                    if (pointInPolygon(point, feature.geometry.coordinates[0])) {
+                        const countryName = feature.properties.name;
+                        tileCountryCache.set(key, countryName);
+                        return countryName;
+                    }
+                } else if (feature.geometry.type === 'MultiPolygon') {
+                    for (const polygon of feature.geometry.coordinates) {
+                        if (pointInPolygon(point, polygon[0])) {
+                            const countryName = feature.properties.name;
+                            tileCountryCache.set(key, countryName);
+                            return countryName;
+                        }
+                    }
+                }
+            }
+
+            // No country found (ocean or disputed territory)
+            tileCountryCache.set(key, null);
+            return null;
+        }
+
+        // Check if polygon crosses the antimeridian
+        function crossesAntimeridian(polygon) {
+            let minLon = Infinity;
+            let maxLon = -Infinity;
+
+            for (const coord of polygon) {
+                const lon = coord[0];
+                if (lon < minLon) minLon = lon;
+                if (lon > maxLon) maxLon = lon;
+            }
+
+            return (maxLon - minLon) > 180;
+        }
+
+        // Point-in-polygon algorithm with antimeridian handling
+        function pointInPolygon(point, polygon) {
+            const [testLon, testLat] = point;
+
+            // Check if polygon crosses antimeridian
+            if (crossesAntimeridian(polygon)) {
+                // For antimeridian-crossing polygons, normalize to [0, 360) range
+                const normalizedTestLon = testLon < 0 ? testLon + 360 : testLon;
+
+                let inside = false;
+                for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                    const [lonI, latI] = polygon[i];
+                    const [lonJ, latJ] = polygon[j];
+
+                    // Normalize polygon coordinates to [0, 360)
+                    const normLonI = lonI < 0 ? lonI + 360 : lonI;
+                    const normLonJ = lonJ < 0 ? lonJ + 360 : lonJ;
+
+                    const intersect = ((latI > testLat) !== (latJ > testLat))
+                        && (normalizedTestLon < (normLonJ - normLonI) * (testLat - latI) / (latJ - latI) + normLonI);
+
+                    if (intersect) inside = !inside;
+                }
+
+                return inside;
+            } else {
+                // Standard ray casting for normal polygons
+                let inside = false;
+
+                for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+                    const [lonI, latI] = polygon[i];
+                    const [lonJ, latJ] = polygon[j];
+
+                    const intersect = ((latI > testLat) !== (latJ > testLat))
+                        && (testLon < (lonJ - lonI) * (testLat - latI) / (latJ - latI) + lonI);
+
+                    if (intersect) inside = !inside;
+                }
+
+                return inside;
+            }
+        }
+
+        // Get tile info for tooltip — aggregates across every visible dataset
+        // so hovering shows v1.0/vultr AND v1.1/cambridge years for the same tile.
+        function getTileInfo(lon, lat) {
+            const key = `${lon.toFixed(2)},${lat.toFixed(2)}`;
+            const tileName = `${lon.toFixed(2)}, ${lat.toFixed(2)}`;
+
+            if (!datasets.length) {
+                return { tileName, message: 'Coverage data not loaded' };
+            }
+
+            const perDataset = [];
+            for (const ds of datasets) {
+                if (!ds.visible) continue;
+                const years = ds.tilesByYear ? ds.tilesByYear[key] : null;
+                if (years && years.length) {
+                    perDataset.push({
+                        id: ds.id,
+                        version: ds.version,
+                        variant: ds.variant,
+                        color: ds.color,
+                        years: years.slice().sort((a, b) => a - b),
+                        totalYears: ds.years.length,
+                    });
+                }
+            }
+
+            if (perDataset.length) {
+                return { tileName, type: 'coverage', datasets: perDataset };
+            }
+
+            // Use coverage texture to detect land vs ocean (O(1) pixel lookup)
+            if (isLandFromTexture(lon, lat)) {
+                return { tileName, type: 'no-coverage', message: 'No tiles generated yet' };
+            }
+
+            // Otherwise it's ocean (transparent pixel in texture)
+            return { tileName, type: 'ocean', message: 'Ocean (outside landmask)' };
+        }
+
+        // Show tooltip with tile coverage info
+        function showTooltip(lon, lat, x, y) {
+            const tooltip = document.getElementById('hoverTooltip');
+            const info = getTileInfo(lon, lat);
+            const country = findCountry(lon, lat);
+
+            let html = `<div class="tile-name">${info.tileName}</div>`;
+            html += `<div class="coverage-info">`;
+
+            if (country) {
+                html += `<strong>${country}</strong><br/>`;
+            }
+
+            if (info.type === 'ocean') {
+                html += `<span class="water">${info.message}</span>`;
+            } else if (info.type === 'no-coverage') {
+                html += `<span class="no-data">${info.message}</span>`;
+            } else if (info.type === 'coverage') {
+                // One block per dataset that has data at this tile.
+                info.datasets.forEach((ds, idx) => {
+                    const colorRgb = `rgb(${ds.color.join(',')})`;
+                    if (idx > 0) html += `<div style="margin-top:6px;"></div>`;
+                    html += `<div><span style="color:${colorRgb};">■</span> `
+                          + `<strong>v${ds.version}${ds.variant ? '/' + ds.variant : ''}</strong> `
+                          + `&middot; ${ds.years.length}/${ds.totalYears} yrs</div>`;
+                    html += `<div>`;
+                    ds.years.forEach(year => {
+                        html += `<span class="year-badge">${year}</span>`;
+                    });
+                    html += `</div>`;
+                });
+            } else {
+                html += info.message;
+            }
+
+            html += `</div>`;
+
+            tooltip.innerHTML = html;
+            tooltip.style.left = (x + 15) + 'px';
+            tooltip.style.top = (y + 15) + 'px';
+            tooltip.classList.add('visible');
+        }
+
+        function hideTooltip() {
+            const tooltip = document.getElementById('hoverTooltip');
+            tooltip.classList.remove('visible');
+        }
+
+        // Convert screen coordinates to lat/lon on sphere
+        function screenToLatLon(screenX, screenY) {
+            if (!raycaster) return null;
+
+            // Convert screen coordinates to normalized device coordinates (-1 to +1)
+            const rect = document.getElementById('globeViz').getBoundingClientRect();
+            mouse.x = ((screenX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((screenY - rect.top) / rect.height) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, globe.camera());
+
+            // Ray-cast against any dataset overlay sphere — they're all the
+            // same radius, so it doesn't matter which one we hit.
+            const targets = datasets
+                .map(d => d.mesh)
+                .filter(m => m);
+            if (!targets.length) return null;
+
+            const intersects = raycaster.intersectObjects(targets);
+            if (intersects.length === 0) return null;
+
+            const point = intersects[0].point;
+
+            // Convert 3D point to lat/lon
+            // The overlay mesh is rotated 270° around Y axis
+            const radius = Math.sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+            const lat = Math.asin(point.y / radius) * 180 / Math.PI;
+
+            // Calculate longitude from 3D coordinates
+            const lon = Math.atan2(point.x, point.z) * 180 / Math.PI;
+
+            // Snap to tile center
+            const tileLon = Math.floor(lon * 10) / 10 + TILE_OFFSET;
+            const tileLat = Math.floor(lat * 10) / 10 + TILE_OFFSET;
+
+            return { lon: tileLon, lat: tileLat };
+        }
+
+        // Initialize globe
+        const globe = Globe()
+            (document.getElementById('globeViz'))
+            .globeImageUrl('//unpkg.com/three-globe/example/img/earth-blue-marble.jpg')
+            .bumpImageUrl('//unpkg.com/three-globe/example/img/earth-topology.png')
+            .backgroundImageUrl('//unpkg.com/three-globe/example/img/night-sky.png')
+            .polygonsData([])  // Will be populated when countries load
+            .polygonCapColor(() => 'rgba(0, 0, 0, 0)')  // Transparent fill
+            .polygonSideColor(() => 'rgba(0, 0, 0, 0)')  // Transparent sides
+            .polygonStrokeColor(() => 'rgba(255, 255, 255, 0.8)')  // White borders - darker/more opaque
+            .polygonAltitude(0.01);  // Above the tile overlay for visibility
+
+        // Set initial point of view
+        globe.pointOfView({ lat: 20, lng: 0, altitude: 2.5 });
+
+        // Initialize raycaster for mouse picking
+        setTimeout(() => {
+            raycaster = new THREE.Raycaster();
+        }, 100);
+
+        // Mouse move handler for tooltip
+        let lastHoveredTile = null;
+        document.getElementById('globeViz').addEventListener('mousemove', (event) => {
+            const tile = screenToLatLon(event.clientX, event.clientY);
+
+            if (tile) {
+                const tileKey = `${tile.lon.toFixed(2)},${tile.lat.toFixed(2)}`;
+                if (lastHoveredTile !== tileKey) {
+                    lastHoveredTile = tileKey;
+                    showTooltip(tile.lon, tile.lat, event.clientX, event.clientY);
+                } else {
+                    // Update tooltip position
+                    const tooltip = document.getElementById('hoverTooltip');
+                    tooltip.style.left = (event.clientX + 15) + 'px';
+                    tooltip.style.top = (event.clientY + 15) + 'px';
+                }
+            } else {
+                lastHoveredTile = null;
+                hideTooltip();
+            }
+        });
+
+        document.getElementById('globeViz').addEventListener('mouseleave', () => {
+            lastHoveredTile = null;
+            hideTooltip();
+        });
+
+        // Load every dataset's texture + per-year tile data and add one
+        // overlay mesh per dataset.
+        async function initLayers() {
+            document.getElementById('status').textContent = 'Loading dataset textures...';
+            let totalTiles = 0;
+            let order = 1;
+            for (const ds of datasets) {
+                // Per-year tile-coverage map (used for hover tooltips).
+                ds.tilesByYear = await loadDatasetTiles(ds);
+                totalTiles += Object.keys(ds.tilesByYear).length;
+
+                // Texture image -> overlay sphere.
+                await new Promise((resolve) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        // First loaded texture seeds the ocean-detection pixel
+                        // buffer used by the hover tooltip.
+                        if (!textureImageData) {
+                            const offscreen = document.createElement('canvas');
+                            offscreen.width = img.width;
+                            offscreen.height = img.height;
+                            const ctx2d = offscreen.getContext('2d');
+                            ctx2d.drawImage(img, 0, 0);
+                            textureImageData = ctx2d.getImageData(0, 0, img.width, img.height);
+                        }
+                        ds.mesh = createDatasetMesh(ds, img, order++);
+                        ds.visible = true;
+                        resolve();
+                    };
+                    img.onerror = () => {
+                        console.warn(`Could not load texture for ${ds.id}: ${ds.texture_png}`);
+                        resolve();
+                    };
+                    img.src = ds.texture_png;
+                });
+            }
+
+            document.getElementById('tileCount').textContent = totalTiles.toLocaleString();
+            renderLayerToggles();
+            document.getElementById('status').textContent = 'Ready';
+        }
+
+        // Initialize: country borders first, then the coverage index + layers.
+        async function initialize() {
+            document.getElementById('status').textContent = 'Loading country boundaries...';
+            countriesData = await loadCountriesData();
+            if (countriesData) {
+                globe.polygonsData(countriesData.features);
+                document.getElementById('status').textContent = 'Globe ready - Loading coverage index...';
+            }
+
+            datasets = await loadCoverageIndex('coverage.json');
+            if (!datasets.length) {
+                document.getElementById('status').textContent = 'Coverage data not available';
+                return;
+            }
+
+            console.log('THREE:', THREE.REVISION);
+            console.log(`Datasets: ${datasets.map(d => d.id).join(', ')}`);
+
+            await initLayers();
+        }
+
+        // Start initialization
+        setTimeout(() => {
+            initialize();
+        }, 500);
+
+        // Control handlers
+        document.getElementById('opacity').addEventListener('input', (e) => {
+            currentOpacity = parseFloat(e.target.value);
+            document.getElementById('opacityValue').textContent = currentOpacity.toFixed(2);
+            for (const ds of datasets) {
+                if (ds.material) {
+                    ds.material.opacity = currentOpacity;
+                    ds.material.needsUpdate = true;
+                }
+            }
+        });
+
+        document.getElementById('showBorders').addEventListener('change', (e) => {
+            if (e.target.checked && countriesData) {
+                globe.polygonsData(countriesData.features);
+            } else {
+                globe.polygonsData([]);
+            }
+        });
+
+        // Disable auto-rotate, let user control the view
+        globe.controls().autoRotate = false;
+        globe.controls().enableZoom = true;
+    </script>
+</body>
+</html>

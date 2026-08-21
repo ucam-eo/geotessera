@@ -504,20 +504,38 @@ group. The store automatically routes geographic queries to the correct zone::
 
     zarr store
     ├── Root attributes (geoemb:model, geoemb:build_version)
-    ├── utm30/           # UTM Zone 30
+    ├── utm30/           # UTM Zone 30, on its own native UTM grid
+    │   ├── embeddings   # (time, band, y, x) int8
+    │   ├── scales       # (time, y, x) float32 — per-pixel dequantisation
     │   ├── time[:]      # Year coordinate array
-    │   ├── embedding    # (time, y, x, band) float32
-    │   └── ...
+    │   ├── x[:], y[:]   # UTM easting / northing coordinates
+    │   └── band[:]
     ├── utm31/           # UTM Zone 31
     │   └── ...
     └── ...
 
+**Coordinate systems**:
+
+The store is UTM-native and nothing on the read path resamples pixels. Each
+layer speaks exactly one coordinate system:
+
+- ``GeoTesseraZarr`` takes **longitude and latitude** and routes each query
+  to the ``utm{NN}`` group holding it
+- The ``.tessera`` accessor takes **eastings and northings in that zone's own
+  CRS**, since by then there is nothing left to route
+
+Crossing between the two costs one point transform. Embeddings always come
+back on their native UTM grid — ``read_region()`` returns the zone's CRS
+alongside the mosaic, not the CRS of the bbox you asked with. Working from a
+national grid such as EPSG:27700? Project your points to lon/lat once, up
+front, rather than per call.
+
 **Access patterns**:
 
 - **Point sampling**: ``sample_points()`` / ``sample_at()`` for extracting
-  embeddings at specific coordinates across zones
-- **Region reading**: ``read_region()`` for loading rectangular areas as
-  mosaics with CRS and transform metadata
+  embeddings at lon/lat coordinates across zones
+- **Region reading**: ``read_region()`` takes a lon/lat bbox and returns the
+  mosaic on the zone's native UTM grid, with its transform and CRS
 - **Zone access**: ``open_zone()`` returns an xarray Dataset with a
   ``.tessera`` accessor for direct manipulation
 - **Diagnostics**: ``probe()`` returns ``(embedding, status)``, the status

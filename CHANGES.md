@@ -1,4 +1,4 @@
-## 0.10.0 (2026-08-20)
+## Unreleased
 
 ### Breaking Changes
 
@@ -6,6 +6,15 @@
   Embeddings, landmasks and manifests are served from the public
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
   replacing the retired `tessera-embeddings` AWS S3 bucket.
+
+- `sphinx` and `cram` are no longer runtime dependencies.
+  Sphinx moved to a `docs` extra (`pip install geotessera[docs]`)
+  and cram to the `dev` dependency group (@avsm)
+
+- The Zarr read API drops `crs=`. The store is UTM-native, so 
+  `GeoTesseraZarr` takes lon/lat and routes to the `utm{NN}` group holding
+  the point, and the `.tessera` accessor takes eastings and northings in
+  that zone's own CRS. Project to lon/lat once up front, rather than per call.
 
 - `botocore` and `awscrt` are no longer required dependencies as `urllib3`
   is a new direct dependency (@avsm)
@@ -43,6 +52,23 @@
 - `geotessera-registry s3scan` scans Source Cooperative to list
   embeddings. This allows manifests and landmask registries to be
   regenerated directly from the Source Cooperative repository.  (@avsm)
+
+- `open_zone(lon=...)` and `GeoTesseraZarr.open_zone(lon=...)` accept a
+  whole-number longitude. `lon=-3` previously raised `TypeError`.  (@avsm)
+
+### Performance
+
+- Point sampling no longer rebuilds a pyproj transformer for every point.
+
+### Documentation
+
+- The `geotessera` package docstring now covers `GeoTesseraZarr` alongside the
+  GeoTIFF export path; it previously described only the latter (@avsm)
+
+### Internal
+
+- The globe viewer HTML embedded in `cli.py` moved to
+  `geotessera/templates/globe.html`, shipped as package data (@avsm)
 
 ## v0.9.0 (2026-06-09)
 

@@ -697,7 +697,6 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "contextily" },
-    { name = "cram" },
     { name = "dask" },
     { name = "fsspec" },
     { name = "geodatasets" },
@@ -712,15 +711,20 @@ dependencies = [
     { name = "rioxarray" },
     { name = "scikit-image" },
     { name = "scikit-learn" },
-    { name = "sphinx" },
     { name = "typer" },
     { name = "urllib3" },
     { name = "xarray" },
     { name = "zarr" },
 ]
 
+[package.optional-dependencies]
+docs = [
+    { name = "sphinx" },
+]
+
 [package.dev-dependencies]
 dev = [
+    { name = "cram" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -729,7 +733,6 @@ dev = [
 requires-dist = [
     { name = "aiohttp" },
     { name = "contextily" },
-    { name = "cram", specifier = ">=0.7" },
     { name = "dask" },
     { name = "fsspec" },
     { name = "geodatasets", specifier = ">=2024.8.0" },
@@ -744,15 +747,17 @@ requires-dist = [
     { name = "rioxarray" },
     { name = "scikit-image", specifier = ">=0.25.2" },
     { name = "scikit-learn", specifier = ">=1.7.1" },
-    { name = "sphinx", specifier = ">=8.2.3" },
+    { name = "sphinx", marker = "extra == 'docs'", specifier = ">=8.2.3" },
     { name = "typer" },
     { name = "urllib3", specifier = ">=2" },
     { name = "xarray" },
     { name = "zarr" },
 ]
+provides-extras = ["docs"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cram", specifier = ">=0.7" },
     { name = "pytest", specifier = ">=8.4.1" },
     { name = "ruff", specifier = ">=0.12.8" },
 ]

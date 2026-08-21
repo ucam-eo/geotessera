@@ -17,6 +17,7 @@ from geotessera.store import (
     OUTSIDE,
     VALID,
     WATER,
+    _resolve_zone,
     _seam_neighbours,
     _zone_for_lon,
 )
@@ -53,6 +54,33 @@ check(
     "zone routing still agrees with the plain longitude rule away from seams",
     _zone_for_lon(2.35) == 31 and _zone_for_lon(-120.5) == 10,
 )
+
+
+# ---------------------------------------------------------------------------
+# Zone selection (open_zone / GeoTesseraZarr.open_zone share this)
+# ---------------------------------------------------------------------------
+
+check("an explicit zone passes straight through", _resolve_zone(30, None, None) == 30)
+check("a longitude selects its zone", _resolve_zone(None, -3.0, None) == 30)
+# A whole-number longitude is the one people type; the old structural match
+# accepted only float and rejected this as if nothing had been given.
+check("a whole-number longitude works too", _resolve_zone(None, -3, None) == 30)
+check(
+    "a bbox selects the zone holding its centre",
+    _resolve_zone(None, None, (-3.0, 53.4, -2.9, 53.5)) == 30,
+)
+
+
+def _raises_type_error(*args):
+    try:
+        _resolve_zone(*args)
+    except TypeError:
+        return True
+    return False
+
+
+check("no selector at all is an error", _raises_type_error(None, None, None))
+check("two selectors at once is an error", _raises_type_error(30, -3.0, None))
 
 
 # ---------------------------------------------------------------------------
@@ -135,19 +163,25 @@ check(
 check(
     "sample_at repairs the hole the same way probe does",
     np.allclose(
-        holed.tessera.sample_at(cx, cy, 2024, crs="EPSG:32653"),
+        holed.tessera.sample_at(cx, cy, 2024),
         np.array([1, 2, 3, 4]) * 0.05,
         atol=1e-6,
     ),
 )
+# probe and sample_at are the same lookup, so on one zone they must read a
+# coordinate pair the same way.  They did not: probe took UTM while sample_at
+# took lon/lat, so the same numbers meant different places on adjacent methods.
+v_probe, _ = holed.tessera.probe(cx, cy, 2024)
+v_sample = holed.tessera.sample_at(cx, cy, 2024)
+check(
+    "probe and sample_at agree on the same coordinates",
+    v_probe is not None and np.allclose(v_probe, v_sample, atol=1e-6),
+)
+
 check(
     "sample_at returns a NaN row for water",
     np.all(
-        np.isnan(
-            watery.tessera.sample_at(
-                float(watery.x[2]), float(watery.y[2]), 2024, crs="EPSG:32653"
-            )
-        )
+        np.isnan(watery.tessera.sample_at(float(watery.x[2]), float(watery.y[2]), 2024))
     ),
 )
 

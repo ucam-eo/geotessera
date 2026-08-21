@@ -8,9 +8,11 @@ build:
 sphinx:
    configuration: docs/conf.py
 
-# Optionally, but recommended,
-# declare the Python requirements required to build your documentation
-# See https://docs.readthedocs.io/en/stable/guides/reproducible-builds.html
-# python:
-#    install:
-#    - requirements: docs/requirements.txt
+# autodoc imports geotessera, so the package itself has to be installed.
+# The `docs` extra carries Sphinx; runtime installs no longer pull it in.
+python:
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs

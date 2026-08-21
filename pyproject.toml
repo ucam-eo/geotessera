@@ -25,14 +25,12 @@ dependencies = [
     "pandas",
     "matplotlib",
     "rasterio",
-    "sphinx>=8.2.3",
     "rich",
     "typer",
     "geodatasets>=2024.8.0",
     "scikit-learn>=1.7.1",
     "scikit-image>=0.25.2",
     "pyarrow>=17.0.0",
-    "cram>=0.7",
     "urllib3>=2",
     "xarray",
     "rioxarray",
@@ -42,6 +40,11 @@ dependencies = [
     "aiohttp",
     "geozarr-toolkit",
     "contextily",
+]
+
+[project.optional-dependencies]
+docs = [
+    "sphinx>=8.2.3",
 ]
 
 [project.urls]
@@ -62,8 +65,12 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["geotessera*"]
 
+[tool.setuptools.package-data]
+geotessera = ["templates/*.html"]
+
 [dependency-groups]
 dev = [
+    "cram>=0.7",
     "pytest>=8.4.1",
     "ruff>=0.12.8",
 ]

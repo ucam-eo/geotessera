@@ -4,7 +4,6 @@ channels:
   - conda-forge
   - main
 dependencies:
-  - cram>=0.7
   - dask
   - geodatasets>=2024.8.0
   - geopandas
@@ -17,7 +16,6 @@ dependencies:
   - rioxarray
   - scikit-image>=0.25.2
   - scikit-learn>=1.7.1
-  - sphinx>=8.2.3
   - typer
   - xarray
   - zarr

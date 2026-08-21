@@ -76,8 +76,11 @@ For development:
 ```bash
 git clone https://github.com/ucam-eo/geotessera
 cd geotessera
-pip install -e .
+uv sync --all-extras --dev   # or: pip install -e ".[docs]"
 ```
+
+Sphinx lives in the `docs` extra and the test harness in the `dev` group, so a
+plain `pip install geotessera` pulls in neither.
 
 ## Architecture
 
