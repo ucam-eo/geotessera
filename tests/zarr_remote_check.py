@@ -1137,13 +1137,27 @@ from geotessera.store import (  # noqa: E402
 )
 
 check("zone interior needs no neighbours", _seam_neighbours(3.0) == [])
-check("just east of a seam looks west", _seam_neighbours(138.2) == [53])
-check("just west of a seam looks east", _seam_neighbours(137.8) == [54])
 # On a seam the natural zone is the eastern one, so the list holds only its
 # western neighbour: what probe() has not already tried.
 check("exactly on a seam adds the western zone", _seam_neighbours(138.0) == [53])
-check("zone 1 wraps west to 60", _seam_neighbours(-179.9) == [60])
-check("zone 60 wraps east to 1", _seam_neighbours(179.9) == [1])
+check("just east of a seam looks west", _seam_neighbours(138.02) == [53])
+check("just west of a seam looks east", _seam_neighbours(137.98) == [54])
+
+# The band must cover every point a neighbouring zone could hold. A tile is
+# 0.1 degrees and belongs to the zone containing its centre, so that is
+# exactly the points within half a tile of the boundary.
+check(
+    "the whole half-tile band on each side consults a neighbour",
+    all(_seam_neighbours(138.0 + d) for d in (-0.05, -0.03, -0.01, 0.01, 0.03, 0.05)),
+)
+# ... and no further: a point a whole tile away is unambiguously its own
+# zone's, so the neighbour lookup stays off the common path.
+check(
+    "a point a tile-width from the seam needs no neighbour",
+    _seam_neighbours(138.2) == [] and _seam_neighbours(137.8) == [],
+)
+check("zone 1 wraps west to 60", _seam_neighbours(-179.98) == [60])
+check("zone 60 wraps east to 1", _seam_neighbours(179.98) == [1])
 
 
 def _fake_zone(scales_2d, epsg=32653, px=10.0, ox=300000.0, oy=4050000.0):
