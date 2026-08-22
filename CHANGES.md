@@ -4,6 +4,29 @@
 - **`convertv2.sh STRETCH_STATS=0`**: skip fill-time stretch statistics. v2's
   preview reads bands 0-2 of `embeddings_d4` directly, so the statistics that
   exist to support a 128-band PCA earn much less there. (@avsm)
+- **`geotessera-registry zarr-verify`**: check a store's contents against the
+  source tiles it was built from. Samples random (year, tile) pairs, reads a
+  small pixel block from each source `.npy` pair and the same ground position
+  from the store, and compares: embeddings must round-trip exactly, scales
+  must match wherever the store kept a finite value, and every nested-depth
+  array must be a true prefix of the full one. Blocks come from the middle of
+  a tile rather than its edge, so the known reprojection seams at tile corners
+  do not mask what is under test.
+
+  This validates that what was written is *correct*, not that everything was
+  written — a shard that was never written can only surface as `unwritten` if
+  it happens to be sampled. `zarr-scan` remains the coverage check. Exits
+  non-zero on any disagreement, so it can gate a publish. First run: 3,000
+  samples over 58 finished v2 zones, 108,000 pixels x 128 bands, zero
+  mismatches. (@avsm)
+
+This release makes the Zarr pipeline work end to end against remote object
+stores. Every subcommand now takes `s3://` locations for both the tile source
+and the output store, fills run as one process per UTM zone and resume from
+the store itself, and the global RGB preview can stream from a read-only
+mirror while writing to a credentialed bucket. Stores gained per-zone stretch
+statistics, optional nested embedding depths, and a mode for datasets that
+need no landmask.
 
 ### Breaking Changes
 

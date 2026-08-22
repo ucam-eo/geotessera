@@ -3260,6 +3260,229 @@ def scan_store(
     return df
 
 
+VERIFY_OK = "ok"
+VERIFY_UNWRITTEN = "unwritten"
+VERIFY_OUTSIDE = "outside-grid"
+
+
+def verify_store(
+    registry: "Registry",
+    store_path: "str | Path | StoreLocation",
+    source: TileSource,
+    samples: int = 1000,
+    window: int = 6,
+    years: Optional[List[int]] = None,
+    zones: Optional[List[int]] = None,
+    workers: int = 16,
+    seed: int = 0,
+    storage_options: Optional[Dict[str, Any]] = None,
+    console: Optional["rich.console.Console"] = None,
+) -> Tuple["pandas.DataFrame", Dict[str, int]]:
+    """Check a store's contents against the source tiles it was built from.
+
+    Samples *samples* random (year, tile) pairs from the manifest, reads a
+    ``window`` x ``window`` pixel block from each source ``.npy`` pair and the
+    same ground position from the store, and compares them. Verifies that
+
+    * ``embeddings`` matches the source exactly — int8 must round-trip;
+    * ``scales`` matches wherever the store kept a finite value;
+    * every nested-depth array is a true prefix of ``embeddings``.
+
+    The block is taken from the middle of a tile rather than its edge. Tile
+    corners are where reprojection seams live (see the seam handling in
+    ``geotessera.store``), and sampling them would measure that known
+    artifact instead of the thing under test.
+
+    This checks that what was written is *correct*; it says nothing about
+    completeness, since a shard that was never written can only show up as
+    ``unwritten`` if it happens to be sampled. Use :func:`scan_store` for
+    coverage.
+
+    Returns ``(per-sample DataFrame, tally)``. Any key containing
+    ``mismatch`` in the tally is a failure.
+    """
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from . import remote
+
+    store = StoreLocation.resolve(store_path, storage_options)
+    root = store.open_group(mode="r")
+    depths = store_depths(root)
+
+    gdf = registry._registry_gdf
+    picks = gdf.index.to_frame(index=False)
+    if years:
+        picks = picks[picks["year"].isin(years)]
+    if zones:
+        picks = picks[[tile_zone(v / 100.0) in zones for v in picks["lon_i"]]]
+    if picks.empty:
+        raise ValueError("No tiles match the requested years/zones")
+    picks = picks.sample(n=min(samples, len(picks)), random_state=seed)
+
+    if console:
+        console.print(f"Verifying [bold]{store}[/bold] against its source tiles")
+        console.print(
+            f"  {len(picks):,} sample(s), {window}x{window}px each"
+            + (f", nested depths {depths}" if depths else "")
+        )
+
+    zone_cache: Dict[int, Any] = {}
+    grid_cache: Dict[int, UnifiedZoneGrid] = {}
+    lock = __import__("threading").Lock()
+
+    def zone_info(z: int):
+        with lock:
+            if z not in zone_cache:
+                g = store.open_group(mode="r", path=_zone_group_name(z))
+                at = dict(g.attrs)
+                tr, shp = at["spatial:transform"], at["spatial:shape"]
+                grid_cache[z] = UnifiedZoneGrid(
+                    zone=z,
+                    years=[int(v) for v in g["time"][:]],
+                    canonical_epsg=int(at["proj:code"].split(":")[1]),
+                    origin_x=tr[2],
+                    origin_y=tr[5],
+                    width_px=shp[1],
+                    height_px=shp[0],
+                )
+                zone_cache[z] = g
+            return zone_cache[z], grid_cache[z]
+
+    src_options = source.storage_options
+
+    def one(rec) -> Dict[str, Any]:
+        year = int(rec["year"])
+        lon, lat = rec["lon_i"] / 100.0, rec["lat_i"] / 100.0
+        out = {"year": year, "lon": lon, "lat": lat, "zone": tile_zone(lon)}
+        try:
+            group, grid = zone_info(out["zone"])
+        except Exception as e:
+            return {**out, "status": "no-zone", "detail": str(e)[:120]}
+        if year not in grid.years:
+            return {**out, "status": "skip-year", "detail": ""}
+        t = grid.years.index(year)
+
+        ti = project_tile(lon, lat)
+        row0, col0 = _tile_pixel_offset(ti, grid)
+        # Middle of the tile: corners carry the known reprojection seams.
+        tr0 = max(0, min(ti.height - window, ti.height // 2))
+        tc0 = max(0, min(ti.width - window, ti.width // 2))
+        R, C = row0 + tr0, col0 + tc0
+        if not (
+            0 <= R
+            and R + window <= grid.height_px
+            and 0 <= C
+            and C + window <= grid.width_px
+        ):
+            return {**out, "status": VERIFY_OUTSIDE, "detail": f"pixel ({R},{C})"}
+
+        try:
+            emb_path, scales_path = source.embedding_locations(lon, lat, year)
+            emb = remote.read_npy_window(
+                emb_path,
+                tr0,
+                tr0 + window,
+                tc0,
+                tc0 + window,
+                storage_options=src_options,
+            )
+            sc = np.asarray(
+                remote.read_npy_window(
+                    scales_path,
+                    tr0,
+                    tr0 + window,
+                    tc0,
+                    tc0 + window,
+                    storage_options=src_options,
+                ),
+                dtype=np.float32,
+            )
+        except Exception as e:
+            return {**out, "status": "source-read", "detail": str(e)[:120]}
+
+        try:
+            z_emb = np.asarray(
+                group["embeddings"][t, :, R : R + window, C : C + window]
+            )
+            z_sc = np.asarray(group["scales"][t, R : R + window, C : C + window])
+        except Exception as e:
+            return {**out, "status": "store-read", "detail": str(e)[:120]}
+
+        if np.all(np.isinf(z_sc)):
+            return {**out, "status": VERIFY_UNWRITTEN, "detail": ""}
+
+        expected = emb.transpose(2, 0, 1)  # HWB -> BHW, the store's layout
+        if not np.array_equal(z_emb, expected):
+            n = int((z_emb != expected).sum())
+            return {
+                **out,
+                "status": "embeddings-mismatch",
+                "detail": f"{n}/{expected.size} values differ",
+            }
+
+        finite = np.isfinite(z_sc)
+        if finite.any() and not np.array_equal(z_sc[finite], sc[finite]):
+            return {**out, "status": "scales-mismatch", "detail": ""}
+
+        for d in depths:
+            z_d = np.asarray(
+                group[depth_array_name(d)][t, :, R : R + window, C : C + window]
+            )
+            if not np.array_equal(z_d, expected[:d]):
+                return {
+                    **out,
+                    "status": f"depth{d}-mismatch",
+                    "detail": f"{depth_array_name(d)} is not a prefix",
+                }
+
+        return {**out, "status": VERIFY_OK, "detail": ""}
+
+    rows: List[Dict[str, Any]] = []
+    records = picks.to_dict("records")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(one, r) for r in records]
+        for i, fut in enumerate(as_completed(futures), 1):
+            rows.append(fut.result())
+            if console and i % max(1, len(records) // 10) == 0:
+                ok = sum(1 for r in rows if r["status"] == VERIFY_OK)
+                console.print(f"    {i}/{len(records)} checked, {ok} verified")
+
+    df = pd.DataFrame(rows)
+    tally = df["status"].value_counts().to_dict()
+    return df, tally
+
+
+def summarise_verify(
+    df: "pandas.DataFrame", tally: Dict[str, int], console: "rich.console.Console"
+) -> int:
+    """Print a verification tally. Returns the number of mismatches."""
+    mismatches = sum(v for k, v in tally.items() if "mismatch" in k)
+    console.print("\n[bold]Verification[/bold]")
+    for status, n in sorted(tally.items(), key=lambda kv: -kv[1]):
+        colour = (
+            "red"
+            if "mismatch" in status
+            else "green"
+            if status == VERIFY_OK
+            else "yellow"
+        )
+        console.print(f"  [{colour}]{status:22s}[/{colour}] {n:6,}")
+    if mismatches:
+        console.print(f"\n[red]{mismatches} sample(s) disagree with the source:[/red]")
+        for _, r in df[df["status"].str.contains("mismatch")].head(10).iterrows():
+            console.print(
+                f"  utm{r['zone']:02d} {r['year']} ({r['lon']}, {r['lat']}): "
+                f"{r['status']} {r['detail']}"
+            )
+    else:
+        console.print(
+            f"\n[green]{tally.get(VERIFY_OK, 0):,} sample(s) identical to the "
+            f"source; no mismatches[/green]"
+        )
+    return mismatches
+
+
 def summarise_scan(df: "pandas.DataFrame", console: "rich.console.Console") -> None:
     """Print per-zone/year and per-year fill summaries from a scan."""
     from rich.table import Table

@@ -3974,6 +3974,62 @@ def zarr_fill_command(args):
     return 0
 
 
+def zarr_verify_command(args):
+    """Check a store's contents against the source tiles it was built from."""
+    import warnings
+    from rich.console import Console
+
+    from .zarr import summarise_verify, verify_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+
+    try:
+        registry, source, _version, _variant = _resolve_source(args, console)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    if source is None:
+        console.print(
+            "[red]Error:[/red] verification reads the source tiles, so a tile "
+            "source is required"
+        )
+        return 1
+
+    try:
+        df, tally = verify_store(
+            registry,
+            args.store_path,
+            source=source,
+            samples=args.samples,
+            window=args.window,
+            years=_parse_int_range(args.years) if args.years else None,
+            zones=_parse_int_range(args.zones) if args.zones else None,
+            workers=args.workers,
+            seed=args.seed,
+            storage_options=_storage_options_for(args, "store", args.store_path),
+            console=console if args.verbose else None,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    mismatches = summarise_verify(df, tally, console)
+
+    if args.output:
+        df.to_parquet(args.output, index=False)
+        console.print(f"  per-sample results written to {args.output}")
+
+    # Non-zero on disagreement, so this can gate a publish.
+    return 1 if mismatches else 0
+
+
 def zarr_scan_command(args):
     """Report how much of a store still needs filling."""
     import warnings
@@ -5213,6 +5269,83 @@ Directory Structure:
     _add_storage_args(zarr_scan_parser, "source", "Tile source")
     _add_storage_args(zarr_scan_parser, "store", "Store")
     zarr_scan_parser.set_defaults(func=zarr_scan_command)
+
+    # Zarr-verify command
+    zarr_verify_parser = subparsers.add_parser(
+        "zarr-verify",
+        help="Check a store's contents against the source tiles",
+        description="Sample random (year, tile) pairs, read a small pixel "
+        "block from each source .npy pair and the same ground position from "
+        "the store, and compare them. Verifies that embeddings round-trip "
+        "exactly, that scales match, and that every nested-depth array is a "
+        "true prefix of the full one. Blocks are taken from the middle of a "
+        "tile, not its edge, so the known reprojection seams at tile corners "
+        "do not mask the thing under test. This checks that what was written "
+        "is correct, not that everything was written — use zarr-scan for "
+        "coverage. Exits non-zero if any sample disagrees.",
+    )
+    zarr_verify_parser.add_argument(
+        "base_dir",
+        type=str,
+        help="Tile source: local mirror or repository root URL",
+    )
+    zarr_verify_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of the store to verify",
+    )
+    zarr_verify_parser.add_argument(
+        "--samples",
+        type=int,
+        default=1000,
+        help="How many (year, tile) pairs to check (default: 1000)",
+    )
+    zarr_verify_parser.add_argument(
+        "--window",
+        type=int,
+        default=6,
+        help="Pixels per side of the block compared at each sample "
+        "(default: 6, so 36 pixels x every band)",
+    )
+    zarr_verify_parser.add_argument(
+        "--years",
+        default=None,
+        help="Years to sample from (e.g. 2024 or 2017-2025). Default: all",
+    )
+    zarr_verify_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Zones to sample from (e.g. 30 or 29-34). Default: all. Restrict "
+        "this to the zones a fill has finished, since an unfinished one "
+        "reports its unwritten shards rather than a mismatch",
+    )
+    zarr_verify_parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Concurrent samples (threads, I/O bound; default: 16)",
+    )
+    zarr_verify_parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed, so a run is reproducible (default: 0)",
+    )
+    zarr_verify_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Write the per-sample results here as parquet",
+    )
+    zarr_verify_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress as samples are checked",
+    )
+    _add_source_args(zarr_verify_parser)
+    _add_storage_args(zarr_verify_parser, "source", "Tile source")
+    _add_storage_args(zarr_verify_parser, "store", "Store")
+    zarr_verify_parser.set_defaults(func=zarr_verify_command)
 
     # Zarr-extend command
     zarr_extend_parser = subparsers.add_parser(
