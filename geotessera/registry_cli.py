@@ -4277,6 +4277,7 @@ def zarr_stretch_command(args):
             mode=args.mode,
             from_sample=args.from_sample,
             allow_drift=args.allow_drift,
+            sample_store=args.sample_store,
         )
         return 0
 
@@ -5689,6 +5690,17 @@ Directory Structure:
         "(default: 0.25)",
     )
     _add_storage_args(zarr_stretch_parser, "store", "Store", writable=True)
+    zarr_stretch_parser.add_argument(
+        "--sample-store",
+        action="store_true",
+        help="With --per-zone, read the percentiles by sampling the store "
+        "rather than from the fill-time statistics. Those statistics exist to "
+        "support a PCA over all 128 dimensions; a bands-mode preview needs "
+        "only the three colour bands, which come from the shallowest depth "
+        "array. About two minutes per zone against the hours "
+        "--backfill-stretch-stats spends, and it works where no statistics "
+        "were collected at all.",
+    )
     zarr_stretch_parser.add_argument(
         "--per-zone",
         action="store_true",

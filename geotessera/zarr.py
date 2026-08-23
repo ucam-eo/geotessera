@@ -4684,6 +4684,130 @@ def compute_stretch_from_stats(
     return entry
 
 
+def _zone_stretches_by_sampling(
+    store_path: "str | Path | StoreLocation",
+    year: int,
+    zones: Optional[List[int]],
+    console: Optional["rich.console.Console"],
+    storage_options: Optional[Dict[str, Any]],
+    persist: bool,
+    sites: int = 12,
+    window: int = 48,
+    p_low: float = 2.0,
+    p_high: float = 98.0,
+    breakpoints: int = 257,
+) -> Dict[int, dict]:
+    """Per-zone stretches sampled from the store, needing no fill-time statistics.
+
+    The statistics arrays exist to support a PCA over all 128 dimensions. A
+    bands-mode preview only needs percentiles over the three colour bands, and
+    those can be read straight from the shallowest depth array — four bands
+    rather than 128. Measured against the published v2 store, a dozen windows
+    per zone costs about two minutes, against the hours per zone
+    ``--backfill-stretch-stats`` spends rebuilding the full second-moment
+    matrix. Most of that is the shard listing rather than the pixel reads.
+
+    Use this when the statistics are missing or not worth rebuilding. Where
+    they exist, :func:`compute_zone_stretches` without ``sample_store`` is
+    exact over every pixel and should be preferred.
+    """
+    store = StoreLocation.resolve(store_path, storage_options)
+    root = store.open_group(mode="r")
+    arr_name = preview_source_array(root, RGB_PREVIEW_BANDS, "bands")
+    names = _zone_group_names(store, zones)
+    wanted = sorted(int(n[3:]) for n in names if n[3:].isdigit())
+
+    if console:
+        console.print(
+            f"Sampling per-zone stretches for {year} from [bold]{arr_name}[/bold] "
+            f"({len(wanted)} zone(s), {sites} window(s) of {window}px each)"
+        )
+
+    rng = np.random.default_rng(0)
+    out: Dict[int, dict] = {}
+    for zone in wanted:
+        name = _zone_group_name(zone)
+        try:
+            g = store.open_group(mode="r", path=name)
+            years = [int(v) for v in g["time"][:]]
+            if year not in years:
+                continue
+            t = years.index(year)
+            H, W = g[arr_name].shape[2], g[arr_name].shape[3]
+        except Exception:
+            continue
+
+        all_coords = {
+            (r, c)
+            for r in range(math.ceil(H / SHARD_SIZE))
+            for c in range(math.ceil(W / SHARD_SIZE))
+        }
+        present = sorted(_existing_shards(store, name, t, all_coords))
+        if not present:
+            continue
+
+        pool = []
+        for sr, sc in [present[i] for i in rng.permutation(len(present))[: sites * 3]]:
+            r0 = sr * SHARD_SIZE + SHARD_SIZE // 2
+            c0 = sc * SHARD_SIZE + SHARD_SIZE // 2
+            if r0 + window > H or c0 + window > W:
+                continue
+            try:
+                emb = np.asarray(
+                    g[arr_name][t, 0:3, r0 : r0 + window, c0 : c0 + window]
+                )
+                sca = np.asarray(g["scales"][t, r0 : r0 + window, c0 : c0 + window])
+            except Exception:
+                continue
+            ok = valid_scale_mask(sca)
+            if ok.sum() < 64:
+                continue
+            pool.append((emb[:, ok].astype(np.float32) * sca[ok]).T)
+            if len(pool) >= sites:
+                break
+
+        if len(pool) < 3:
+            if console:
+                console.print(
+                    f"  [dim]utm{zone:02d}: too few valid samples, skipped[/dim]"
+                )
+            continue
+
+        x = np.concatenate(pool, 0)
+        entry = {
+            "bands": list(RGB_PREVIEW_BANDS),
+            "mode": "bands",
+            "min": [float(np.percentile(x[:, i], p_low)) for i in range(3)],
+            "max": [float(np.percentile(x[:, i], p_high)) for i in range(3)],
+            "cdf": [
+                [
+                    float(q)
+                    for q in np.percentile(
+                        x[:, i], np.linspace(p_low, p_high, breakpoints)
+                    )
+                ]
+                for i in range(3)
+            ],
+        }
+        out[zone] = entry
+        if console:
+            console.print(
+                f"  utm{zone:02d}: {x.shape[0]:,} px, "
+                f"min={[f'{v:.3f}' for v in entry['min']]} "
+                f"max={[f'{v:.3f}' for v in entry['max']]}"
+            )
+
+    if persist and out:
+        rw = store.open_group(mode="r+", zarr_format=3)
+        existing = dict(rw.attrs).get(_ZONE_STRETCH_ATTR) or {}
+        existing[str(year)] = {str(z): v for z, v in out.items()}
+        rw.attrs[_ZONE_STRETCH_ATTR] = existing
+        consolidate_store(store, console=console)
+        if console:
+            console.print(f"  [green]Stored {len(out)} zone stretch(es)[/green]")
+    return out
+
+
 def compute_zone_stretches(
     store_path: "str | Path | StoreLocation",
     year: int,
@@ -4691,6 +4815,9 @@ def compute_zone_stretches(
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
     persist: bool = True,
+    sample_store: bool = False,
+    sample_sites: int = 12,
+    sample_window: int = 48,
     **stretch_kwargs,
 ) -> Dict[int, dict]:
     """One stretch per UTM zone, for the blended preview.
@@ -4705,6 +4832,21 @@ def compute_zone_stretches(
     Persisted to the root ``geoemb:stretch_zones.{year}`` attribute, keyed by
     zone number.
     """
+    if sample_store:
+        return _zone_stretches_by_sampling(
+            store_path,
+            year,
+            zones,
+            console,
+            storage_options,
+            persist,
+            sites=sample_sites,
+            window=sample_window,
+            p_low=stretch_kwargs.get("p_low", 2.0),
+            p_high=stretch_kwargs.get("p_high", 98.0),
+            breakpoints=stretch_kwargs.get("equalise_breakpoints", 257),
+        )
+
     store = StoreLocation.resolve(store_path, storage_options)
     names = _zone_group_names(store, zones)
     wanted = sorted(int(n[3:]) for n in names if n[3:].isdigit())

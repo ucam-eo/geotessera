@@ -379,7 +379,14 @@ if [ -n "${MANIFEST_URL:-}" ]; then
 fi
 if [ "$BLEND_ZONES" = "1" ]; then
     echo "==> [3b/5] Computing per-zone stretches"
+    # SAMPLE_ZONES=1 reads the per-zone percentiles from the store instead of
+    # the fill-time statistics: seconds per zone, and it works for zones filled
+    # with --no-stretch-stats, which would otherwise fall back to the global
+    # stretch and keep the washed-out look.
+    ZONE_STRETCH_FLAGS=()
+    [ "${SAMPLE_ZONES:-0}" = "1" ] && ZONE_STRETCH_FLAGS+=(--sample-store)
     "$GT" zarr-stretch "$DST" --year "$YEAR" --mode "$STRETCH_MODE" --per-zone \
+        ${ZONE_STRETCH_FLAGS[@]+"${ZONE_STRETCH_FLAGS[@]}"} \
         "${STRETCH_FLAGS[@]}" "${STORE_W_FLAGS[@]}" 2>&1 \
         | tee "$LOGDIR/stretch-zones.log"
     PREVIEW_FLAGS+=(--blend-zone-stretch)
