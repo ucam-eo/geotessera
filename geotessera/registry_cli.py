@@ -4212,6 +4212,7 @@ def zarr_global_preview_command(args):
             ),
             reproject_only=args.reproject_only,
             coarsen_only=args.coarsen_only,
+            blend_zone_stretch=args.blend_zone_stretch,
         )
     except (ValueError, RuntimeError) as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -4254,6 +4255,27 @@ def zarr_stretch_command(args):
             pca_total_bands=args.pca_total_bands,
             pca_rgb_order=args.pca_rgb_order,
             console=console,
+        )
+        return 0
+
+    if args.per_zone:
+        # One stretch per zone, for a preview that blends them across zone
+        # boundaries instead of flattening every region into one mapping.
+        from .zarr import compute_zone_stretches
+
+        compute_zone_stretches(
+            args.store_path,
+            year=args.year,
+            zones=zones,
+            console=console,
+            storage_options=_storage_options_for(args, "store", args.store_path),
+            p_low=args.p_low,
+            p_high=args.p_high,
+            equalise=not args.no_equalise,
+            equalise_breakpoints=args.breakpoints,
+            mode=args.mode,
+            from_sample=args.from_sample,
+            allow_drift=args.allow_drift,
         )
         return 0
 
@@ -5505,6 +5527,16 @@ Directory Structure:
     _add_storage_args(zarr_gp_parser, "store", "Store")
     _add_storage_args(zarr_gp_parser, "output", "Pyramid output", writable=True)
     _add_storage_args(zarr_gp_parser, "state", "Build state", writable=True)
+    zarr_gp_parser.add_argument(
+        "--blend-zone-stretch",
+        action="store_true",
+        help="Colour each chunk with a blend of its zone's stretch and its "
+        "neighbour's, weighted by longitude. Needs `zarr-stretch --per-zone` "
+        "to have run. Both sides of a zone boundary evaluate to the same "
+        "mixture, so no seam appears. Changes every rendered pixel, so discard "
+        "existing preview markers before re-running.",
+    )
+
     zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
 
     # Zarr-stretch command
@@ -5644,6 +5676,17 @@ Directory Structure:
         "(default: 0.25)",
     )
     _add_storage_args(zarr_stretch_parser, "store", "Store", writable=True)
+    zarr_stretch_parser.add_argument(
+        "--per-zone",
+        action="store_true",
+        help="Compute one stretch per UTM zone instead of a single global one, "
+        "and store them under geoemb:stretch_zones. A single global stretch has "
+        "to serve every region, so a region at one end of the global "
+        "distribution renders with a channel pinned flat; per-zone recovers "
+        "that. Use with `zarr-global-preview --blend-zone-stretch`, which "
+        "blends them in longitude so zone boundaries stay seamless.",
+    )
+
     zarr_stretch_parser.set_defaults(func=zarr_stretch_command)
 
     # Verify-tile command

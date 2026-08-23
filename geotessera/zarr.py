@@ -4221,6 +4221,89 @@ def compute_stretch(
 # a seamless mosaic instead of one stretch per zone.
 
 _GLOBAL_STRETCH_ATTR = "geoemb:stretch"
+_ZONE_STRETCH_ATTR = "geoemb:stretch_zones"
+
+# A single global stretch has to serve every region, so a region sitting at one
+# end of the global distribution renders with a channel pinned flat. Measured on
+# v2 2024 over the UK: the green channel used 48 of 255 values and the mosaic
+# looked washed out, while equalising that tile against its own distribution
+# used 227. A stretch per UTM zone recovers most of that (48 -> 197), but used
+# raw it puts a visible step at every zone boundary.
+#
+# The step is removed by blending in longitude. Within zone z, with
+# t = (lon - zone_centre) / 6 in [-0.5, 0.5], the neighbour toward which the
+# pixel lies gets weight |t| and the zone itself 1 - |t|. Both sides of a
+# boundary therefore evaluate to the same 50/50 mixture, so continuity holds by
+# construction rather than by tuning. Blending CDF breakpoints is a weighted
+# mean of quantiles, which is the exact 1-D interpolation between two
+# distributions, not an approximation.
+#
+# Blending is longitude-only because UTM zones are longitude bands. A zone still
+# spans every latitude, so this fixes cross-zone variation and not cross-latitude.
+
+
+def _zone_centre_lon(zone: int) -> float:
+    """Central meridian of a UTM zone, in degrees."""
+    return -180.0 + (zone - 0.5) * 6.0
+
+
+def blend_stretches(a: Optional[dict], b: Optional[dict], w_b: float) -> Optional[dict]:
+    """Weighted mean of two stretches; *w_b* is the weight given to *b*.
+
+    Missing operands pass through, so a zone with no statistics of its own can
+    be represented as None and simply contributes nothing.
+    """
+    if a is None:
+        return b
+    if b is None:
+        return a
+    w_a = 1.0 - w_b
+    out = {
+        "min": [w_a * x + w_b * y for x, y in zip(a["min"], b["min"])],
+        "max": [w_a * x + w_b * y for x, y in zip(a["max"], b["max"])],
+    }
+    ca, cb = a.get("cdf"), b.get("cdf")
+    if ca and cb:
+        out["cdf"] = [
+            [w_a * x + w_b * y for x, y in zip(ra, rb)] for ra, rb in zip(ca, cb)
+        ]
+    for k in ("bands", "mode", "gamma", "saturation", "pca_components", "pca_mean"):
+        if k in a:
+            out[k] = a[k]
+    return out
+
+
+def stretch_for_lon(
+    zone_stretches: Dict[int, dict],
+    lon: float,
+    fallback: Optional[dict] = None,
+) -> Optional[dict]:
+    """The blended stretch that applies at longitude *lon*.
+
+    *zone_stretches* is keyed by UTM zone number; zones absent from it fall back
+    to *fallback* (normally the global stretch), so a partially-covered store
+    degrades smoothly instead of failing.
+    """
+    zone = tile_zone(lon)
+    t = (lon - _zone_centre_lon(zone)) / 6.0
+    neighbour = zone + 1 if t >= 0 else zone - 1
+    if neighbour > 60:
+        neighbour = 1
+    elif neighbour < 1:
+        neighbour = 60
+    here = zone_stretches.get(zone) or fallback
+    there = zone_stretches.get(neighbour) or fallback
+    return blend_stretches(here, there, min(abs(t), 0.5))
+
+
+def load_zone_stretches(
+    store: "StoreLocation | zarr.Group", year: int
+) -> Dict[int, dict]:
+    """Per-zone stretches persisted on the root, empty when none are stored."""
+    root = store if hasattr(store, "attrs") else store.open_group(mode="r")
+    entry = dict(root.attrs).get(_ZONE_STRETCH_ATTR) or {}
+    per_year = entry.get(str(year)) or entry.get(year) or {}
+    return {int(z): v for z, v in per_year.items()}
 
 
 def _parse_pca_perm(pca_rgb_order: str, pca_components: int) -> List[int]:
@@ -4552,6 +4635,84 @@ def compute_stretch_from_stats(
             )
 
     return entry
+
+
+def compute_zone_stretches(
+    store_path: "str | Path | StoreLocation",
+    year: int,
+    zones: Optional[List[int]] = None,
+    console: Optional["rich.console.Console"] = None,
+    storage_options: Optional[Dict[str, Any]] = None,
+    persist: bool = True,
+    **stretch_kwargs,
+) -> Dict[int, dict]:
+    """One stretch per UTM zone, for the blended preview.
+
+    Each zone's stretch is the ordinary global calculation restricted to that
+    zone, so this reuses :func:`compute_stretch_from_stats` rather than
+    duplicating the statistics handling. Zones whose statistics are absent or
+    empty are skipped and simply left out of the result;
+    :func:`stretch_for_lon` falls back to the global stretch for them, so a
+    partially-covered store still renders.
+
+    Persisted to the root ``geoemb:stretch_zones.{year}`` attribute, keyed by
+    zone number.
+    """
+    store = StoreLocation.resolve(store_path, storage_options)
+    names = _zone_group_names(store, zones)
+    wanted = sorted(int(n[3:]) for n in names if n[3:].isdigit())
+
+    if console:
+        console.print(
+            f"Computing per-zone stretches for {year} over {len(wanted)} zone(s)"
+        )
+
+    out: Dict[int, dict] = {}
+    skipped: List[int] = []
+    for zone in wanted:
+        try:
+            entry = compute_stretch_from_stats(
+                store,
+                year=year,
+                zones=[zone],
+                console=None,
+                storage_options=storage_options,
+                persist=False,
+                **stretch_kwargs,
+            )
+        except Exception as exc:  # no statistics, or none for this year
+            skipped.append(zone)
+            if console:
+                console.print(f"  [dim]utm{zone:02d}: skipped ({exc})[/dim]")
+            continue
+        if not entry or not entry.get("min"):
+            skipped.append(zone)
+            continue
+        out[zone] = entry
+        if console:
+            console.print(
+                f"  utm{zone:02d}: min={[f'{v:.3f}' for v in entry['min']]} "
+                f"max={[f'{v:.3f}' for v in entry['max']]}"
+            )
+
+    if console and skipped:
+        console.print(
+            f"  [yellow]{len(skipped)} zone(s) without usable statistics "
+            f"({', '.join(f'utm{z:02d}' for z in skipped[:8])}"
+            f"{', ...' if len(skipped) > 8 else ''}); they will use the global "
+            f"stretch, which the blend absorbs smoothly[/yellow]"
+        )
+
+    if persist and out:
+        root = store.open_group(mode="r+", zarr_format=3)
+        existing = dict(root.attrs).get(_ZONE_STRETCH_ATTR) or {}
+        existing[str(year)] = {str(z): v for z, v in out.items()}
+        root.attrs[_ZONE_STRETCH_ATTR] = existing
+        consolidate_store(store, console=console)
+        if console:
+            console.print(f"  [green]Stored {len(out)} zone stretch(es)[/green]")
+
+    return out
 
 
 def backfill_stretch_stats(
@@ -5228,6 +5389,7 @@ _reproj_scales_arr = None
 _reproj_to_utm = None
 _reproj_time_index = None
 _reproj_stretch = None
+_reproj_zone_stretches: Optional[Dict[int, dict]] = None
 
 
 def _init_reproj_worker(
@@ -5240,6 +5402,7 @@ def _init_reproj_worker(
     time_index: int,
     stretch: dict,
     emb_array: str = "embeddings",
+    zone_stretches: Optional[Dict[int, dict]] = None,
 ) -> None:
     """Process pool initializer: open stores and create transformer.
 
@@ -5251,6 +5414,7 @@ def _init_reproj_worker(
     """
     global _reproj_global_arr, _reproj_emb_arr, _reproj_scales_arr
     global _reproj_to_utm, _reproj_time_index, _reproj_stretch
+    global _reproj_zone_stretches
     from pyproj import Transformer
 
     from . import remote
@@ -5273,6 +5437,7 @@ def _init_reproj_worker(
     )
     _reproj_time_index = time_index
     _reproj_stretch = stretch
+    _reproj_zone_stretches = zone_stretches or None
 
 
 def _reproject_chunk_worker(args) -> bool:
@@ -5302,6 +5467,7 @@ def _reproject_chunk_worker(args) -> bool:
         src_h,
         src_w,
         _reproj_to_utm,
+        _reproj_zone_stretches,
     )
 
 
@@ -5320,8 +5486,15 @@ def _reproject_chunk(
     src_h: int,
     src_w: int,
     to_utm,
+    zone_stretches: Optional[Dict[int, dict]] = None,
 ) -> bool:
-    """Reproject one 512x512 global chunk, computing RGB from embeddings on the fly."""
+    """Reproject one 512x512 global chunk, computing RGB from embeddings on the fly.
+
+    With *zone_stretches* the colour mapping is blended per chunk from the
+    chunk's own centre longitude. A chunk spans 0.05 degrees against a zone's
+    6, so resolving the blend once per chunk is visually indistinguishable from
+    per-pixel and costs one interpolation instead of 260,000.
+    """
     import warnings
     from affine import Affine
     from rasterio.enums import Resampling
@@ -5384,6 +5557,11 @@ def _reproject_chunk(
 
     if r_max <= r_min or c_max <= c_min:
         return False
+
+    if zone_stretches:
+        stretch = stretch_for_lon(
+            zone_stretches, (tile_west + tile_east) / 2.0, fallback=stretch
+        )
 
     # Compute RGB on the fly from embeddings + scales (no stored rgb array needed)
     scales_chunk = np.asarray(scales_arr[time_index, r_min:r_max, c_min:c_max])
@@ -5498,6 +5676,7 @@ def _reproject_zone(
     console: Optional["rich.console.Console"] = None,
     force: bool = False,
     emb_array: str = "embeddings",
+    zone_stretches: Optional[Dict[int, dict]] = None,
 ) -> Tuple[set, bool]:
     """Reproject one zone's embeddings into global level 0.
 
@@ -5582,6 +5761,7 @@ def _reproject_zone(
                 time_index,
                 stretch,
                 emb_array,
+                zone_stretches,
             ),
         ) as pool:
             futures = {pool.submit(_reproject_chunk_worker, it): it for it in items}
@@ -5674,6 +5854,7 @@ def build_global_preview(
     state_storage_options: Optional[Dict[str, Any]] = None,
     reproject_only: bool = False,
     coarsen_only: bool = False,
+    blend_zone_stretch: bool = False,
 ) -> None:
     """Build the global EPSG:4326 RGB pyramid from zone-level embeddings.
 
@@ -5935,6 +6116,25 @@ def build_global_preview(
         (global_stretch or {}).get("bands", RGB_PREVIEW_BANDS),
         (global_stretch or {}).get("mode", "bands"),
     )
+
+    # Per-zone stretches, blended per chunk so zone boundaries stay seamless.
+    # Read from the source store, since that is where zarr-stretch --per-zone
+    # writes them; a pyramid-only destination has no statistics of its own.
+    zone_stretches: Dict[int, dict] = {}
+    if blend_zone_stretch:
+        zone_stretches = load_zone_stretches(source, year)
+        if not zone_stretches:
+            raise ValueError(
+                f"No per-zone stretches stored for {year}. Run "
+                f"`zarr-stretch --per-zone --year {year}` first, or drop "
+                f"--blend-zone-stretch to use the single global stretch."
+            )
+        if console:
+            console.print(
+                f"  Blending [bold]{len(zone_stretches)}[/bold] per-zone "
+                f"stretch(es) in longitude "
+                f"[dim](zones without one fall back to the global)[/dim]"
+            )
     if console and emb_array != "embeddings":
         console.print(
             f"  Reading colour bands from [bold]{emb_array}[/bold] "
@@ -5998,6 +6198,7 @@ def build_global_preview(
             console=console,
             force=force,
             emb_array=emb_array,
+            zone_stretches=zone_stretches,
         )
 
         if did_work:

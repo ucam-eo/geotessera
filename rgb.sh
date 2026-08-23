@@ -80,6 +80,17 @@ case "$VERSION" in
     *)  FROM_SAMPLE="${FROM_SAMPLE:-0}" ;;
 esac
 
+# Per-zone stretches, blended across zone boundaries. One global stretch has to
+# serve every region, so a region sitting at one end of the global distribution
+# renders with a channel pinned flat: measured on v2 2024 over the UK, green
+# used 48 of 255 values and the mosaic looked washed out. Per-zone lifts that to
+# 197 and chroma from 0.352 to 0.554, and the longitude blend keeps zone
+# boundaries seamless. Off for v1, whose published pyramid predates it.
+case "$VERSION" in
+    v1) BLEND_ZONES="${BLEND_ZONES:-0}" ;;
+    *)  BLEND_ZONES="${BLEND_ZONES:-1}" ;;
+esac
+
 # Step 1 rescans every shard in the store — days of work, and already done for
 # 2024. It is off by default; set SKIP_STATS=0 for a year that has never had
 # its statistics built.
@@ -158,6 +169,7 @@ elif [ -d "$STATE/_preview" ] && [ -n "$(ls -A "$STATE/_preview" 2>/dev/null)" ]
 fi
 
 echo "==> $VERSION year=$YEAR  zones=1-60  parallel=$ZONE_JOBS x $WORKERS workers"
+echo "    stretch  mode=$STRETCH_MODE$([ "$BLEND_ZONES" = "1" ] && echo ", per-zone blended" || echo ", single global")"
 echo "    venv   $VENV"
 echo "    source $SRC"
 echo "    dest   $DST"
@@ -355,6 +367,18 @@ echo "==> [3/5] Computing global stretch (mode=$STRETCH_MODE${FROM_SAMPLE:+, fro
 "$GT" zarr-stretch "$DST" --year "$YEAR" --mode "$STRETCH_MODE" \
     "${STRETCH_FLAGS[@]}" "${STORE_W_FLAGS[@]}" 2>&1 | tee "$LOGDIR/stretch.log"
 
+# The global stretch above still matters: it is the fallback for any zone whose
+# statistics are missing, and the blend mixes it in smoothly rather than
+# stepping to it.
+PREVIEW_FLAGS=()
+if [ "$BLEND_ZONES" = "1" ]; then
+    echo "==> [3b/5] Computing per-zone stretches"
+    "$GT" zarr-stretch "$DST" --year "$YEAR" --mode "$STRETCH_MODE" --per-zone \
+        "${STRETCH_FLAGS[@]}" "${STORE_W_FLAGS[@]}" 2>&1 \
+        | tee "$LOGDIR/stretch-zones.log"
+    PREVIEW_FLAGS+=(--blend-zone-stretch)
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Reproject every zone into level 0, in two rounds.
 #
@@ -369,6 +393,7 @@ echo "==> [4/5] Reprojecting all 60 zones (neighbour-aware, up to $ZONE_JOBS at 
 run_zones_scheduled zone "$ALL_ZONES" \
     "$GT" zarr-global-preview "$SRC" --year "$YEAR" --reproject-only \
     --workers "$WORKERS" --gamma "$GAMMA" --saturation "$SATURATION" \
+    ${PREVIEW_FLAGS[@]+"${PREVIEW_FLAGS[@]}"} \
     --output "$DST" --state-url "$STATE" "${SRC_FLAGS[@]}" "${DST_FLAGS[@]}" \
     || fail "one or more zones failed; re-run to resume before coarsening"
 

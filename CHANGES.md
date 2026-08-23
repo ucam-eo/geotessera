@@ -4,6 +4,36 @@
 - **`convertv2.sh STRETCH_STATS=0`**: skip fill-time stretch statistics. v2's
   preview reads bands 0-2 of `embeddings_d4` directly, so the statistics that
   exist to support a 128-band PCA earn much less there. (@avsm)
+- **Per-zone stretch, blended across zone boundaries**: `zarr-stretch --per-zone`
+  computes one stretch per UTM zone and stores them under
+  `geoemb:stretch_zones`; `zarr-global-preview --blend-zone-stretch` then colours
+  each chunk with a blend of its zone's stretch and its neighbour's, weighted by
+  longitude.
+
+  A single global stretch has to serve every region, so a region sitting at one
+  end of the global distribution renders with a channel pinned flat. Measured on
+  v2 2024 over the UK, green used 48 of 255 values and the mosaic looked washed
+  out; per-zone lifts that to 197 and chroma from 0.352 to 0.554, above the v1
+  mosaic's 0.458. Sinnamary goes 0.491 to 0.549 with all three channels evenly
+  spread for the first time. Sampling the global CDF evenly across latitude
+  bands was tried first and does nothing: 0.352 to 0.362, with green getting
+  *worse*.
+
+  Used raw, per-zone stretches step at every zone boundary. Within zone `z`,
+  with `t = (lon - centre) / 6`, the neighbour gets weight `|t|` and the zone
+  itself `1 - |t|`, so both sides of a boundary evaluate to the same 50/50
+  mixture and continuity holds by construction — stepping across in 0.001
+  degree increments moves the CDF breakpoints by 0.00000. Blending breakpoints
+  is a weighted mean of quantiles, the exact 1-D interpolation between two
+  distributions.
+
+  The blend resolves once per chunk, not per pixel: a chunk spans 0.05 degrees
+  against a zone's 6, so the difference is invisible and the cost is one
+  interpolation rather than 260,000. Zones with no statistics fall back to the
+  global stretch, which the blend mixes in smoothly, so a partially-covered
+  store still renders. Blending is longitude-only, since UTM zones are
+  longitude bands; a zone still spans every latitude. (@avsm)
+
 - **`geotessera-registry zarr-verify`**: check a store's contents against the
   source tiles it was built from. Samples random (year, tile) pairs, reads a
   small pixel block from each source `.npy` pair and the same ground position

@@ -1417,6 +1417,88 @@ check(
     ),
 )
 
+# ---------------------------------------------------------------------------
+# Per-zone stretch blending
+# ---------------------------------------------------------------------------
+# A single global stretch flattens regions that sit at one end of the global
+# distribution. Per-zone stretches fix that but step at zone boundaries; the
+# tent blend must remove the step exactly, not approximately.
+
+from geotessera.zarr import (  # noqa: E402
+    _zone_centre_lon,
+    blend_stretches,
+    stretch_for_lon,
+)
+
+
+def _st(v):
+    """A stretch whose every number is v, so blends are easy to read."""
+    return {"min": [v] * 3, "max": [v + 1] * 3, "cdf": [[v] * 4] * 3, "bands": [0, 1, 2]}
+
+
+check("zone centre is the central meridian", _zone_centre_lon(31) == 3.0)
+check("zone 1 centre is -177", _zone_centre_lon(1) == -177.0)
+
+mid = blend_stretches(_st(0.0), _st(10.0), 0.5)
+check("an even blend is the midpoint", mid["min"] == [5.0] * 3)
+check("and blends the cdf breakpoints too", mid["cdf"][0] == [5.0] * 4)
+check("weight 0 returns the first operand", blend_stretches(_st(2.0), _st(9.0), 0.0)["min"] == [2.0] * 3)
+check("weight 1 returns the second", blend_stretches(_st(2.0), _st(9.0), 1.0)["min"] == [9.0] * 3)
+check("a missing operand passes the other through", blend_stretches(None, _st(4.0), 0.5)["min"] == [4.0] * 3)
+check("both missing yields nothing", blend_stretches(None, None, 0.5) is None)
+
+# The property that matters: no step at a zone boundary. Give each zone a
+# distinct stretch so any discontinuity is glaring.
+ZS = {z: _st(float(z)) for z in range(1, 61)}
+
+west = stretch_for_lon(ZS, -1e-9)   # zone 30, at its eastern edge
+east = stretch_for_lon(ZS, +1e-9)   # zone 31, at its western edge
+check(
+    "the two sides of a zone boundary agree",
+    max(abs(a - b) for a, b in zip(west["min"], east["min"])) < 1e-6,
+)
+check(
+    "and they agree on the cdf as well",
+    max(abs(a - b) for a, b in zip(west["cdf"][0], east["cdf"][0])) < 1e-6,
+)
+check(
+    "a boundary blends the two zones evenly",
+    abs(west["min"][0] - 30.5) < 1e-6,
+)
+check(
+    "a zone centre uses that zone alone",
+    abs(stretch_for_lon(ZS, _zone_centre_lon(31))["min"][0] - 31.0) < 1e-9,
+)
+
+# Walking across a boundary must never jump: the largest step between adjacent
+# samples should be proportional to the step in longitude, not to the
+# difference between the two zones' stretches.
+samples = [stretch_for_lon(ZS, lo)["min"][0] for lo in np.arange(-0.5, 0.5, 0.01)]
+steps = [abs(b - a) for a, b in zip(samples, samples[1:])]
+check("crossing a boundary is continuous", max(steps) < 0.01)
+check("and monotonic through it", all(b >= a - 1e-9 for a, b in zip(samples, samples[1:])))
+
+# Antimeridian: zone 60's eastern neighbour is zone 1.
+check(
+    "zone 60 blends east into zone 1",
+    abs(stretch_for_lon(ZS, 179.999)["min"][0] - 30.5) < 1.0,
+)
+check(
+    "zone 1 blends west into zone 60",
+    abs(stretch_for_lon(ZS, -179.999)["min"][0] - 30.5) < 1.0,
+)
+
+# A zone with no stretch of its own falls back without a discontinuity.
+partial = {30: _st(30.0)}
+check(
+    "a zone without a stretch uses the fallback",
+    stretch_for_lon(partial, 20.0, fallback=_st(99.0))["min"] == [99.0] * 3,
+)
+check(
+    "and the fallback blends smoothly with a real neighbour",
+    30.0 < stretch_for_lon(partial, -0.001, fallback=_st(99.0))["min"][0] < 99.0,
+)
+
 import shutil  # noqa: E402
 
 shutil.rmtree(TMP, ignore_errors=True)
