@@ -1499,6 +1499,69 @@ check(
     30.0 < stretch_for_lon(partial, -0.001, fallback=_st(99.0))["min"][0] < 99.0,
 )
 
+# ---------------------------------------------------------------------------
+# Tile-footprint chunk filtering
+# ---------------------------------------------------------------------------
+# The work list comes from written shards, but a shard is 4096 px against a
+# tile's 0.1 degrees, so on a sparse dataset most of it holds nothing. The
+# filter must be exact: dropping a chunk a tile can reach would lose data.
+
+from geotessera.zarr import (  # noqa: E402
+    GLOBAL_BASE_RES,
+    GLOBAL_BOUNDS,
+    GLOBAL_CHUNK,
+    TILE_SIZE_DEG,
+    chunks_for_tile_centres,
+)
+
+_west, _s_, _e_, _north = GLOBAL_BOUNDS
+
+
+def _chunk_of(lon, lat):
+    return (int((_north - lat) / GLOBAL_BASE_RES) // GLOBAL_CHUNK,
+            int((lon - _west) / GLOBAL_BASE_RES) // GLOBAL_CHUNK)
+
+
+one = chunks_for_tile_centres([(0.05, 52.05)])
+check("a tile yields at least one chunk", len(one) >= 1)
+check("and includes the chunk under its centre", _chunk_of(0.05, 52.05) in one)
+
+# Every corner of the footprint must be covered — a missed corner is lost data.
+corners = [(0.05 + dx, 52.05 + dy)
+           for dx in (-TILE_SIZE_DEG / 2 + 1e-9, TILE_SIZE_DEG / 2 - 1e-9)
+           for dy in (-TILE_SIZE_DEG / 2 + 1e-9, TILE_SIZE_DEG / 2 - 1e-9)]
+check(
+    "every corner of a tile falls in a returned chunk",
+    all(_chunk_of(x, y) in one for x, y in corners),
+)
+
+# A chunk is 512 * 0.0001 = 0.0512 deg; a 0.1 deg tile spans 2-3 of them.
+check("a tile spans a plausible number of chunks", 4 <= len(one) <= 12)
+
+check("no tiles yields no chunks", chunks_for_tile_centres([]) == set())
+
+# Two distant tiles must not merge into a filled rectangle between them.
+far = chunks_for_tile_centres([(0.05, 52.05), (20.05, 52.05)])
+check(
+    "distant tiles stay disjoint",
+    len(far) == 2 * len(one) and _chunk_of(10.0, 52.05) not in far,
+)
+
+# Adjacent tiles overlap only on their shared edge.
+adj = chunks_for_tile_centres([(0.05, 52.05), (0.15, 52.05)])
+check("adjacent tiles share at most an edge of chunks", len(adj) < 2 * len(one))
+
+# The filter is an intersection, so it can only ever remove chunks.
+shardish = one | {(r, c) for r in range(900, 910) for c in range(900, 910)}
+check(
+    "intersecting can only shrink the work list",
+    (shardish & chunks_for_tile_centres([(0.05, 52.05)])) <= shardish,
+)
+check(
+    "and keeps every chunk the tile needs",
+    one <= (shardish & chunks_for_tile_centres([(0.05, 52.05)])) | (one - shardish),
+)
+
 import shutil  # noqa: E402
 
 shutil.rmtree(TMP, ignore_errors=True)

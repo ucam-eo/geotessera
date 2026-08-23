@@ -4,6 +4,19 @@
 - **`convertv2.sh STRETCH_STATS=0`**: skip fill-time stretch statistics. v2's
   preview reads bands 0-2 of `embeddings_d4` directly, so the statistics that
   exist to support a 128-band PCA earn much less there. (@avsm)
+- **`zarr-global-preview --manifest-url`**: narrow each zone's work list from
+  the chunks its shards touch to the chunks a tile can actually reach. The work
+  list already comes from written shard objects rather than a zone's bounding
+  rectangle, but a shard is 4096 pixels against a tile's 0.1 degrees, so on a
+  sparse dataset most of a shard's footprint holds nothing — and every empty
+  chunk still costs a scales read before the renderer discards it. Measured
+  over seven v2 zones: 312,902 chunks from shards, 66,898 that can hold data,
+  so **78.6% of the reprojection work was empty** and the filter is a 4.7x
+  reduction. Tiles are axis-aligned in lon/lat and the pyramid is plate carrée,
+  so the intersection is exact rather than approximate, and being an
+  intersection it can only remove chunks, never lose one. `rgb.sh` passes it
+  when `MANIFEST_URL` is set. (@avsm)
+
 - **Per-zone stretch, blended across zone boundaries**: `zarr-stretch --per-zone`
   computes one stretch per UTM zone and stores them under
   `geoemb:stretch_zones`; `zarr-global-preview --blend-zone-stretch` then colours
