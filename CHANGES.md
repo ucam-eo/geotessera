@@ -48,6 +48,10 @@ There are several new variants availabile, see `geotessera info`:
   that zone's own CRS. Project to lon/lat once up front, rather than per call.
   (@avsm)
 
+- The unused `TesseraTileTransform` class and its `geotessera.tile_transform`
+  module are removed; `GeoTesseraZarr` datasets carry plain coordinate
+  arrays instead. (#305 @aneeshnaik)
+
 ### New Features
 
 - A new `GeoTesseraZarr.read_patch(lon, lat, year, size_px)` returns a
@@ -141,6 +145,11 @@ There are several new variants availabile, see `geotessera info`:
   (@avsm)
 
 ### Bug Fixes
+
+- `coverage` renders a single-source dataset in the website's multi-colour
+  year palette again, keeping per-source tints for maps that overlay
+  several versions or variants; the globe viewer shows the matching
+  legend. (#330 @adpeace)
 
 - Out-of-range scales no longer poison the stretch statistics.  (@avsm)
 
