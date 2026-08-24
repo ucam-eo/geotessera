@@ -130,8 +130,8 @@
         </div>
         <label>
             Overlay Opacity:
-            <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.8">
-            <span id="opacityValue">0.8</span>
+            <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.95">
+            <span id="opacityValue">0.95</span>
         </label>
         <label>
             <input type="checkbox" id="showBorders">
@@ -176,7 +176,7 @@
         const TILE_OFFSET = 0.05; // centered at 0.05-degree offsets
 
         // Configuration
-        let currentOpacity = 0.8;
+        let currentOpacity = 0.95;
         // One entry per (version, variant) layer. Populated by initLayers().
         // Each entry: {id, version, variant, color, years, tilesByYear, mesh, material, visible}
         let datasets = [];
