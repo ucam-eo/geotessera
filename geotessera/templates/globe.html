@@ -134,7 +134,7 @@
             <span id="opacityValue">0.8</span>
         </label>
         <label>
-            <input type="checkbox" id="showBorders" checked>
+            <input type="checkbox" id="showBorders">
             Show country borders
         </label>
     </div>
@@ -245,7 +245,9 @@
         function createDatasetMesh(ds, img, renderOrder) {
             const texture = new THREE.Texture(img);
             texture.needsUpdate = true;
-            const geometry = new THREE.SphereGeometry(102, 64, 64);
+            // Sit just above the globe surface (radius 100) so the overlay
+            // hugs the land instead of floating visibly above it.
+            const geometry = new THREE.SphereGeometry(100.3, 64, 64);
             const material = new THREE.MeshBasicMaterial({
                 map: texture,
                 transparent: true,
@@ -684,7 +686,11 @@
             document.getElementById('status').textContent = 'Loading country boundaries...';
             countriesData = await loadCountriesData();
             if (countriesData) {
-                globe.polygonsData(countriesData.features);
+                // Borders are off by default; the data still loads so the
+                // toggle and the hover tooltip's country lookup work.
+                if (document.getElementById('showBorders').checked) {
+                    globe.polygonsData(countriesData.features);
+                }
                 document.getElementById('status').textContent = 'Globe ready - Loading coverage index...';
             }
 
