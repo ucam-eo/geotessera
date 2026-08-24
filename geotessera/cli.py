@@ -787,6 +787,14 @@ def coverage(
     # Resolve flag defaults. The defaults differ between single-source and
     # --by-source modes so the "complete picture" rendering doesn't require
     # the user to type --dataset-version=all every time.
+    # An explicit 'all' for either flag forces the multi-source view even
+    # without --by-source, as documented in the flag help.
+    if (dataset_version is not None and dataset_version.lower() == "all") or (
+        dataset_variant is not None and dataset_variant.lower() == "all"
+    ):
+        if not by_source:
+            rprint("[blue]Explicit 'all' requested: enabling --by-source rendering[/blue]")
+        by_source = True
     if by_source:
         version_spec = dataset_version if dataset_version is not None else "all"
         variant_spec = dataset_variant if dataset_variant is not None else "all"

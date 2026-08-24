@@ -126,3 +126,14 @@ Test that coverage command also accepts --tile option and parses the tile correc
   >   --dataset-version v1 2>&1 | head -2
   Point (0.17, 52.23) -> tile grid_0.15_52.25
   Region bounding box: [0.150000\xc2\xb0E, 52.250000\xc2\xb0N] - [0.150000\xc2\xb0E, 52.250000\xc2\xb0N] (esc)
+
+Test that an explicit --dataset-version all forces the multi-source view
+without needing --by-source (as the flag help documents):
+
+  $ geotessera coverage \
+  >   --tile "0.17,52.23" \
+  >   --output "$TESTDIR/all_datasets_coverage.png" \
+  >   --dataset-version all 2>&1 | head -3
+  Point (0.17, 52.23) -> tile grid_0.15_52.25
+  Region bounding box: [0.150000\xc2\xb0E, 52.250000\xc2\xb0N] - [0.150000\xc2\xb0E, 52.250000\xc2\xb0N] (esc)
+  Explicit 'all' requested: enabling --by-source rendering
