@@ -266,35 +266,77 @@
         function renderLayerToggles() {
             const root = document.getElementById('layerList');
             root.innerHTML = '';
-            for (const ds of datasets) {
+
+            // For single dataset, show temporal legend (multi-color scheme fixed by texture);
+            // for multiple datasets, show tint-variant legend (color gradient per dataset).
+            const isSingleDataset = datasets.length === 1;
+
+            if (isSingleDataset) {
+                // Temporal variant: show the fixed temporal coverage colors
+                const ds = datasets[0];
                 const id = `ds_${ds.id}`;
-                const [r, g, b] = ds.color;
-                const colorRgb = `rgb(${r},${g},${b})`;
-                // Shade scale mirrors the server-side rendering: tiles with
-                // 1/N years are blended 50% toward white; tiles with N/N
-                // years stay at full tint. Show the gradient inline so the
-                // legend self-documents what the on-globe shades mean.
-                const palest = `rgb(${Math.round(r*0.5+255*0.5)},${Math.round(g*0.5+255*0.5)},${Math.round(b*0.5+255*0.5)})`;
-                const gradient = `linear-gradient(90deg, ${palest}, ${colorRgb})`;
-                const totalYears = ds.years.length;
                 const wrap = document.createElement('div');
                 wrap.style.cssText = 'margin:8px 0;';
+
+                // Legend entries for temporal coverage scheme
+                const legendItems = [
+                    { color: '#00c800', label: 'Full coverage' },
+                    { color: '#00b4ff', label: 'Multi-year' },
+                    { color: '#ffc800', label: 'Latest year' },
+                    { color: '#c86400', label: 'Older years' },
+                    { color: '#666666', label: 'No coverage' },
+                ];
+
                 wrap.innerHTML = `
-                    <label style="display:flex;align-items:center;gap:6px;">
+                    <label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
                         <input type="checkbox" id="${id}" checked>
-                        <span style="color:${colorRgb};font-size:14px;">■</span>
                         <span>v${ds.version}${ds.variant ? ' / ' + ds.variant : ''}</span>
                     </label>
-                    <div style="display:flex;align-items:center;gap:6px;margin:3px 0 0 24px;font-size:10px;opacity:0.85;">
-                        <span>1 yr</span>
-                        <span style="flex:1;height:8px;background:${gradient};border:1px solid rgba(255,255,255,0.3);border-radius:2px;"></span>
-                        <span>${totalYears} yr</span>
+                    <div style="font-size:10px;opacity:0.85;margin-left:24px;">
+                        ${legendItems.map(item => `
+                            <div style="display:flex;align-items:center;gap:4px;margin:3px 0;">
+                                <span style="width:12px;height:12px;background:${item.color};border-radius:2px;border:1px solid rgba(255,255,255,0.3);flex-shrink:0;"></span>
+                                <span>${item.label}</span>
+                            </div>
+                        `).join('')}
                     </div>`;
                 root.appendChild(wrap);
                 wrap.querySelector('input').addEventListener('change', (e) => {
                     ds.visible = e.target.checked;
                     if (ds.mesh) ds.mesh.visible = ds.visible;
                 });
+            } else {
+                // Tint variant: show gradient per dataset (sparse to full coverage in that color)
+                for (const ds of datasets) {
+                    const id = `ds_${ds.id}`;
+                    const [r, g, b] = ds.color;
+                    const colorRgb = `rgb(${r},${g},${b})`;
+                    // Shade scale mirrors the server-side rendering: tiles with
+                    // 1/N years are blended 50% toward white; tiles with N/N
+                    // years stay at full tint. Show the gradient inline so the
+                    // legend self-documents what the on-globe shades mean.
+                    const palest = `rgb(${Math.round(r*0.5+255*0.5)},${Math.round(g*0.5+255*0.5)},${Math.round(b*0.5+255*0.5)})`;
+                    const gradient = `linear-gradient(90deg, ${palest}, ${colorRgb})`;
+                    const totalYears = ds.years.length;
+                    const wrap = document.createElement('div');
+                    wrap.style.cssText = 'margin:8px 0;';
+                    wrap.innerHTML = `
+                        <label style="display:flex;align-items:center;gap:6px;">
+                            <input type="checkbox" id="${id}" checked>
+                            <span style="color:${colorRgb};font-size:14px;">■</span>
+                            <span>v${ds.version}${ds.variant ? ' / ' + ds.variant : ''}</span>
+                        </label>
+                        <div style="display:flex;align-items:center;gap:6px;margin:3px 0 0 24px;font-size:10px;opacity:0.85;">
+                            <span>1 yr</span>
+                            <span style="flex:1;height:8px;background:${gradient};border:1px solid rgba(255,255,255,0.3);border-radius:2px;"></span>
+                            <span>${totalYears} yr</span>
+                        </div>`;
+                    root.appendChild(wrap);
+                    wrap.querySelector('input').addEventListener('change', (e) => {
+                        ds.visible = e.target.checked;
+                        if (ds.mesh) ds.mesh.visible = ds.visible;
+                    });
+                }
             }
         }
 

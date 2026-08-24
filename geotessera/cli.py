@@ -1053,6 +1053,7 @@ def coverage(
             # Per-dataset GeoTessera instances. Reuse `gt` when its
             # (version, variant) matches a combo so we don't redownload.
             dataset_index = []  # entries that will land in coverage.json
+            logging.info(f"Exporting coverage for {len(datasets_to_export)} dataset(s)")
             for ds in datasets_to_export:
                 if (
                     ds["dataset_version_path"] == gt.registry._version_path
@@ -1084,7 +1085,7 @@ def coverage(
                 ds_gt.generate_coverage_texture(
                     coverage_data,
                     output_file=str(texture_path),
-                    tint_color=ds["color"],
+                    tint_color=ds["color"] if len(datasets_to_export) > 1 else None,
                 )
 
                 dataset_index.append(
