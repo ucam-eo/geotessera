@@ -15,9 +15,8 @@ The store contains nothing but Zarr. Build-time bookkeeping lives in a
 sibling location, ``<store>.build`` by default:
 
     tessera.zarr.build/
-        _registry/utm{zone:02d}_{year}.parquet   # per-zone ingestion tracking
+        _registry/utm{zone:02d}_{year}.parquet   # legacy ingestion tracking
         _registry.parquet             # merged tracking (written by consolidate)
-        _locks/utm{zone:02d}_{year}.json         # advisory fill locks
         _preview/zone_{zone}_done     # global-preview resume markers
 
 Dimension order: (time, band, y, x) — ML-standard NCHW.
@@ -39,11 +38,11 @@ Parallel fills
 --------------
 A UTM zone's pixels live entirely within its own ``utm{zone}`` group, and
 shards never straddle zones, so one process per zone can fill the same store
-concurrently.  All per-fill state is keyed by (zone, year) — the ingestion
-registry and the advisory lock — so no two zone jobs touch the same object.
-The one shared object, the root ``zarr.json``, is only rewritten by
-consolidation, which a zone fill skips by default when ``zones`` is set;
-run ``zarr-consolidate`` once after the sweep instead.
+concurrently.  Fills keep no state of their own: the shard objects in the
+store are the only record of progress, so a killed run is resumed by
+re-running the same command.  The one shared object, the root ``zarr.json``,
+is only rewritten by consolidation, which a zone fill skips by default when
+``zones`` is set; run ``zarr-consolidate`` once after the sweep instead.
 """
 
 from __future__ import annotations
@@ -61,7 +60,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 if TYPE_CHECKING:
-    import geopandas
     import pandas
     import rich.console
     import zarr
@@ -1663,7 +1661,6 @@ def init_store(
     model_version: str = "1.0",
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
-    state_url: Optional[str] = None,
     stretch_sample_size: int = STRETCH_SAMPLE_K,
     matryoshka_depths: Sequence[int] = (),
     use_landmask: bool = True,
@@ -1694,7 +1691,7 @@ def init_store(
 
     depths = validate_matryoshka_depths(matryoshka_depths, model_version)
 
-    store = StoreLocation.resolve(output_path, storage_options, state_url)
+    store = StoreLocation.resolve(output_path, storage_options)
     if not store.is_remote:
         if Path(store.url).exists():
             raise FileExistsError(f"Store already exists: {store}")
@@ -2320,44 +2317,17 @@ def update_zone_stretch_stats(
 # ---------------------------------------------------------------------------
 # Tile registry (GeoParquet tracking which tiles are written)
 # ---------------------------------------------------------------------------
-# This is build bookkeeping, so it lives in the state sibling rather than the
-# store: an incremental fill needs to know which tiles it already wrote, but a
-# reader of the published store never does. Tracking is sharded by (zone,
-# year) under ``_registry/`` so that concurrent per-zone fills never
-# read-modify-write the same object, and ``consolidate_store`` merges the
-# parts into one ``_registry.parquet``.
-#
-# Stores built before the split keep a single ``_registry.parquet`` at the
-# store root; it is still read so those stores resume correctly, but nothing
-# is written back into the store any more.
+# Legacy build bookkeeping. Fills are stateless now — the shard objects in
+# the store are the only record of progress — but builds from before that
+# change left per-(zone, year) tracking parts under ``_registry/`` in the
+# state sibling, and older stores still a single ``_registry.parquet`` at
+# the store root. ``consolidate_store`` merges whatever it finds into one
+# ``_registry.parquet`` so those records are not lost; nothing writes new
+# parts any more.
 
 REGISTRY_DIR_NAME = "_registry"
 MERGED_REGISTRY_NAME = "_registry.parquet"
 LEGACY_REGISTRY_NAME = MERGED_REGISTRY_NAME
-
-
-def _zone_registry_name(zone: int, year: int) -> str:
-    return f"{_zone_group_name(zone)}_{year}.parquet"
-
-
-def _empty_tile_registry() -> "geopandas.GeoDataFrame":
-    """An empty registry frame with the canonical schema."""
-    import geopandas as gpd
-    import pandas as pd
-
-    return gpd.GeoDataFrame(
-        {
-            "year": pd.array([], dtype="int32"),
-            "zone": pd.array([], dtype="int32"),
-            "tile_lon": pd.array([], dtype="float64"),
-            "tile_lat": pd.array([], dtype="float64"),
-            "written_at": pd.array([], dtype="datetime64[ns, UTC]"),
-            "geometry": gpd.array.GeometryArray(
-                gpd.points_from_xy([], []),
-            ),
-        },
-        crs="EPSG:4326",
-    )
 
 
 def _read_parquet_at(store: StoreLocation, *parts: str):
@@ -2391,9 +2361,6 @@ def _write_parquet_at(store: StoreLocation, gdf, *parts: str) -> None:
     store.write_bytes(buf.getvalue(), *parts)
 
 
-_MERGED_UNSET = object()
-
-
 def load_merged_registry(store: StoreLocation):
     """Read the merged ingestion registry, from the state dir or an old store.
 
@@ -2404,85 +2371,6 @@ def load_merged_registry(store: StoreLocation):
         return merged
     # Stores built before the split kept it inside the Zarr hierarchy.
     return _read_parquet_at(store, LEGACY_REGISTRY_NAME)
-
-
-def _get_written_tiles(
-    store: StoreLocation,
-    year: int,
-    zone: int,
-    merged=_MERGED_UNSET,
-) -> set:
-    """Return set of (tile_lon, tile_lat) already written for a year/zone.
-
-    Reads this zone/year's own tracking file, then unions in any rows the
-    merged registry holds for the same zone/year — including one left inside
-    an older store, so those resume correctly too.
-
-    Args:
-        merged: A pre-loaded merged registry frame (or None if there isn't
-            one). It covers the whole store, so a multi-zone fill should read
-            it once and pass it in rather than re-fetching it per zone/year.
-    """
-    written: set = set()
-
-    zone_gdf = _read_parquet_at(
-        store.state, REGISTRY_DIR_NAME, _zone_registry_name(zone, year)
-    )
-    if zone_gdf is not None and not zone_gdf.empty:
-        written |= set(zip(zone_gdf["tile_lon"], zone_gdf["tile_lat"]))
-
-    if merged is _MERGED_UNSET:
-        merged = load_merged_registry(store)
-    if merged is not None and not merged.empty:
-        mask = (merged["year"] == year) & (merged["zone"] == zone)
-        subset = merged[mask]
-        written |= set(zip(subset["tile_lon"], subset["tile_lat"]))
-
-    return written
-
-
-def _record_written_tiles(
-    store: StoreLocation,
-    tile_infos: List[TileInfo],
-    year: int,
-    zone: int,
-) -> None:
-    """Append newly written tiles to this zone/year's tracking file.
-
-    Single-writer by construction: only the process filling (zone, year)
-    touches this object, so parallel zone sweeps need no locking here.
-    """
-    import geopandas as gpd
-    import pandas as pd
-    from shapely.geometry import Point
-
-    now = pd.Timestamp.now(tz="UTC")
-    rows = [
-        {
-            "year": np.int32(year),
-            "zone": np.int32(zone),
-            "tile_lon": ti.lon,
-            "tile_lat": ti.lat,
-            "written_at": now,
-            "geometry": Point(ti.lon, ti.lat),
-        }
-        for ti in tile_infos
-    ]
-    if not rows:
-        return
-
-    new_gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
-    name = _zone_registry_name(zone, year)
-    existing = _read_parquet_at(store.state, REGISTRY_DIR_NAME, name)
-
-    if existing is not None and not existing.empty:
-        combined = gpd.GeoDataFrame(
-            pd.concat([existing, new_gdf], ignore_index=True), crs="EPSG:4326"
-        ).drop_duplicates(subset=["year", "zone", "tile_lon", "tile_lat"], keep="last")
-    else:
-        combined = new_gdf
-
-    _write_parquet_at(store.state, combined, REGISTRY_DIR_NAME, name)
 
 
 def merge_tile_registry(
@@ -3118,7 +3006,6 @@ def scan_store(
     console: Optional["rich.console.Console"] = None,
     storage_options: Optional[Dict[str, Any]] = None,
     source: Optional[TileSource] = None,
-    state_url: Optional[str] = None,
     output: Optional[str] = None,
     dataset_version: str = "v1",
     landmasks_path: Optional[str] = None,
@@ -3150,7 +3037,7 @@ def scan_store(
     """
     import pandas as pd
 
-    store = StoreLocation.resolve(store_path, storage_options, state_url)
+    store = StoreLocation.resolve(store_path, storage_options)
 
     all_years = _store_years(store, zones)
     if not all_years:
@@ -5421,48 +5308,14 @@ def _require_array(parent, name: str, **kwargs):
     )
 
 
-def _await_global_store(
-    dest: "StoreLocation",
-    timeout: float = 600.0,
-    poll: float = 3.0,
-    console: Optional["rich.console.Console"] = None,
-) -> None:
-    """Block until another process has finished creating the pyramid.
-
-    Completion is judged by the ``multiscales`` attribute, which
-    :func:`_ensure_global_store` writes only after every level array exists —
-    so a waiter never starts rendering into a half-built pyramid.
-    """
-    import time
-
-    if console:
-        console.print("    Another zone is creating the pyramid; waiting...")
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            grp = dest.open_group(mode="r", path="global_rgb", zarr_format=3)
-            if "multiscales" in dict(grp.attrs):
-                return
-        except Exception:
-            pass
-        time.sleep(poll)
-    raise RuntimeError(
-        f"Timed out after {timeout:.0f}s waiting for another process to "
-        f"finish creating global_rgb in {dest}. If no other build is "
-        f"running, the group is half-created: delete the global_rgb prefix "
-        f"and start again."
-    )
-
-
 def _ensure_global_store(
     dest: "StoreLocation",
     num_levels: int,
-    console: Optional["rich.console.Console"] = None,
 ) -> None:
     """Create the global_rgb/ pyramid group within the store.
 
-    Safe to call concurrently: exactly one caller creates the structure and
-    the others wait for it (see :func:`_await_global_store`).
+    Safe to call concurrently: every creation step is idempotent, so parallel
+    callers build the identical structure and converge.
     """
     from zarr.codecs import BloscCodec
 
@@ -6201,7 +6054,7 @@ def build_global_preview(
         console.print(f"  {len(zone_infos)} zone(s) with data")
 
     # Ensure global pyramid structure exists
-    _ensure_global_store(dest, num_levels, console=console)
+    _ensure_global_store(dest, num_levels)
 
     if coarsen_only:
         # Single-writer finish for the levels where zones share chunks. The

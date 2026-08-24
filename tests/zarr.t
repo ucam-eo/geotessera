@@ -45,11 +45,6 @@ Consolidation is opt-out for a zone-restricted fill:
   --consolidate
   --no-consolidate
 
-A dead sibling job's lock can be taken over explicitly:
-
-  $ geotessera-registry zarr-fill --help | grep -o '\-\-force-lock' | sort -u
-  --force-lock
-
 Test: resume from the store itself
 -----------------------------------
 
@@ -58,11 +53,6 @@ what is already there. Rebuilding is the opt-in:
 
   $ geotessera-registry zarr-fill --help | grep -o '\-\-rewrite-existing-shards' | sort -u
   --rewrite-existing-shards
-
-The old flag stays accepted so existing scripts keep working:
-
-  $ geotessera-registry zarr-fill --help | grep -c 'now the default'
-  1
 
 Test: zarr-scan reports outstanding work
 -----------------------------------------

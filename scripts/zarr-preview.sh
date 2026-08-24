@@ -19,8 +19,8 @@
 # the old colours are skipped and the mosaic ends up half one stretch, half
 # another.
 #
-# Usage:  ./rgb.sh [YEAR]
-#         VERSION=v1.1 FROM_SAMPLE=0 ./rgb.sh 2025
+# Usage:  ./scripts/zarr-preview.sh [YEAR]
+#         VERSION=v1.1 FROM_SAMPLE=0 ./scripts/zarr-preview.sh 2025
 #
 set -euo pipefail
 

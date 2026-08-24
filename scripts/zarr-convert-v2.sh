@@ -1,15 +1,34 @@
 #!/usr/bin/env bash
 #
-# Build a Zarr store from a Tessera npy dataset on Source Cooperative.
+# Build a Zarr store from the v2 2B-L~beta1 Tessera dataset on Source
+# Cooperative.
 #
-# Defaults to v1.1/cambridge -> zarr/v1.1, but any published dataset works:
+#     npy/v2-2B-L~beta1  ->  zarr/v2-2B-L~beta1
 #
-#     ./convert.sh                       # v1.1 cambridge, years 2015-2025
-#     VERSION=v1 VARIANT=vultr YEARS=2017-2025 ./convert.sh
+#     ./scripts/zarr-convert-v2.sh                          # the whole dataset
+#     ZONE_JOBS=30 WORKERS=8 ./scripts/zarr-convert-v2.sh   # monteverde settings
+#     ZONES="30 31 32" ./scripts/zarr-convert-v2.sh         # just those zones
+#     MATRYOSHKA_DEPTHS= ./scripts/zarr-convert-v2.sh       # without nested depths
 #
-# Installs geotessera from git with uv, so the host needs only uv, curl and
-# AWS credentials. Unlike the preview build this is safe to install on every
-# run: the code comes from a pinned ref rather than files patched in by hand.
+# Same shape as zarr-convert.sh — installs geotessera from a pinned git ref with
+# uv, so the host needs only uv, curl and AWS credentials — with three v2
+# differences:
+#
+#   * The npy directory is `v2-2B-L~beta1` — version *and* variant — which is
+#     not derivable from the version, so the preflight asks the library rather
+#     than guessing.
+#   * v2 inference covers every pixel of a tile it emits, so there is no
+#     landmask: a tile that exists is data all the way to its edges. The zone
+#     grid is therefore sized from the embeddings. That is required, not an
+#     optimisation — the published landmasks/v2 is a copy of v1.1's and stops
+#     at lat -59.55, while v2 reaches -89.95, so sizing from it would place
+#     880 Antarctic tiles outside the grid.
+#   * v2 dimensions are matryoshka-ordered, so the store also carries the
+#     first 4 and first 16 dimensions as their own arrays for ~16% extra
+#     storage (docs/specs/zarr-matryoshka-depths.md). A client can then read a
+#     4-dimensional prefix without decoding all 128 bands.
+#   * The dataset is small: 207,502 tiles over 9 years, against the millions
+#     in v1.1. Expect hours rather than days.
 #
 # Zone fills are independent — each writes only its own zone group — so they
 # run in a simple pool with no ordering constraint. A fill also resumes from
@@ -22,31 +41,54 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-VERSION="${VERSION:-v1.1}"
-VARIANT="${VARIANT:-cambridge}"
-YEARS="${YEARS:-2015-2025}"
-REF="${REF:-switch-source-coop}"          # git ref of avsm/geotessera to install
+VERSION="${VERSION:-v2}"
+VARIANT="${VARIANT:-2B-L~beta1}"
+YEARS="${YEARS:-2017-2025}"
+REF="${REF:-main}"                        # git ref of ucam-eo/geotessera to install
 PROFILE="${PROFILE:-sc-writer}"           # AWS profile with write access
 
-# Dataset directory in the npy/ tree. v1.1/cambridge lives in npy/v1.1-cam/,
-# so this cannot be derived from the version alone — the preflight asks the
-# installed library rather than guessing.
-SRC="${SRC:-s3://tessera/tessera}"                                          # repo root, via gateway
-DST="${DST:-s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/$VERSION}"
+# Nested embedding depths. v2 is matryoshka-trained, so a prefix of the
+# dimensions is a usable embedding in its own right; empty disables them.
+# zarr-init refuses these for v1/v1.1, whose dimensions are not ordered.
+MATRYOSHKA_DEPTHS="${MATRYOSHKA_DEPTHS-4,16}"
 
-VENV="${VENV:-$HOME/.venvs/geotessera-$VERSION}"
-WORKDIR="${WORKDIR:-$HOME/tessera-$VERSION.build}"
+# The destination keeps the full dataset name, so v2 variants do not collide
+# in zarr/ the way they would if it were keyed by version alone.
+DATASET_TAG="${DATASET_TAG:-$VERSION-$VARIANT}"
+
+SRC="${SRC:-s3://tessera/tessera}"                                          # repo root, via gateway
+DST="${DST:-s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/$DATASET_TAG}"
+
+# Local paths drop the tilde: it is legal in a filename but invites trouble in
+# any command line that later forgets to quote it.
+SAFE_TAG="${DATASET_TAG//\~/-}"
+VENV="${VENV:-$HOME/.venvs/geotessera-$SAFE_TAG}"
+WORKDIR="${WORKDIR:-$HOME/tessera-$SAFE_TAG.build}"
 LOGDIR="${LOGDIR:-$WORKDIR/logs}"
 SPILL="${SPILL:-$WORKDIR/spill}"
 
 # Each fill worker holds a (128, 4096, 4096) int8 shard buffer plus scales —
-# ~2.2 GiB, and peak is several times that. --spill-dir memory-maps them, which
-# moves the cost to disk and off the OOM killer's radar. Size ZONE_JOBS x
-# WORKERS against RAM, not cores: this is bounded by memory, not CPU.
+# ~2.2 GiB, and peak is several times that. Nested depths add ~320 MiB (they
+# are slices of that same buffer, so no extra source reads, just the extra
+# writes). --spill-dir memory-maps the buffers, which moves the cost to disk
+# and off the OOM killer's radar. Size ZONE_JOBS x WORKERS against RAM, not
+# cores: this is bounded by memory, not CPU.
 ZONE_JOBS="${ZONE_JOBS:-8}"               # zones filled concurrently
 WORKERS="${WORKERS:-4}"                   # shard workers per zone
 
 RETRIES="${RETRIES:-3}"                   # whole-zone retries
+
+# Fill-time stretch statistics. Worth collecting for a store whose preview
+# needs a PCA over all 128 dimensions; v2's preview reads bands 0-2 of
+# embeddings_d4 directly, so they earn much less here.
+#
+# Turning them off also avoids a deadlock on resume. With statistics on, a
+# zone that already has shards in the store submits catch-up *reads* into the
+# same pool as the shard *writes*, and that mixed workload hangs: three zones
+# sat in futex_do_wait with zero CPU for hours, at exactly the point the log
+# reports "N stats catch-up read(s)". A first-pass zone has nothing to catch
+# up and never hits it, which is why it only appears on a retry.
+STRETCH_STATS="${STRETCH_STATS:-1}"
 
 # The gateway returns 429/525 under load; adaptive mode adds client-side rate
 # limiting that backs off when throttled.
@@ -72,28 +114,45 @@ mkdir -p "$WORKDIR" "$LOGDIR" "$SPILL"
 echo "==> Installing geotessera@$REF into $VENV"
 uv venv --python 3.13 "$VENV" >/dev/null
 uv pip install --python "$VENV" --quiet \
-    "geotessera[s3] @ git+https://github.com/avsm/geotessera@$REF"
+    "geotessera[s3] @ git+https://github.com/ucam-eo/geotessera@$REF"
 GT="$VENV/bin/geotessera-registry"
 [ -x "$GT" ] || fail "install produced no geotessera-registry at $GT"
 
 # Resolve the dataset directory and confirm the build carries the fixes this
 # pipeline depends on. Each of these fails silently rather than loudly, so
 # check rather than trust: an older ref would write a plausible-looking store.
-DATASET_DIR=$("$VENV/bin/python" - "$VERSION" "$VARIANT" <<'PY' || fail "preflight failed (see above)"
+DATASET_DIR=$("$VENV/bin/python" - "$VERSION" "$VARIANT" "$MATRYOSHKA_DEPTHS" <<'PY' || fail "preflight failed (see above)"
 import sys
 from geotessera.registry import dataset_path, _parse_dataset_version
-version, variant = sys.argv[1], sys.argv[2]
+version, variant, depths = sys.argv[1], sys.argv[2], sys.argv[3]
 _, norm = _parse_dataset_version(version)
 d = dataset_path(norm, variant)
 if not d:
     print(f"   {version}/{variant} is not a published dataset", file=sys.stderr)
     sys.exit(1)
-from geotessera.zarr import MAX_VALID_SCALE, _require_group  # noqa: F401
+from geotessera.zarr import MAX_VALID_SCALE, N_BANDS, _require_group  # noqa: F401
 if MAX_VALID_SCALE != 1.0:
     print(f"   MAX_VALID_SCALE is {MAX_VALID_SCALE}, expected 1.0 — this build "
           f"still admits the scales that poison the stretch statistics",
           file=sys.stderr)
     sys.exit(1)
+if N_BANDS != 128:
+    print(f"   N_BANDS is {N_BANDS}; the v2 tiles are (H, W, 128) int8",
+          file=sys.stderr)
+    sys.exit(1)
+if depths:
+    # Nested depths landed after the v1.1 conversion, so a ref that predates
+    # them would silently build a single-depth store.
+    try:
+        from geotessera.zarr import validate_matryoshka_depths
+    except ImportError:
+        print(f"   this build has no nested-depth support, so "
+              f"--matryoshka-depths {depths} would be rejected by argparse. "
+              f"Push the branch carrying it and set REF, or re-run with "
+              f"MATRYOSHKA_DEPTHS= to build a single-depth store.",
+              file=sys.stderr)
+        sys.exit(1)
+    validate_matryoshka_depths([int(p) for p in depths.split(",")], norm)
 print(d)
 PY
 )
@@ -104,9 +163,11 @@ echo "    dataset dir: npy/$DATASET_DIR   commit: $("$VENV/bin/python" -c 'impor
 # ---------------------------------------------------------------------------
 # Fetched with curl rather than left to fsspec: fsspec times out on these
 # through the gateway (FSTimeoutError after ~6 min) where curl takes seconds.
+#
+# The manifest is the only registry this pipeline needs: with no landmask
+# there is nothing else to consult.
 
-MANIFEST="$WORKDIR/manifest-$VERSION.parquet"
-LANDMASKS="$WORKDIR/landmasks-$VERSION.parquet"
+MANIFEST="$WORKDIR/manifest-$SAFE_TAG.parquet"
 BASE="https://data.source.coop/tessera/tessera"
 
 fetch() {  # url dest
@@ -117,10 +178,9 @@ fetch() {  # url dest
     mv "$2.part" "$2"
 }
 
-echo "==> Registries"
+echo "==> Manifest"
 fetch "$BASE/npy/$DATASET_DIR/manifest.parquet" "$MANIFEST"
-fetch "$BASE/landmasks/$VERSION/landmasks.parquet" "$LANDMASKS"
-REG=(--manifest-url "$MANIFEST" --landmasks-url "$LANDMASKS")
+REG=(--manifest-url "$MANIFEST")
 
 # Zones that actually carry tiles. Filling a zone with no tiles is harmless but
 # pointless, and the list makes the run's scope explicit in the log.
@@ -136,12 +196,24 @@ PY
 echo "==> $VERSION/$VARIANT  years=$YEARS  zones=$(echo "$ZONES" | wc -w)"
 echo "    source $SRC (npy/$DATASET_DIR)"
 echo "    dest   $DST"
+echo "    depths ${MATRYOSHKA_DEPTHS:-none (full 128 only)}"
+echo "    mask   none (grid sized from the embeddings)"
+echo "    stats  $([ "$STRETCH_STATS" = "1" ] && echo "collected at fill time" || echo "off (--no-stretch-stats)")"
 echo "    fill   $ZONE_JOBS zones x $WORKERS workers, spilling to $SPILL"
 echo
 
 # ---------------------------------------------------------------------------
 # 1. Store skeleton — single writer
 # ---------------------------------------------------------------------------
+
+# An explicit if, not `[ -n .. ] && arr+=(..)`: under `set -e` that idiom
+# exits the script whenever the test is false and it happens to be the last
+# command in its context. Expanded below with the ${arr[@]+..} guard, because
+# bash before 4.4 treats an empty array as unset under `set -u`.
+INIT_FLAGS=(--no-landmask)
+if [ -n "$MATRYOSHKA_DEPTHS" ]; then
+    INIT_FLAGS+=(--matryoshka-depths "$MATRYOSHKA_DEPTHS")
+fi
 
 # Cheap existence probe rather than zarr-scan, which lists every shard.
 if "$VENV/bin/python" - "$DST" "$PROFILE" <<'PY' >/dev/null 2>&1; then
@@ -152,9 +224,21 @@ so = build_storage_options(profile=sys.argv[2], region="us-west-2")
 sys.exit(0 if StoreLocation.resolve(sys.argv[1], so).exists("zarr.json", on_denied=False) else 1)
 PY
     echo "==> [1/3] Store already initialised, skipping zarr-init"
+    # Depths are fixed at init: every fill writes what the root declares, and
+    # adding one later would mean rewriting every shard. Say what the store
+    # actually has rather than what this run asked for.
+    "$VENV/bin/python" - "$DST" "$PROFILE" <<'PY' || true
+import sys
+from geotessera.zarr import StoreLocation, store_depths
+from geotessera.remote import build_storage_options
+so = build_storage_options(profile=sys.argv[2], region="us-west-2")
+d = store_depths(StoreLocation.resolve(sys.argv[1], so))
+print(f"    store declares nested depths: {', '.join(map(str, d)) if d else 'none'}")
+PY
 else
     echo "==> [1/3] Initialising store"
     "$GT" zarr-init "$SRC" --years "$YEARS" --output "$DST" \
+        ${INIT_FLAGS[@]+"${INIT_FLAGS[@]}"} \
         "${DATASET[@]}" "${REG[@]}" "${SRC_FLAGS[@]}" "${STORE_FLAGS[@]}" \
         2>&1 | tee "$LOGDIR/init.log"
 fi
@@ -163,11 +247,17 @@ fi
 # 2. Fill, one zone per process
 # ---------------------------------------------------------------------------
 
+FILL_FLAGS=()
+if [ "$STRETCH_STATS" != "1" ]; then
+    FILL_FLAGS+=(--no-stretch-stats)
+fi
+
 run_zone() {
     local z="$1" log="$LOGDIR/zone-z$1.log" attempt
     for attempt in $(seq 1 "$RETRIES"); do
         if "$GT" zarr-fill "$SRC" "$DST" --zones "$z" --workers "$WORKERS" \
                 --spill-dir "$SPILL/z$z" --no-consolidate \
+                ${FILL_FLAGS[@]+"${FILL_FLAGS[@]}"} \
                 "${DATASET[@]}" "${REG[@]}" "${SRC_FLAGS[@]}" "${STORE_FLAGS[@]}" \
                 >>"$log" 2>&1; then
             return 0
@@ -225,4 +315,6 @@ echo "==> [3/3] Consolidating metadata"
 echo
 echo "==> Done. Store at $DST"
 echo "    logs:  $LOGDIR"
+echo "    check: $GT zarr-scan $DST --dataset-version $VERSION \\"
+echo "             --dataset-variant $VARIANT ${REG[*]} ${STORE_FLAGS[*]}"
 echo "    next:  zarr-stretch then zarr-global-preview, if you want a preview pyramid"

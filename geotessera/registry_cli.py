@@ -3428,19 +3428,6 @@ def _add_source_args(parser) -> None:
     )
 
 
-def _add_state_arg(parser) -> None:
-    """Register ``--state-url`` (legacy; fills are now stateless)."""
-    parser.add_argument(
-        "--state-url",
-        type=str,
-        default=None,
-        help="Legacy build-state location from before fills became "
-        "stateless. Only zarr-consolidate still reads it (to merge old "
-        "ingestion registries); accepted elsewhere for script "
-        "compatibility and ignored.",
-    )
-
-
 def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -> None:
     """Register ``--{prefix}-*`` object-store flags on *parser*.
 
@@ -3864,7 +3851,6 @@ def zarr_init_command(args):
             model_version=model_version,
             console=console,
             storage_options=store_options,
-            state_url=args.state_url,
             stretch_sample_size=args.stretch_sample_size or STRETCH_SAMPLE_K,
             matryoshka_depths=depths,
             use_landmask=not args.no_landmask,
@@ -4070,7 +4056,6 @@ def zarr_scan_command(args):
             console=console if args.verbose else None,
             storage_options=store_options,
             source=source,
-            state_url=args.state_url,
             output=args.output,
             dataset_version=dataset_version,
             landmasks_path=args.landmasks_url,
@@ -5129,7 +5114,6 @@ Directory Structure:
     )
     _add_source_args(zarr_init_parser)
     _add_storage_args(zarr_init_parser, "source", "Tile source")
-    _add_state_arg(zarr_init_parser)
     _add_storage_args(zarr_init_parser, "store", "Output store", writable=True)
     zarr_init_parser.set_defaults(func=zarr_init_command)
 
@@ -5186,12 +5170,6 @@ Directory Structure:
         help="Never rewrite the root consolidated metadata.",
     )
     zarr_fill_parser.add_argument(
-        "--skip-existing-shards",
-        action="store_true",
-        help="Deprecated and now the default; accepted so existing scripts "
-        "keep working.",
-    )
-    zarr_fill_parser.add_argument(
         "--rewrite-existing-shards",
         action="store_true",
         help="Rebuild shards that are already in the store instead of "
@@ -5224,16 +5202,8 @@ Directory Structure:
         "anonymous memory per worker, which is what the OOM killer targets — "
         "worth it on a memory-tight box with spare disk.",
     )
-    zarr_fill_parser.add_argument(
-        "--force-lock",
-        action="store_true",
-        help="Deprecated no-op: fills no longer take locks. The store's own "
-        "shard objects are the only state, so a dead run leaves nothing to "
-        "take over.",
-    )
     _add_source_args(zarr_fill_parser)
     _add_storage_args(zarr_fill_parser, "source", "Tile source")
-    _add_state_arg(zarr_fill_parser)
     _add_storage_args(zarr_fill_parser, "store", "Output store", writable=True)
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
 
@@ -5289,7 +5259,6 @@ Directory Structure:
         help="Print progress for each zone/year as it is scanned",
     )
     _add_source_args(zarr_scan_parser)
-    _add_state_arg(zarr_scan_parser)
     _add_storage_args(zarr_scan_parser, "source", "Tile source")
     _add_storage_args(zarr_scan_parser, "store", "Store")
     zarr_scan_parser.set_defaults(func=zarr_scan_command)
@@ -5404,13 +5373,6 @@ Directory Structure:
         help="Skip re-consolidating the root metadata. Array metadata has "
         "changed, so readers need a consolidate before they see the new year.",
     )
-    zarr_extend_parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Deprecated no-op: fills no longer take locks. Do not extend "
-        "while a fill is in flight.",
-    )
-    _add_state_arg(zarr_extend_parser)
     _add_storage_args(zarr_extend_parser, "store", "Store", writable=True)
     zarr_extend_parser.set_defaults(func=zarr_extend_command)
 
@@ -5434,7 +5396,14 @@ Directory Structure:
         action="store_true",
         help="Skip merging _registry/ per-zone files into _registry.parquet",
     )
-    _add_state_arg(zarr_consolidate_parser)
+    zarr_consolidate_parser.add_argument(
+        "--state-url",
+        type=str,
+        default=None,
+        help="Where a pre-stateless build kept its per-zone ingestion "
+        "registries (default: <store>.build alongside the store). Read "
+        "only to merge them into _registry.parquet.",
+    )
     _add_storage_args(zarr_consolidate_parser, "store", "Store", writable=True)
     zarr_consolidate_parser.set_defaults(func=zarr_consolidate_command)
 

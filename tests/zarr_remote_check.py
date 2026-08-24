@@ -3,8 +3,8 @@
 Run by tests/zarr.t.  Every check works on small in-memory arrays and a
 temporary directory, using ``file://`` URLs to drive the same fsspec code
 path a remote ``s3://`` store takes — so the suite stays offline and fast
-while still covering the byte-range reader, the per-zone tracking files and
-the advisory locks.
+while still covering the byte-range reader and the legacy ingestion-registry
+merge.
 
 Prints one ``ok - <name>`` line per check and exits non-zero on the first
 failure.
@@ -26,9 +26,8 @@ from geotessera.zarr import (
     TileInfo,
     TileSource,
     UnifiedZoneGrid,
-    _get_written_tiles,
-    _record_written_tiles,
     build_shard_index,
+    load_merged_registry,
     merge_tile_registry,
     shard_coords_for_tiles,
 )
@@ -218,8 +217,12 @@ finally:
 
 
 # ---------------------------------------------------------------------------
-# Per-zone ingestion registry
+# Legacy ingestion-registry merge
 # ---------------------------------------------------------------------------
+# Fills are stateless now, but pre-stateless builds left per-(zone, year)
+# tracking parts in the state sibling, and older stores still a single
+# ``_registry.parquet`` at the store root. Consolidation must fold both into
+# the merged registry, so write what those builds wrote and check the merge.
 
 
 def tile(lon, lat, zone=31):
@@ -237,62 +240,89 @@ def tile(lon, lat, zone=31):
     )
 
 
+def write_legacy_part(store, coords, year, zone):
+    """Write a per-zone tracking part the way a pre-stateless build did."""
+    import io
+
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame(
+        [
+            {
+                "year": np.int32(year),
+                "zone": np.int32(zone),
+                "tile_lon": lon,
+                "tile_lat": lat,
+                "written_at": pd.Timestamp.now(tz="UTC"),
+                "geometry": Point(lon, lat),
+            }
+            for lon, lat in coords
+        ],
+        crs="EPSG:4326",
+    )
+    buf = io.BytesIO()
+    gdf.to_parquet(buf)
+    store.state.write_bytes(
+        buf.getvalue(), REGISTRY_DIR_NAME, f"utm{zone:02d}_{year}.parquet"
+    )
+
+
+def written(store, year, zone):
+    merged = load_merged_registry(store)
+    if merged is None or merged.empty:
+        return set()
+    sub = merged[(merged["year"] == year) & (merged["zone"] == zone)]
+    return set(zip(sub["tile_lon"], sub["tile_lat"]))
+
+
 store = StoreLocation(str(TMP / "reg_store"))
-check("registry empty before any fill", _get_written_tiles(store, 2024, 31) == set())
+check("no merged registry before consolidation", written(store, 2024, 31) == set())
 
-_record_written_tiles(store, [tile(0.05, 52.05), tile(0.15, 52.05)], 2024, 31)
-check(
-    "registry records this zone/year",
-    _get_written_tiles(store, 2024, 31) == {(0.05, 52.05), (0.15, 52.05)},
-)
-check("registry isolates other zones", _get_written_tiles(store, 2024, 30) == set())
-check("registry isolates other years", _get_written_tiles(store, 2023, 31) == set())
-
-# A second zone writes its own object — the file a sibling job owns is
-# untouched, which is what makes concurrent zone fills safe.
-_record_written_tiles(store, [tile(-0.05, 52.05, zone=30)], 2024, 30)
+write_legacy_part(store, [(0.05, 52.05), (0.15, 52.05)], 2024, 31)
+write_legacy_part(store, [(-0.05, 52.05)], 2024, 30)
 parts = sorted(Path(p).name for p in store.state.listdir(REGISTRY_DIR_NAME))
 check(
     "one registry object per zone/year",
     parts == ["utm30_2024.parquet", "utm31_2024.parquet"],
 )
 
-# Appending to a zone keeps earlier rows and dedupes repeats.
-_record_written_tiles(store, [tile(0.15, 52.05), tile(0.25, 52.05)], 2024, 31)
-check(
-    "registry append keeps and dedupes",
-    _get_written_tiles(store, 2024, 31)
-    == {(0.05, 52.05), (0.15, 52.05), (0.25, 52.05)},
-)
-
 n = merge_tile_registry(store)
-check("merge folds every zone into the root registry", n == 4)
+check("merge folds every zone into the root registry", n == 3)
 check(
     "merged registry lands in the state sibling",
     store.state.exists("_registry.parquet"),
 )
 check("nothing written into the store itself", not store.exists("_registry.parquet"))
 check("state sibling sits next to the store", store.state.url == store.url + ".build")
+check(
+    "merged registry keeps this zone/year",
+    written(store, 2024, 31) == {(0.05, 52.05), (0.15, 52.05)},
+)
+check(
+    "merged registry keeps sibling zones apart",
+    written(store, 2024, 30) == {(-0.05, 52.05)},
+)
 
 # The same merge must work through a URL location, since that is how a
 # remote store is finished after a sweep.
 url_store = StoreLocation(url(TMP / "reg_store_url"))
-for zone, tiles in [(31, [tile(0.05, 52.05)]), (30, [tile(-0.05, 52.05, zone=30)])]:
-    _record_written_tiles(url_store, tiles, 2024, zone)
+write_legacy_part(url_store, [(0.05, 52.05)], 2024, 31)
+write_legacy_part(url_store, [(-0.05, 52.05)], 2024, 30)
 check("merge over a url location", merge_tile_registry(url_store) == 2)
 check(
-    "url store resumes from its own registry",
-    _get_written_tiles(url_store, 2024, 31) == {(0.05, 52.05)},
+    "merged registry readable over a url location",
+    written(url_store, 2024, 31) == {(0.05, 52.05)},
 )
 
 # Stores built before the split kept the registry inside the hierarchy;
-# it must still be read so those resume correctly.
+# it must still be read so those records survive a merge too.
 legacy = StoreLocation(str(TMP / "legacy_store"))
 legacy.write_bytes(store.state.read_bytes("_registry.parquet"), "_registry.parquet")
 check(
-    "legacy root registry still resumes",
-    _get_written_tiles(legacy, 2024, 31)
-    == {(0.05, 52.05), (0.15, 52.05), (0.25, 52.05)},
+    "legacy root registry is still read",
+    written(legacy, 2024, 31) == {(0.05, 52.05), (0.15, 52.05)},
 )
 
 # ---------------------------------------------------------------------------

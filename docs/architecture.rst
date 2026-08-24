@@ -1243,12 +1243,12 @@ scans the store and continues from wherever the objects stop:
   but it is no longer enforced by locks: two identical concurrent fills
   write identical shards (wasted work, not corruption), and a stats
   double-fold is caught by the drift check and repaired by
-  ``--backfill-stretch-stats``. ``--force-lock`` is accepted as a no-op
-  for older scripts.
+  ``--backfill-stretch-stats``.
 * **Consolidation is skipped** by default when ``--zones`` is given, since
   the root ``zarr.json`` is the one object all jobs share.
-* ``--state-url`` is legacy: only ``zarr-consolidate`` still reads it, to
-  merge ingestion registries written by pre-stateless builds.
+* ``zarr-consolidate --state-url`` names where a pre-stateless build kept
+  its per-zone ingestion registries, so they can still be merged into
+  ``_registry.parquet``.
 
 Resuming After a Crash
 ~~~~~~~~~~~~~~~~~~~~~~
