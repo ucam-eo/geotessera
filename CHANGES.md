@@ -11,6 +11,7 @@ need no landmask.
 
 There are several new variants availabile, see `geotessera info`:
 
+```
 ╭─────────┬──────────────────────┬────────────────┬─────────────╮
 │ Version │ Variant              │ Repository dir │ Status      │
 ├─────────┼──────────────────────┼────────────────┼─────────────┤
@@ -19,6 +20,7 @@ There are several new variants availabile, see `geotessera info`:
 │ 1.1     │ dclimate             │ -              │ coming soon │
 │ 2.0     │ 2B-L~beta1 (default) │ v2-2B-L~beta1  │ available   │
 ╰─────────┴──────────────────────┴────────────────┴─────────────╯
+```
 
 ### Breaking Changes
 
