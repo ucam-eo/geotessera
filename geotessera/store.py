@@ -26,6 +26,9 @@ Usage::
     X = gt.sample_points([(-2.97, 53.44), (-2.96, 53.43)], year=2025)
     mosaic, transform, crs = gt.read_region(bbox, year=2025)  # bbox in lon/lat
 
+    # A fixed-size patch centred on a point, merged across UTM zones
+    patch, transform, crs = gt.read_patch(0.0, 52.2, year=2025, size_px=512)
+
     # Direct zone access, in that zone's UTM
     ds = gt.open_zone(lon=-2.97)
     emb = ds.tessera.sample_at(500_000.0, 5_921_000.0, year=2025)
@@ -46,6 +49,7 @@ import rasterio.transform
 import xarray as xr
 import zarr
 from pyproj import Transformer
+from rasterio.warp import Resampling, reproject
 from rich.progress import track
 
 from .registry import zarr_store_url
@@ -162,6 +166,32 @@ def _seam_neighbours(lon: float) -> List[int]:
     if frac >= 6.0 - SEAM_DEGREES:
         out.append(1 if z == 60 else z + 1)
     return out
+
+
+def _patch_crs(lon: float, lat: float) -> str:
+    """A transverse Mercator CRS with its central meridian at *lon*.
+
+    UTM's projection, centred on the patch rather than on a 6-degree zone,
+    which keeps distortion small and symmetric whatever the patch spans.
+    """
+    y0 = 0 if lat >= 0 else 10000000
+    return (
+        f"+proj=tmerc +lat_0=0 +lon_0={lon:.8f} +k=0.9996 "
+        f"+x_0=500000 +y_0={y0} +datum=WGS84 +units=m +no_defs"
+    )
+
+
+def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
+    """The contiguous run of UTM zones covering *lons*, walked the short
+    way round the ring so a patch on the antimeridian gets ``[60, 1]``."""
+    zc = _zone_for_lon(centre_lon)
+
+    def offset(z: int) -> int:
+        d = (z - zc) % 60
+        return d - 60 if d > 30 else d
+
+    offs = [offset(_zone_for_lon(lon)) for lon in lons]
+    return [(zc - 1 + o) % 60 + 1 for o in range(min(offs), max(offs) + 1)]
 
 
 def open_zone(
@@ -613,8 +643,19 @@ class GeoTesseraZarr:
         mosaic is in that zone's UTM, not in WGS84: the bbox is projected to
         pick the window, and the pixels come back on their native grid
         untouched.
+
+        A bbox crossing a zone boundary is served from the centre zone
+        alone; :meth:`read_patch` merges across zones.
         """
         z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
+        edge_zones = _zones_spanned([bbox[0], bbox[2]], (bbox[0] + bbox[2]) / 2)
+        if len(edge_zones) > 1:
+            log.warning(
+                "read_region: bbox spans UTM zones %s; reading zone %d only — "
+                "use read_patch() to merge across zones",
+                edge_zones,
+                z,
+            )
         ds = self.open_zone(zone=z)
         zone_crs = ds.tessera.crs
 
@@ -632,3 +673,203 @@ class GeoTesseraZarr:
 
         mosaic, transform = ds.tessera.read_region(utm_bbox, year, progress=progress)
         return mosaic, transform, zone_crs
+
+    # -- Patch reading (cross-zone) ------------------------------------------
+
+    def read_patch(
+        self,
+        lon: float,
+        lat: float,
+        year: int,
+        size_px: int,
+        *,
+        dst_crs: Optional[str] = None,
+        resampling: str = "nearest",
+        progress: bool = False,
+    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+        """Read a fixed-size square patch centred on a point.
+
+        Returns ``(patch, transform, crs)``.  The patch is exactly
+        ``(size_px, size_px, B)`` float32, NaN where the store holds
+        nothing; the point falls in pixel ``[size_px // 2, size_px // 2]``.
+
+        A patch within one UTM zone is sliced from that zone's grid
+        unresampled, in the zone's CRS.  A patch crossing a zone boundary
+        is merged onto a transverse Mercator grid centred on the patch,
+        relocating pixels whole with nearest-neighbour resampling; each
+        pixel comes from the zone owning its longitude, neighbours filling
+        gaps, as :meth:`sample_at` prefers.
+
+        Args:
+            lon: Patch centre longitude (WGS84).
+            lat: Patch centre latitude (WGS84).
+            year: Embedding year.
+            size_px: Patch width and height in pixels.
+            dst_crs: Output CRS, for pipelines that need every patch in
+                one CRS; forces the merge path even within one zone.
+            resampling: rasterio resampling name for the merge path.
+                Only the ``"nearest"`` default leaves vectors unblended.
+            progress: Show a progress bar while downloading.
+        """
+        if size_px <= 0:
+            raise ValueError(f"size_px must be positive, got {size_px}")
+
+        centre_ds = self.open_zone(lon=lon)
+        acc = centre_ds.tessera
+        px = acc.pixel_size
+        half = size_px * px / 2.0
+
+        ce, cn = _project(lon, lat, "EPSG:4326", acc.crs)
+        corner_lons = [
+            _project(ce + dx, cn + dy, acc.crs, "EPSG:4326")[0]
+            for dx in (-half, half)
+            for dy in (-half, half)
+        ]
+        zones = _zones_spanned(corner_lons, lon)
+
+        if dst_crs is None and len(zones) == 1:
+            return self._read_patch_native(centre_ds, ce, cn, year, size_px, progress)
+
+        target_crs = dst_crs or _patch_crs(lon, lat)
+        return self._read_patch_merged(
+            zones, target_crs, lon, lat, year, size_px, px, resampling, progress
+        )
+
+    def _read_patch_native(
+        self,
+        ds: xr.Dataset,
+        centre_e: float,
+        centre_n: float,
+        year: int,
+        size_px: int,
+        progress: bool,
+    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+        """Slice a patch straight off one zone's grid, NaN-padded at edges."""
+        acc = ds.tessera
+        px = acc.pixel_size
+
+        # Off-grid pixels get a NaN scale, which dequantise() masks.
+        near = ds.sel(x=centre_e, y=centre_n, method="nearest")
+        offsets = (np.arange(size_px) - size_px // 2) * px
+        want_x = float(near["x"]) + offsets
+        want_y = float(near["y"]) - offsets
+        sub = ds[["embeddings", "scales"]].sel(time=year).reindex(
+            x=want_x,
+            y=want_y,
+            method="nearest",
+            tolerance=0.5 * px,
+            fill_value={"embeddings": np.int8(0), "scales": np.float32("nan")},
+        )
+        if progress:
+            from dask.diagnostics import ProgressBar
+
+            with ProgressBar():
+                scales = sub["scales"].values
+                emb_int8 = sub["embeddings"].values
+        else:
+            scales = sub["scales"].values
+            emb_int8 = sub["embeddings"].values
+        out = acc.dequantise(emb_int8, scales)
+
+        transform = rasterio.transform.Affine(
+            px, 0, want_x[0] - 0.5 * px, 0, -px, want_y[0] + 0.5 * px
+        )
+        self._log_patch_coverage(out, size_px)
+        return out, transform, acc.crs
+
+    def _read_patch_merged(
+        self,
+        zones: List[int],
+        target_crs: str,
+        lon: float,
+        lat: float,
+        year: int,
+        size_px: int,
+        px: float,
+        resampling: str,
+        progress: bool,
+    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+        """Merge each zone's native pixels onto one patch-centred grid."""
+        ce, cn = _project(lon, lat, "EPSG:4326", target_crs)
+        # The point lands on the centre of pixel [size_px // 2, size_px // 2].
+        ox = ce - (size_px // 2 + 0.5) * px
+        oy = cn + (size_px // 2 + 0.5) * px
+        transform = rasterio.transform.Affine(px, 0, ox, 0, -px, oy)
+
+        # Densified outline: a straight edge curves in a zone's CRS, so
+        # corners alone under-cover mid-edge.
+        steps = np.linspace(0.0, size_px * px, 33)
+        outline = (
+            [(ox + s, oy) for s in steps]
+            + [(ox + s, oy - size_px * px) for s in steps]
+            + [(ox, oy - s) for s in steps]
+            + [(ox + size_px * px, oy - s) for s in steps]
+        )
+
+        gx, gy = np.meshgrid(
+            ox + (np.arange(size_px) + 0.5) * px,
+            oy - (np.arange(size_px) + 0.5) * px,
+        )
+        lons, _ = _transformer(target_crs, "EPSG:4326").transform(gx, gy)
+        owner = np.clip(np.floor((lons + 180.0) / 6.0).astype(int) + 1, 1, 60)
+
+        out = np.full((size_px, size_px, self.n_bands), np.nan, np.float32)
+        owned = np.zeros((size_px, size_px), dtype=bool)
+        spare = np.full_like(out, np.nan)
+        spared = np.zeros((size_px, size_px), dtype=bool)
+        for z in zones:
+            try:
+                acc = self.open_zone(zone=z).tessera
+            except KeyError as exc:
+                log.debug("read_patch: zone %d not in this store (%s)", z, exc)
+                continue
+            zone_pts = [_project(e, n, target_crs, acc.crs) for e, n in outline]
+            es = [c[0] for c in zone_pts]
+            ns = [c[1] for c in zone_pts]
+            pad = 2 * px
+            try:
+                mosaic, src_transform = acc.read_region(
+                    (min(es) - pad, min(ns) - pad, max(es) + pad, max(ns) + pad),
+                    year,
+                    progress=progress,
+                )
+            except IndexError:
+                continue  # the window misses everything this zone holds
+            if 0 in mosaic.shape[:2]:
+                continue
+            relocated = np.full((self.n_bands, size_px, size_px), np.nan, np.float32)
+            reproject(
+                source=mosaic.transpose(2, 0, 1),
+                destination=relocated,
+                src_transform=src_transform,
+                src_crs=acc.crs,
+                dst_transform=transform,
+                dst_crs=target_crs,
+                src_nodata=np.nan,
+                dst_nodata=np.nan,
+                resampling=Resampling[resampling],
+            )
+            relocated = relocated.transpose(1, 2, 0)
+            valid = np.isfinite(relocated).any(axis=2)
+            mine = valid & (owner == z)
+            out[mine] = relocated[mine]
+            owned |= mine
+            extra = valid & (owner != z) & ~spared
+            spare[extra] = relocated[extra]
+            spared |= extra
+
+        fill = ~owned & spared
+        out[fill] = spare[fill]
+        self._log_patch_coverage(out, size_px)
+        return out, transform, target_crs
+
+    @staticmethod
+    def _log_patch_coverage(patch: np.ndarray, size_px: int) -> None:
+        fraction = float(np.isfinite(patch).any(axis=2).mean())
+        if fraction < 1.0:
+            log.warning(
+                "read_patch: %.1f%% of the %dx%d patch has no coverage (NaN)",
+                (1.0 - fraction) * 100.0,
+                size_px,
+                size_px,
+            )

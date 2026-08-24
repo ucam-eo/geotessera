@@ -19,6 +19,9 @@ for point sampling and for regions you want as arrays::
     >>> # Read a bounding box — (H, W, 128) float32
     >>> mosaic, transform, crs = gt.read_region((-3.0, 53.4, -2.9, 53.5), year=2025)
 
+    >>> # Read a fixed-size patch centred on a point, whatever zones it spans
+    >>> patch, transform, crs = gt.read_patch(0.0, 52.2, year=2025, size_px=512)
+
     >>> # Tell open water apart from a gap in coverage
     >>> vec, status = gt.probe(-2.97, 53.44, year=2025)  # 'valid' | 'water' | ...
 

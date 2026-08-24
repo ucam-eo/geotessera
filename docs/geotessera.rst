@@ -83,6 +83,7 @@ Cloud-native access to Tessera embeddings via Zarr v3 format, with automatic UTM
 * :class:`~geotessera.store.GeoTesseraZarr` - Cloud-native Zarr store for streaming access without downloads
 * :meth:`~geotessera.store.GeoTesseraZarr.sample_points` - Sample embeddings at specific coordinates
 * :meth:`~geotessera.store.GeoTesseraZarr.read_region` - Read rectangular regions as mosaics
+* :meth:`~geotessera.store.GeoTesseraZarr.read_patch` - Read a fixed-size patch centred on a point, merged across UTM zones
 * :meth:`~geotessera.store.GeoTesseraZarr.open_zone` - Open UTM zone as xarray Dataset
 * :meth:`~geotessera.store.GeoTesseraZarr.probe` - Sample a point, reporting why when there is no value
 

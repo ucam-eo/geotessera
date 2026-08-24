@@ -357,6 +357,10 @@ mosaic, transform, crs = gt.read_region(
 )
 print(f"Mosaic shape: {mosaic.shape}")
 
+# Read a fixed-size patch centred on a point, whatever zones it spans
+patch, transform, crs = gt.read_patch(0.0, 52.2, year=2025, size_px=512)
+print(f"Patch shape: {patch.shape}")  # (512, 512, 128)
+
 # Work with individual UTM zones via xarray
 ds = gt.open_zone(lon=0.15)
 print(ds)
