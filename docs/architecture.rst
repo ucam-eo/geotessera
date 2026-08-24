@@ -561,6 +561,8 @@ front, rather than per call.
   embeddings at lon/lat coordinates across zones
 - **Region reading**: ``read_region()`` takes a lon/lat bbox and returns the
   mosaic on the zone's native UTM grid, with its transform and CRS
+- **Patch reading**: ``read_patch()`` returns a fixed-size square centred
+  on a point, merged across UTM zones when the patch crosses a boundary
 - **Zone access**: ``open_zone()`` returns an xarray Dataset with a
   ``.tessera`` accessor for direct manipulation
 - **Diagnostics**: ``probe()`` returns ``(embedding, status)``, the status
@@ -1090,6 +1092,8 @@ group. The store automatically routes geographic queries to the correct zone::
   embeddings at specific coordinates across zones
 - **Region reading**: ``read_region()`` for loading rectangular areas as
   mosaics with CRS and transform metadata
+- **Patch reading**: ``read_patch()`` for fixed-size squares centred on a
+  point, merged across UTM zones when needed
 - **Zone access**: ``open_zone()`` returns an xarray Dataset with a
   ``.tessera`` accessor for direct manipulation
 - **Diagnostics**: ``probe()`` returns ``(embedding, status)``, the status

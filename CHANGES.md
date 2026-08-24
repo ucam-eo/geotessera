@@ -37,6 +37,13 @@ need no landmask.
 
 ### New Features
 
+- A new `GeoTesseraZarr.read_patch(lon, lat, year, size_px)` returns a
+  `(size_px, size_px, 128)` patch centred on a point.  A patch within one
+  UTM zone is sliced from the native grid unresampled; one crossing a zone
+  boundary is merged onto a patch-centred transverse Mercator grid with
+  nearest-neighbour resampling, and `dst_crs=` pins any other output CRS.
+  `read_region` now warns when its bbox crosses a zone boundary. (@avsm @aneeshnaik)
+
 - The hosted Zarr store is available at
   `https://data.source.coop/tessera/tessera/zarr/v1`. `GeoTesseraZarr()`
   streams from it with no downloads and no configuration (@avsm)

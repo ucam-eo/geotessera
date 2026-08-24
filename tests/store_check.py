@@ -7,19 +7,26 @@ for water, ``+inf`` for never written — so the suite stays offline and fast.
 Prints one ``ok - <name>`` line per check and exits non-zero if any failed.
 """
 
+import logging
 import sys
 
 import numpy as np
 import xarray as xr
+
+# Expected warnings (NaN-padded patches) must not reach cram's output.
+logging.getLogger("geotessera.store").setLevel(logging.ERROR)
 
 from geotessera.store import (
     NODATA,
     OUTSIDE,
     VALID,
     WATER,
+    GeoTesseraZarr,
+    _patch_crs,
     _resolve_zone,
     _seam_neighbours,
     _zone_for_lon,
+    _zones_spanned,
 )
 
 FAILED = []
@@ -184,6 +191,139 @@ check(
         np.isnan(watery.tessera.sample_at(float(watery.x[2]), float(watery.y[2]), 2024))
     ),
 )
+
+# ---------------------------------------------------------------------------
+# Patch reads (read_patch)
+# ---------------------------------------------------------------------------
+
+from pyproj import Transformer  # noqa: E402  (import here keeps the header light)
+
+
+def _fake_store(zone_datasets, n_bands=4):
+    """A GeoTesseraZarr with its zone cache pre-filled — no store opened."""
+    gt = GeoTesseraZarr.__new__(GeoTesseraZarr)
+    gt.url = "fake://"
+    gt.model_version = ""
+    gt.build_version = ""
+    gt.n_bands = n_bands
+    gt.years = [2024]
+    gt._cache = dict(zone_datasets)
+    return gt
+
+
+# Zone enumeration walks the ring the short way round.
+check("a patch inside one zone spans one zone", _zones_spanned([2.0, 2.5], 2.2) == [31])
+check(
+    "a patch across a seam spans both zones",
+    _zones_spanned([-0.01, 0.01], 0.0) == [30, 31],
+)
+check(
+    "a patch across the antimeridian wraps 60 to 1",
+    _zones_spanned([179.97, -179.97], 179.99) == [60, 1],
+)
+
+# The patch-centred CRS puts its false easting on the patch itself.
+_to_patch = Transformer.from_crs("EPSG:4326", _patch_crs(0.5, 52.0), always_xy=True)
+_pe, _pn = _to_patch.transform(0.5, 52.0)
+check("the patch CRS centres its meridian on the patch", abs(_pe - 500000.0) < 1e-3)
+_to_south = Transformer.from_crs("EPSG:4326", _patch_crs(0.5, -30.0), always_xy=True)
+check(
+    "a southern patch gets the southern false northing",
+    _to_south.transform(0.5, -30.0)[1] > 5_000_000,
+)
+
+# -- Native fast path: one zone, pure slice, no resampling ------------------
+
+flat = _fake_zone(np.full((12, 12), np.float32(0.05)))
+_to_wgs = Transformer.from_crs(flat.attrs["proj:code"], "EPSG:4326", always_xy=True)
+_clon, _clat = _to_wgs.transform(float(flat.x[6]), float(flat.y[6]))
+gt_one = _fake_store({_zone_for_lon(_clon): flat})
+
+patch, transform, crs = gt_one.read_patch(_clon, _clat, 2024, 6)
+check("a one-zone patch has the exact shape asked for", patch.shape == (6, 6, 4))
+check("a one-zone patch keeps the zone's own CRS", crs == flat.attrs["proj:code"])
+check(
+    "a one-zone patch holds native values, unresampled",
+    np.allclose(patch, np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
+)
+# The transform must place the patch centre within half a pixel of the point.
+_ce, _cn = transform * (3, 3)  # centre pixel's corner
+check(
+    "the native grid lands within half a pixel of the requested centre",
+    abs(_ce + 5.0 - float(flat.x[6])) <= 5.0 and abs(_cn - 5.0 - float(flat.y[6])) <= 5.0,
+)
+
+# A patch larger than the zone's data is NaN-padded, never truncated.
+patch, transform, crs = gt_one.read_patch(_clon, _clat, 2024, 20)
+inside = np.isfinite(patch).any(axis=2)
+check("an over-size patch keeps its shape and pads with NaN", patch.shape == (20, 20, 4))
+check(
+    "the padding surrounds intact native data",
+    0 < inside.sum() == 144 and np.allclose(
+        patch[inside], np.tile(np.array([1, 2, 3, 4]) * 0.05, (144, 1)), atol=1e-6
+    ),
+)
+
+# -- Merge path: a patch straddling the utm30/utm31 seam --------------------
+
+
+def _seam_zone(epsg, west_of_seam, lat=52.0, px=10.0, h=140, w=110, shift_px=0):
+    """A fake zone whose data stops at the lon=0 seam, like real tiles do.
+
+    ``shift_px`` moves the data edge east: overhang past the seam for the
+    western zone, a gap after it for the eastern one.
+    """
+    to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+    seam_e, seam_n = to_utm.transform(0.0, lat)
+    if west_of_seam:
+        ox, width, scale = seam_e - w * px, w + shift_px, np.float32(0.05)
+    else:
+        ox, width, scale = seam_e + shift_px * px, w, np.float32(0.07)
+    oy = seam_n + h * px / 2
+    return _fake_zone(np.full((h, width), scale), epsg=epsg, px=px, ox=ox, oy=oy)
+
+
+gt_seam = _fake_store({30: _seam_zone(32630, True), 31: _seam_zone(32631, False)})
+patch, transform, crs = gt_seam.read_patch(0.0, 52.0, 2024, 64)
+
+check("a seam patch has the exact shape asked for", patch.shape == (64, 64, 4))
+check("a seam patch comes back in a patch-centred CRS", "+proj=tmerc" in crs)
+coverage = np.isfinite(patch).any(axis=2).mean()
+check("a seam patch is covered from both zones", coverage > 0.98)
+check(
+    "west of the seam the western zone's values survive relocation",
+    np.allclose(patch[32, 5], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
+)
+check(
+    "east of the seam the eastern zone's values survive relocation",
+    np.allclose(patch[32, 58], np.array([1, 2, 3, 4]) * 0.07, atol=1e-6),
+)
+# Both paths centre the requested point on pixel [size // 2, size // 2].
+_ce, _cn = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(0.0, 52.0)
+_pe, _pn = transform * (32 + 0.5, 32 + 0.5)
+check(
+    "the merged grid centres the requested point on its centre pixel",
+    abs(_pe - _ce) < 1e-6 and abs(_pn - _cn) < 1e-6,
+)
+
+# Zone 30's data overhangs 5 px past the seam; zone 31's starts 3 px after it.
+gt_overlap = _fake_store(
+    {30: _seam_zone(32630, True, shift_px=5), 31: _seam_zone(32631, False, shift_px=3)}
+)
+patch, transform, crs = gt_overlap.read_patch(0.0, 52.0, 2024, 64)
+check(
+    "a sliver the owner lacks is filled by its neighbour",
+    np.allclose(patch[32, 33], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
+)
+check(
+    "where zones overlap the owning zone wins",
+    np.allclose(patch[32, 36], np.array([1, 2, 3, 4]) * 0.07, atol=1e-6),
+)
+
+# Pinning dst_crs forces one shared grid even within a single zone.
+patch, transform, crs = gt_one.read_patch(_clon, _clat, 2024, 6, dst_crs="EPSG:3857")
+check("an explicit dst_crs is honoured", crs == "EPSG:3857" and patch.shape == (6, 6, 4))
+
 
 if FAILED:
     print(f"{len(FAILED)} check(s) failed", file=sys.stderr)
