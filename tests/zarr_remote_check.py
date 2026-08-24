@@ -1598,5 +1598,29 @@ shutil.rmtree(TMP, ignore_errors=True)
 
 if FAILED:
     print(f"\n{len(FAILED)} check(s) failed: {', '.join(FAILED)}")
-    sys.exit(1)
-print("\nall checks passed")
+    status = 1
+else:
+    print("\nall checks passed")
+    status = 0
+
+# Exit without interpreter finalisation. With the zarr/xarray/dask state this
+# suite piles up, module teardown on 3.13 sprays "Error in sys.excepthook"
+# noise after the verdict — from inside the dependencies, with every thread
+# already joined, and only when certain unrelated packages are absent. Every
+# check has run and the tempdir is gone, so nothing is left worth finalising.
+# First drop the blosc mutex numcodecs keeps at module level and collect, so
+# its semaphore unregisters, then stop the multiprocessing resource tracker
+# so a bare os._exit leaves it nothing to warn about.
+import gc  # noqa: E402
+import multiprocessing.resource_tracker as _rt  # noqa: E402
+
+from numcodecs import blosc as _blosc  # noqa: E402
+
+_blosc._MUTEX = None
+_blosc._MUTEX_IS_INIT = False
+gc.collect()
+if _rt._resource_tracker is not None:
+    _rt._resource_tracker._stop()
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(status)

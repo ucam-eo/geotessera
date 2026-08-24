@@ -25,6 +25,16 @@ need no landmask.
 - Convention metadata now comes from `zarr-cm`, replacing `geozarr-toolkit`.
   Stores stamp `spatial:`/`proj:` at revision r3 and `multiscales` at r2. (@avsm)
 
+- `sphinx` and `cram` are no longer runtime dependencies.
+  Sphinx moved to a `docs` extra (`pip install geotessera[docs]`)
+  and cram to the `dev` dependency group (@avsm)
+
+- The Zarr read API drops `crs=`. The store is UTM-native, so
+  `GeoTesseraZarr` takes lon/lat and routes to the `utm{NN}` group holding
+  the point, and the `.tessera` accessor takes eastings and northings in
+  that zone's own CRS. Project to lon/lat once up front, rather than per call.
+  (@avsm)
+
 ### New Features
 
 - The hosted Zarr store is available at
@@ -102,6 +112,14 @@ need no landmask.
   a parallel sweep. Accepts a remote store URL as well as a local path.
   (@avsm)
 
+- `open_zone(lon=...)` and `GeoTesseraZarr.open_zone(lon=...)` accept a
+  whole-number longitude. `lon=-3` previously raised `TypeError`.  (@avsm)
+
+### Performance
+
+- Point sampling no longer rebuilds a pyproj transformer for every point.
+  (@avsm)
+
 ### Bug Fixes
 
 - Out-of-range scales no longer poison the stretch statistics.  (@avsm)
@@ -149,6 +167,16 @@ need no landmask.
 - Build bookkeeping no longer lives inside the store, which now contains
   only Zarr. Anything an older build left at the store root is still read
   so existing stores resume correctly, but nothing is written back. (@avsm)
+
+### Documentation
+
+- The `geotessera` package docstring now covers `GeoTesseraZarr` alongside the
+  GeoTIFF export path; it previously described only the latter (@avsm)
+
+### Internal
+
+- The globe viewer HTML embedded in `cli.py` moved to
+  `geotessera/templates/globe.html`, shipped as package data (@avsm)
 
 ## v0.9.0 (2026-06-09)
 
