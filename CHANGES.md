@@ -9,6 +9,17 @@ while writing to a credentialed bucket. Stores gained per-zone stretch
 statistics, optional nested embedding depths, and a mode for datasets that
 need no landmask.
 
+There are several new variants availabile, see `geotessera info`:
+
+╭─────────┬──────────────────────┬────────────────┬─────────────╮
+│ Version │ Variant              │ Repository dir │ Status      │
+├─────────┼──────────────────────┼────────────────┼─────────────┤
+│ 1.0     │ vultr (default)      │ v1             │ available   │
+│ 1.1     │ cambridge (default)  │ v1.1-cam       │ available   │
+│ 1.1     │ dclimate             │ -              │ coming soon │
+│ 2.0     │ 2B-L~beta1 (default) │ v2-2B-L~beta1  │ available   │
+╰─────────┴──────────────────────┴────────────────┴─────────────╯
+
 ### Breaking Changes
 
 - All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
