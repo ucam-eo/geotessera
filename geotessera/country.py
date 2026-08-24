@@ -196,24 +196,6 @@ class CountryLookup:
         countries = self._load_countries_data()
         return sorted(countries["NAME_EN"].dropna().tolist())
 
-    def search_countries(self, query: str) -> List[str]:
-        """Fuzzy search for country names."""
-        all_countries = self.list_countries()
-        matches = difflib.get_close_matches(
-            query.lower(), [name.lower() for name in all_countries], n=10, cutoff=0.3
-        )
-
-        # Return original case versions
-        result = []
-        for match in matches:
-            for country in all_countries:
-                if country.lower() == match:
-                    result.append(country)
-                    break
-
-        return result
-
-
 # Global instance for convenience
 _country_lookup = None
 
@@ -242,18 +224,3 @@ def get_country_bbox(
     return get_country_lookup(progress_callback).get_bbox(country_name)
 
 
-def get_country_tiles(
-    country_name: str, year: int = 2024
-) -> List[Tuple[int, float, float]]:
-    """Get list of GeoTessera tile (year, tile_lon, tile_lat) tuples that intersect with country."""
-    from .core import GeoTessera
-
-    # Get country bounding box
-    country_lookup = get_country_lookup()
-    bbox = country_lookup.get_bbox(country_name)
-
-    # Use existing registry to find tiles in the bounding box
-    gt = GeoTessera()
-    tiles = gt.registry.load_blocks_for_region(bounds=bbox, year=year)
-
-    return tiles

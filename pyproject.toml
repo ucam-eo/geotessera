@@ -38,7 +38,7 @@ dependencies = [
     "dask",
     "fsspec",
     "aiohttp",
-    "geozarr-toolkit",
+    "zarr-cm>=0.4.1",
     "contextily",
 ]
 
@@ -46,6 +46,10 @@ dependencies = [
 docs = [
     "sphinx>=8.2.3",
 ]
+# s3:// locations for zarr-init/zarr-fill/zarr-consolidate. Kept optional
+# because s3fs pulls in botocore (~26 MB), which the core install
+# deliberately does not depend on — https:// reads work without it.
+s3 = ["s3fs"]
 
 [project.urls]
 Homepage = "https://github.com/ucam-eo/geotessera"

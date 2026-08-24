@@ -46,6 +46,7 @@ from .registry import (
     dataset_from_path,
     dataset_path,
     default_variant,
+    format_bytes,
     parse_grid_name,
     zarr_store_url,
 )
@@ -3371,32 +3372,447 @@ def _detect_dataset_metadata(
     return version, variant
 
 
+def _add_source_args(parser) -> None:
+    """Register the dataset-selection flags shared by zarr-init and zarr-fill."""
+    parser.add_argument(
+        "--registry-dir",
+        type=str,
+        default=None,
+        help="Local directory containing manifest.parquet / landmasks.parquet "
+        "(default: auto-detected from base_dir and parents, or pulled from a "
+        "URL base_dir)",
+    )
+    parser.add_argument(
+        "--source-npy-root",
+        type=str,
+        default=None,
+        help="Location holding {year}/grid_<lon>_<lat>/ tile directories, for "
+        "a mirror that does not use the published <root>/npy/<version> "
+        "layout",
+    )
+    parser.add_argument(
+        "--source-landmask-root",
+        type=str,
+        default=None,
+        help="Location holding grid_<lon>_<lat>.tiff landmasks, for a mirror "
+        "that does not use the published <root>/landmasks/<version> layout",
+    )
+    parser.add_argument(
+        "--manifest-url",
+        type=str,
+        default=None,
+        help="Location of the embeddings manifest, for mirrors that do not "
+        "follow the npy/<version>/manifest.parquet layout",
+    )
+    parser.add_argument(
+        "--landmasks-url",
+        type=str,
+        default=None,
+        help="Location of the landmasks registry, for mirrors that do not "
+        "follow the landmasks/<version>/landmasks.parquet layout",
+    )
+    parser.add_argument(
+        "--dataset-version",
+        type=str,
+        default=None,
+        help="Tessera dataset version (e.g. v1, v1.1). "
+        "Default: read from tessera_metadata.json in base_dir, else v1.",
+    )
+    parser.add_argument(
+        "--dataset-variant",
+        type=str,
+        default=None,
+        help="Tessera dataset variant (e.g. vultr, cambridge). "
+        "Default: read from tessera_metadata.json in base_dir, else the "
+        "version's published variant.",
+    )
+
+
+def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -> None:
+    """Register ``--{prefix}-*`` object-store flags on *parser*.
+
+    Access keys are deliberately absent: they come from the environment
+    (``AWS_ACCESS_KEY_ID``/``AWS_SECRET_ACCESS_KEY``), a named profile, or an
+    instance role, so they never appear in a process listing.
+
+    Args:
+        writable: Also offer ``--{prefix}-acl``, which only affects writes.
+    """
+    group = parser.add_argument_group(f"{label} object-store options")
+    group.add_argument(
+        f"--{prefix}-endpoint-url",
+        type=str,
+        default=None,
+        help=f"S3-compatible endpoint for the {label.lower()} "
+        f"(default: $AWS_ENDPOINT_URL, else the AWS default)",
+    )
+    group.add_argument(
+        f"--{prefix}-anon",
+        action="store_true",
+        help=f"Access the {label.lower()} anonymously (public buckets)",
+    )
+    group.add_argument(
+        f"--{prefix}-region",
+        type=str,
+        default=None,
+        help=f"Region for the {label.lower()} (default: $AWS_DEFAULT_REGION)",
+    )
+    group.add_argument(
+        f"--{prefix}-profile",
+        type=str,
+        default=None,
+        help=f"Shared-config profile for the {label.lower()} "
+        f"(default: $AWS_PROFILE)",
+    )
+    group.add_argument(
+        f"--{prefix}-requester-pays",
+        action="store_true",
+        help=f"Send requester-pays headers to the {label.lower()}",
+    )
+    group.add_argument(
+        f"--{prefix}-path-style",
+        action="store_true",
+        help=f"Address the {label.lower()} as endpoint/bucket/key rather "
+        f"than bucket.endpoint/key. Needed by most S3-compatible servers "
+        f"(MinIO, Ceph, and any endpoint without wildcard DNS).",
+    )
+    if writable:
+        from .remote import OBJECT_ACLS
+
+        group.add_argument(
+            f"--{prefix}-acl",
+            type=str,
+            default=None,
+            choices=OBJECT_ACLS,
+            metavar="ACL",
+            help=f"Canned ACL applied to every object written to the "
+            f"{label.lower()} (e.g. bucket-owner-full-control when the "
+            f"bucket belongs to another account)",
+        )
+
+
+def _object_store_errors() -> Tuple[type, ...]:
+    """Exception types worth reporting as a message rather than a traceback.
+
+    fsspec translates most S3 failures into builtin OSErrors — a 403 arrives
+    as PermissionError, a 404 as FileNotFoundError — so catching only
+    botocore's own types misses the common cases. botocore's are included for
+    the errors raised before fsspec gets a chance to translate them (bad
+    endpoint, unresolvable credentials); the tuple is short when the s3
+    extra is not installed.
+    """
+    types: Tuple[type, ...] = (PermissionError, OSError)
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        return types + (BotoCoreError, ClientError)
+    except ImportError:
+        return types
+
+
+def _report_store_error(e: Exception, console: "Console") -> int:
+    """Print an object-store or missing-backend failure and return exit 1.
+
+    Error text is escaped: it routinely contains bracketed fragments (and
+    our own ``geotessera[s3]`` hint) that Rich would otherwise eat as markup.
+    """
+    from rich.markup import escape
+
+    detail = str(e) or type(e).__name__
+    console.print(f"[red]{emoji('❌ ')}{escape(detail)}[/red]")
+
+    if isinstance(e, ImportError):
+        return 1
+
+    console.print(
+        "Check the endpoint and credentials: --source-endpoint-url / "
+        "--store-endpoint-url, --*-profile, --*-anon, or the AWS_* "
+        "environment variables."
+    )
+    if isinstance(e, PermissionError):
+        console.print(
+            "A 403 on a key that does not exist yet usually means the "
+            "credentials lack s3:ListBucket on the prefix — S3 then hides "
+            "whether the object is there rather than answering 404."
+        )
+    return 1
+
+
+def _storage_options_for(
+    args, prefix: str, location: str
+) -> Optional[Dict[str, Any]]:
+    """Build fsspec storage options from ``--{prefix}-*`` flags.
+
+    Returns None for local paths so plain filesystem access never picks up
+    stray ``AWS_*`` environment variables.
+    """
+    from .remote import build_storage_options, is_url
+
+    if not is_url(location):
+        return None
+
+    def opt(name):
+        return getattr(args, f"{prefix}_{name}", None)
+
+    return build_storage_options(
+        endpoint_url=opt("endpoint_url"),
+        anon=bool(opt("anon")),
+        region=opt("region"),
+        profile=opt("profile"),
+        requester_pays=bool(opt("requester_pays")),
+        acl=opt("acl"),
+        path_style=bool(opt("path_style")),
+    )
+
+
+def _remote_registry_cache_dir(root: str, version_path: str) -> Path:
+    """Local cache directory for registries pulled from a remote mirror.
+
+    Keyed by a digest of the source root so mirrors with different contents
+    never share a cached manifest.
+    """
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", "~")).expanduser()
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+    digest = hashlib.sha256(root.encode()).hexdigest()[:12]
+    return base / "geotessera" / "mirrors" / digest / version_path
+
+
+def _sync_remote_file(
+    loc: str,
+    dest: Path,
+    storage_options: Optional[Dict[str, Any]],
+    console: "Console",
+    optional: bool = False,
+) -> Optional[Path]:
+    """Download *loc* to *dest* unless the cached copy already matches.
+
+    Freshness is judged on the object's size and last-modified stamp, which
+    every S3-compatible endpoint reports on a HEAD — far cheaper than
+    re-pulling a multi-hundred-megabyte manifest each run.
+
+    A local path is used where it lies; only URLs are ever copied.
+    """
+    import json
+
+    from . import remote
+
+    if not remote.is_url(loc):
+        local = Path(loc)
+        if local.exists():
+            return local
+        if optional:
+            return None
+        raise FileNotFoundError(loc)
+
+    fs = remote.get_fs(loc, storage_options)
+    try:
+        info = fs.info(str(loc))
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    except Exception as e:
+        if optional:
+            console.print(f"[yellow]Could not stat {loc}: {e}[/yellow]")
+            return None
+        raise
+
+    stamp = {
+        "size": info.get("size"),
+        "mtime": str(info.get("LastModified") or info.get("mtime") or ""),
+    }
+    meta = dest.with_name(dest.name + ".meta.json")
+
+    if dest.exists() and meta.exists():
+        try:
+            if json.loads(meta.read_text()) == stamp:
+                console.print(f"[dim]Using cached {dest.name} ({loc})[/dim]")
+                return dest
+        except (OSError, ValueError):
+            pass
+
+    size_str = format_bytes(stamp["size"]) if stamp["size"] else "unknown size"
+    console.print(f"Downloading {loc} ({size_str})...")
+    remote.download(loc, dest, storage_options)
+    meta.write_text(json.dumps(stamp, default=str))
+    return dest
+
+
+def _resolve_source(args, console: "Console"):
+    """Resolve the tile source and its registry for a zarr-init/fill run.
+
+    ``args.base_dir`` is either a local mirror directory (the historical
+    behaviour) or a URL such as ``s3://bucket/prefix`` pointing at a
+    repository in the published layout.  In the remote case the manifest and
+    landmask registries are pulled from that same root — or from
+    ``--manifest-url``/``--landmasks-url`` when a mirror deviates — and
+    cached locally, so no local tile mirror is needed at all.
+
+    Returns ``(registry, source, dataset_version, dataset_variant)`` where
+    ``source`` is a :class:`~geotessera.zarr.TileSource`, or None to mean
+    "use the registry's local mirror".
+    """
+    from .registry import Registry, _parse_dataset_version
+    from .remote import is_url, join
+    from .zarr import TileSource
+
+    base_dir = args.base_dir
+
+    # A Zarr store passed where the tile source belongs otherwise fails much
+    # later, looking for a manifest inside the store and often with the wrong
+    # credentials. Say what happened instead.
+    from .remote import exists as _loc_exists
+
+    try:
+        looks_like_store = _loc_exists(
+            join(base_dir, "zarr.json"),
+            _storage_options_for(args, "source", base_dir),
+            on_denied=False,
+        )
+    except Exception:
+        looks_like_store = False
+    if looks_like_store:
+        raise ValueError(
+            f"{base_dir} looks like a Zarr store, not a tile source — it has "
+            f"a zarr.json. The tile source comes first and the store second: "
+            f"<source> <store>."
+        )
+
+    def override(loc, name, optional=False):
+        """Resolve an explicit --manifest-url / --landmasks-url, if given."""
+        if not loc:
+            return None
+        return _sync_remote_file(
+            loc,
+            _remote_registry_cache_dir(str(base_dir), "override") / name,
+            _storage_options_for(args, "source", loc),
+            console,
+            optional=optional,
+        )
+
+    if not is_url(base_dir):
+        base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
+        dataset_version, dataset_variant = _detect_dataset_metadata(
+            base_dir, args.dataset_version, args.dataset_variant
+        )
+        console.print(
+            f"[cyan]Using dataset version={dataset_version}, "
+            f"variant={dataset_variant}[/cyan]"
+        )
+        registry = Registry(
+            version=dataset_version,
+            variant=dataset_variant,
+            embeddings_dir=base_dir,
+            registry_dir=registry_dir,
+            registry_path=override(args.manifest_url, "manifest.parquet"),
+            landmasks_registry_path=override(
+                args.landmasks_url, "landmasks.parquet", optional=True
+            ),
+        )
+        return registry, None, dataset_version, dataset_variant
+
+    # Remote mirror.
+    dataset_version = args.dataset_version or "v1"
+    version_path, version_norm = _parse_dataset_version(dataset_version)
+    dataset_variant = args.dataset_variant or default_variant(version_norm)
+    storage_options = _storage_options_for(args, "source", base_dir)
+
+    # The npy/ tree is keyed by *dataset* — a (version, variant) pair — with
+    # the variant encoded as a directory suffix, so 1.1/cambridge lives in
+    # npy/v1.1-cam/. Landmasks are shared across a version's variants and stay
+    # under the plain landmasks/v1.1/. Deriving the npy path from the version
+    # alone points at a prefix that does not exist, and the failure surfaces
+    # only much later as every shard reporting "The specified key does not
+    # exist". The v1 series is the exception that hides it: its directory
+    # predates the suffix scheme, so version and dataset happen to coincide.
+    from .registry import dataset_path
+
+    dataset_dir = dataset_path(version_norm, dataset_variant) or version_path
+
+    console.print(
+        f"[cyan]Streaming tiles from {base_dir} "
+        f"(dataset=npy/{dataset_dir}, variant={dataset_variant})[/cyan]"
+    )
+
+    if args.registry_dir:
+        registry = Registry(
+            version=dataset_version,
+            variant=dataset_variant,
+            registry_dir=args.registry_dir,
+        )
+    else:
+        cache_dir = _remote_registry_cache_dir(base_dir, version_path)
+        manifest_loc = args.manifest_url or join(
+            base_dir, "npy", dataset_dir, "manifest.parquet"
+        )
+        landmasks_loc = args.landmasks_url or join(
+            base_dir, "landmasks", version_path, "landmasks.parquet"
+        )
+        manifest_path = _sync_remote_file(
+            manifest_loc,
+            cache_dir / "manifest.parquet",
+            _storage_options_for(args, "source", manifest_loc),
+            console,
+        )
+        # --no-landmask means exactly that: the 19 MB registry is not fetched,
+        # not fetched-and-ignored. Registry.available_landmasks then falls back
+        # to the embedding tiles, which is the coverage this mode wants.
+        if getattr(args, "no_landmask", False):
+            landmasks_path = None
+            console.print("[dim]No landmask: skipping the landmask registry[/dim]")
+        else:
+            landmasks_path = _sync_remote_file(
+                landmasks_loc,
+                cache_dir / "landmasks.parquet",
+                _storage_options_for(args, "source", landmasks_loc),
+                console,
+                optional=True,
+            )
+        registry = Registry(
+            version=dataset_version,
+            variant=dataset_variant,
+            registry_path=manifest_path,
+            landmasks_registry_path=landmasks_path,
+        )
+
+    if args.source_npy_root or args.source_landmask_root:
+        # A mirror that lays tiles out its own way: take the roots verbatim
+        # rather than appending the published npy/<dataset> convention.
+        default = TileSource.for_url(
+            base_dir, version_path, storage_options, dataset_dir=dataset_dir
+        )
+        source = TileSource(
+            embeddings_root=args.source_npy_root or default.embeddings_root,
+            landmasks_root=args.source_landmask_root or default.landmasks_root,
+            storage_options=storage_options,
+        )
+    else:
+        source = TileSource.for_url(
+            base_dir, version_path, storage_options, dataset_dir=dataset_dir
+        )
+    return registry, source, dataset_version, dataset_variant
+
+
 def zarr_init_command(args):
     """Create an empty tessera store with time dimension."""
     from rich.console import Console
-    from .registry import Registry
-    from .zarr import init_store
+    from .zarr import STRETCH_SAMPLE_K, init_store
 
     console = Console()
 
-    base_dir = args.base_dir
-    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
-    dataset_version, dataset_variant = _detect_dataset_metadata(
-        base_dir, args.dataset_version, args.dataset_variant
-    )
-    console.print(
-        f"[cyan]Using dataset version={dataset_version}, variant={dataset_variant}[/cyan]"
-    )
-
-    registry = Registry(
-        version=dataset_version,
-        variant=dataset_variant,
-        embeddings_dir=base_dir,
-        registry_dir=registry_dir,
-    )
+    try:
+        registry, _source, _version, _variant = _resolve_source(args, console)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     years = _parse_int_range(args.years)
-    output = Path(args.output)
+    output = args.output
+    store_options = _storage_options_for(args, "store", output)
 
     try:
         import importlib.metadata
@@ -3413,6 +3829,19 @@ def zarr_init_command(args):
         f"[cyan]geoemb:model -> https://geotessera.org/model/{model_version}[/cyan]"
     )
 
+    depths = ()
+    if args.matryoshka_depths:
+        try:
+            depths = tuple(
+                int(p) for p in args.matryoshka_depths.replace(",", " ").split()
+            )
+        except ValueError:
+            console.print(
+                f"[red]Error:[/red] --matryoshka-depths expects a comma-separated "
+                f"list of integers, got {args.matryoshka_depths!r}"
+            )
+            return 1
+
     try:
         init_store(
             registry,
@@ -3421,10 +3850,19 @@ def zarr_init_command(args):
             geotessera_version=version,
             model_version=model_version,
             console=console,
+            storage_options=store_options,
+            stretch_sample_size=args.stretch_sample_size or STRETCH_SAMPLE_K,
+            matryoshka_depths=depths,
+            use_landmask=not args.no_landmask,
         )
     except FileExistsError as e:
         console.print(f"[red]Error:[/red] {e}")
         return 1
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     return 0
 
@@ -3433,43 +3871,246 @@ def zarr_fill_command(args):
     """Incrementally fill a tessera store with tile data."""
     import warnings
     from rich.console import Console
-    from .registry import Registry
     from .zarr import fill_store
 
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
 
-    base_dir = args.base_dir
-    base_dir, registry_dir = _find_registry(base_dir, args.registry_dir)
-    dataset_version, dataset_variant = _detect_dataset_metadata(
-        base_dir, args.dataset_version, args.dataset_variant
-    )
-    console.print(
-        f"[cyan]Using dataset version={dataset_version}, variant={dataset_variant}[/cyan]"
-    )
+    # Backfill mode scans the store itself — no tile source, no manifest.
+    # Accept the store as the only positional (argparse binds it to base_dir
+    # when store_path is absent).
+    if args.backfill_stretch_stats:
+        from .zarr import backfill_stretch_stats
 
-    registry = Registry(
-        version=dataset_version,
-        variant=dataset_variant,
-        embeddings_dir=base_dir,
-        registry_dir=registry_dir,
-    )
+        store_path = args.store_path or args.base_dir
+        if store_path is None:
+            console.print(f"[red]{emoji('❌ ')}No store given.[/red]")
+            return 1
+        store_options = _storage_options_for(args, "store", store_path)
+        zones = _parse_int_range(args.zones) if args.zones else None
+        years = [args.year] if args.year else None
+        try:
+            n = backfill_stretch_stats(
+                store_path,
+                zones=zones,
+                years=years,
+                console=console,
+                storage_options=store_options,
+            )
+        except (ValueError, RuntimeError) as e:
+            console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+            return 1
+        except (ImportError, *_object_store_errors()) as e:
+            return _report_store_error(e, console)
+        console.print(
+            f"{emoji('✅ ')}{n} (zone, year) statistics rebuilt. "
+            f"Run zarr-consolidate to publish them."
+        )
+        return 0
 
-    store_path = Path(args.store_path)
+    if args.store_path is None:
+        console.print(
+            f"[red]{emoji('❌ ')}Usage: zarr-fill <source> <store> "
+            f"(the store-only form is for --backfill-stretch-stats).[/red]"
+        )
+        return 1
+
+    try:
+        registry, source, _version, _variant = _resolve_source(args, console)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    store_path = args.store_path
+    store_options = _storage_options_for(args, "store", store_path)
     year = args.year
     zones = _parse_int_range(args.zones) if args.zones else None
 
-    n = fill_store(
-        registry,
-        store_path,
-        year=year,
-        zones=zones,
-        console=console,
-        workers=args.workers,
-    )
+    consolidate = None
+    if args.consolidate:
+        consolidate = True
+    elif args.no_consolidate:
+        consolidate = False
+
+    try:
+        n = fill_store(
+            registry,
+            store_path,
+            year=year,
+            zones=zones,
+            console=console,
+            workers=args.workers,
+            storage_options=store_options,
+            source=source,
+            consolidate=consolidate,
+            skip_existing_shards=not args.rewrite_existing_shards,
+            spill_dir=args.spill_dir,
+            collect_stretch_stats=not args.no_stretch_stats,
+        )
+    except RuntimeError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     console.print(f"\n{emoji('✅ ')}{n} shards written")
+    return 0
+
+
+def zarr_verify_command(args):
+    """Check a store's contents against the source tiles it was built from."""
+    import warnings
+    from rich.console import Console
+
+    from .zarr import summarise_verify, verify_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+
+    try:
+        registry, source, _version, _variant = _resolve_source(args, console)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    if source is None:
+        console.print(
+            "[red]Error:[/red] verification reads the source tiles, so a tile "
+            "source is required"
+        )
+        return 1
+
+    try:
+        df, tally = verify_store(
+            registry,
+            args.store_path,
+            source=source,
+            samples=args.samples,
+            window=args.window,
+            years=_parse_int_range(args.years) if args.years else None,
+            zones=_parse_int_range(args.zones) if args.zones else None,
+            workers=args.workers,
+            seed=args.seed,
+            storage_options=_storage_options_for(args, "store", args.store_path),
+            console=console if args.verbose else None,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    mismatches = summarise_verify(df, tally, console)
+
+    if args.output:
+        df.to_parquet(args.output, index=False)
+        console.print(f"  per-sample results written to {args.output}")
+
+    # Non-zero on disagreement, so this can gate a publish.
+    return 1 if mismatches else 0
+
+
+def zarr_scan_command(args):
+    """Report how much of a store still needs filling."""
+    import warnings
+    from rich.console import Console
+
+    from .zarr import scan_store, summarise_scan
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+
+    # The manifest is optional: land coverage alone says which shards can
+    # ever hold data, and that comes from the much smaller landmask registry.
+    if args.base_dir:
+        try:
+            registry, source, dataset_version, _variant = _resolve_source(
+                args, console
+            )
+        except ValueError as e:
+            console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+            return 1
+        except (ImportError, *_object_store_errors()) as e:
+            return _report_store_error(e, console)
+    else:
+        registry, source = None, None
+        dataset_version = args.dataset_version or "v1"
+
+    store_options = _storage_options_for(args, "store", args.store_path)
+    years = _parse_int_range(args.years) if args.years else None
+    zones = _parse_int_range(args.zones) if args.zones else None
+
+    try:
+        df = scan_store(
+            registry,
+            args.store_path,
+            years=years,
+            zones=zones,
+            console=console if args.verbose else None,
+            storage_options=store_options,
+            source=source,
+            output=args.output,
+            dataset_version=dataset_version,
+            landmasks_path=args.landmasks_url,
+        )
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    summarise_scan(df, console)
+    return 0
+
+
+def zarr_extend_command(args):
+    """Append new years to an existing store's time axis."""
+    import warnings
+    from rich.console import Console
+
+    from .zarr import extend_store
+
+    warnings.filterwarnings("ignore", message="Object at .* is not recognized")
+
+    console = Console()
+    store_options = _storage_options_for(args, "store", args.store_path)
+    years = _parse_int_range(args.years)
+    zones = _parse_int_range(args.zones) if args.zones else None
+
+    try:
+        n = extend_store(
+            args.store_path,
+            years,
+            console=console,
+            storage_options=store_options,
+            zones=zones,
+            consolidate=not args.no_consolidate,
+        )
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    if n == 0:
+        console.print(
+            f"{emoji('✅ ')}Nothing to do — every zone already has "
+            f"{', '.join(str(y) for y in years)}"
+        )
+        return 0
+
+    console.print(
+        f"{emoji('✅ ')}{n} zone(s) extended. "
+        f"Fill them with: geotessera-registry zarr-fill <source> "
+        f"{args.store_path} --year {years[0]} --zones <n>"
+    )
     return 0
 
 
@@ -3480,20 +4121,42 @@ def zarr_consolidate_command(args):
     from .zarr import consolidate_store
 
     console = Console()
+    store_options = _storage_options_for(args, "store", args.store_path)
     try:
-        n = consolidate_store(args.store_path, console=console)
+        n = consolidate_store(
+            args.store_path,
+            console=console,
+            storage_options=store_options,
+            merge_registry=not args.no_merge_registry,
+            state_url=args.state_url,
+        )
     except FileNotFoundError as e:
         console.print(f"[red]{emoji('❌ ')}Error: {e}[/red]")
-        raise SystemExit(1)
-    except ImportError as e:
-        console.print(
-            f"[red]{emoji('❌ ')}Error: {e} "
-            f"(remote store URLs need the matching fsspec backend, "
-            f"e.g. s3fs for s3://)[/red]"
-        )
-        raise SystemExit(1)
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
     console.print(f"{emoji('✅ ')}Consolidated metadata for {n} nodes")
     return 0
+
+
+def _require_local_store(store_path: str, command: str, console: "Console") -> bool:
+    """Reject a URL store for the commands that still need a local path.
+
+    Without this the URL is silently mangled by ``Path()`` into something
+    like ``s3:/bucket/store`` and fails much later with a confusing error.
+    """
+    from .remote import is_url
+
+    if not is_url(store_path):
+        return True
+    console.print(
+        f"[red]{emoji('❌ ')}{command} needs a local store path; "
+        f"got {store_path}.[/red]\n"
+        f"Only the legacy shard-sampling path is local-only — the default "
+        f"stats-based stretch and zarr-global-preview --output both work "
+        f"against remote stores."
+    )
+    return False
 
 
 def zarr_global_preview_command(args):
@@ -3505,20 +4168,43 @@ def zarr_global_preview_command(args):
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
-    store_path = Path(args.store_path)
-    zones = _parse_int_range(args.zones) if args.zones else None
 
-    build_global_preview(
-        store_path=store_path,
-        year=args.year,
-        zones=zones,
-        num_levels=args.levels,
-        workers=args.workers,
-        gamma=args.gamma,
-        saturation=args.saturation,
-        console=console,
-        force=args.force,
+    zones = _parse_int_range(args.zones) if args.zones else None
+    store_options = _storage_options_for(args, "store", args.store_path)
+    output_options = (
+        _storage_options_for(args, "output", args.output) if args.output else None
     )
+
+    try:
+        build_global_preview(
+            store_path=args.store_path,
+            year=args.year,
+            zones=zones,
+            num_levels=args.levels,
+            workers=args.workers,
+            gamma=args.gamma,
+            saturation=args.saturation,
+            console=console,
+            force=args.force,
+            storage_options=store_options,
+            output_path=args.output,
+            output_storage_options=output_options,
+            state_url=args.state_url,
+            state_storage_options=(
+                _storage_options_for(args, "state", args.state_url)
+                if args.state_url
+                else None
+            ),
+            reproject_only=args.reproject_only,
+            coarsen_only=args.coarsen_only,
+            blend_zone_stretch=args.blend_zone_stretch,
+            manifest_path=args.manifest_url,
+        )
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     return 0
 
@@ -3527,31 +4213,87 @@ def zarr_stretch_command(args):
     """Compute a global cross-zone RGB stretch and persist it to the store."""
     import warnings
     from rich.console import Console
-    from .zarr import compute_global_stretch
 
     warnings.filterwarnings("ignore", message="Object at .* is not recognized")
 
     console = Console()
-    store_path = Path(args.store_path)
     zones = _parse_int_range(args.zones) if args.zones else None
 
-    compute_global_stretch(
-        store_path=store_path,
-        year=args.year,
-        target_samples=args.target_samples,
-        max_shards=args.max_shards,
-        p_low=args.p_low,
-        p_high=args.p_high,
-        workers=args.workers,
-        zones=zones,
-        equalise=not args.no_equalise,
-        equalise_breakpoints=args.breakpoints,
-        mode=args.mode,
-        pca_components=args.pca_components,
-        pca_total_bands=args.pca_total_bands,
-        pca_rgb_order=args.pca_rgb_order,
-        console=console,
-    )
+    if args.from_shards:
+        # Legacy shard-sampling path: re-reads embeddings, local stores only.
+        from .zarr import compute_global_stretch
+
+        if not _require_local_store(args.store_path, "zarr-stretch", console):
+            return 1
+        compute_global_stretch(
+            store_path=Path(args.store_path),
+            year=args.year,
+            target_samples=args.target_samples,
+            max_shards=args.max_shards,
+            p_low=args.p_low,
+            p_high=args.p_high,
+            workers=args.workers,
+            zones=zones,
+            equalise=not args.no_equalise,
+            equalise_breakpoints=args.breakpoints,
+            mode=args.mode,
+            pca_components=args.pca_components,
+            pca_total_bands=args.pca_total_bands,
+            pca_rgb_order=args.pca_rgb_order,
+            console=console,
+        )
+        return 0
+
+    if args.per_zone:
+        # One stretch per zone, for a preview that blends them across zone
+        # boundaries instead of flattening every region into one mapping.
+        from .zarr import compute_zone_stretches
+
+        compute_zone_stretches(
+            args.store_path,
+            year=args.year,
+            zones=zones,
+            console=console,
+            storage_options=_storage_options_for(args, "store", args.store_path),
+            p_low=args.p_low,
+            p_high=args.p_high,
+            equalise=not args.no_equalise,
+            equalise_breakpoints=args.breakpoints,
+            mode=args.mode,
+            from_sample=args.from_sample,
+            allow_drift=args.allow_drift,
+            sample_store=args.sample_store,
+        )
+        return 0
+
+    # Fast path: aggregate the per-zone statistics collected at fill time.
+    # A few MiB of reads; works against local and remote stores alike.
+    from .zarr import compute_stretch_from_stats
+
+    store_options = _storage_options_for(args, "store", args.store_path)
+    try:
+        compute_stretch_from_stats(
+            args.store_path,
+            year=args.year,
+            zones=zones,
+            p_low=args.p_low,
+            p_high=args.p_high,
+            equalise=not args.no_equalise,
+            equalise_breakpoints=args.breakpoints,
+            mode=args.mode,
+            pca_components=args.pca_components,
+            pca_rgb_order=args.pca_rgb_order,
+            drift_threshold=args.drift_threshold,
+            console=console,
+            storage_options=store_options,
+            from_sample=args.from_sample,
+            allow_drift=args.allow_drift,
+        )
+    except (ValueError, RuntimeError) as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
 
     return 0
 
@@ -4006,6 +4748,12 @@ def main():
         else [logging.StreamHandler()],
     )
 
+    # The object-store libraries log at INFO on every client build; left on,
+    # they interleave with the progress bars during a fill.
+    from .remote import quieten_dependency_logging
+
+    quieten_dependency_logging()
+
     parser = argparse.ArgumentParser(
         description="GeoTessera Registry Management Tool - Generate and maintain Pooch registry files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4320,7 +5068,8 @@ Directory Structure:
     )
     zarr_init_parser.add_argument(
         "base_dir",
-        help="Base directory containing downloaded tile data",
+        help="Base directory containing downloaded tile data, or a URL of a "
+        "repository in the published layout (e.g. s3://bucket/tessera)",
     )
     zarr_init_parser.add_argument(
         "--years",
@@ -4331,45 +5080,64 @@ Directory Structure:
         "--output",
         required=True,
         type=str,
-        help="Output store path (e.g. tessera.zarr)",
+        help="Output store path or URL (e.g. tessera.zarr, "
+        "s3://bucket/tessera.zarr)",
     )
     zarr_init_parser.add_argument(
-        "--registry-dir",
-        type=str,
+        "--stretch-sample-size",
+        type=int,
         default=None,
-        help="Directory containing manifest.parquet / landmasks.parquet "
-        "(default: auto-detected from base_dir and parents)",
+        help="Per-(zone, year) capacity of the raw pixel sample kept for the "
+        "global stretch quantiles (default: 20000)",
     )
     zarr_init_parser.add_argument(
-        "--dataset-version",
-        type=str,
-        default=None,
-        help="Tessera dataset version (e.g. v1, v1.1). "
-        "Default: read from tessera_metadata.json in base_dir, else v1.",
+        "--no-landmask",
+        action="store_true",
+        help="Treat every pixel of a present tile as data and never read a "
+        "landmask. For datasets whose inference covers the whole tile (v2 "
+        "onwards). The zone grid is then sized from the embeddings, which is "
+        "required rather than an optimisation: a landmask stopping short of "
+        "the embeddings places tiles outside the grid. Recorded in the store, "
+        "so fills follow it.",
     )
     zarr_init_parser.add_argument(
-        "--dataset-variant",
+        "--matryoshka-depths",
         type=str,
         default=None,
-        help="Tessera dataset variant (e.g. vultr, cambridge). "
-        "Default: read from tessera_metadata.json in base_dir, else the "
-        "version's published variant.",
+        metavar="N,M",
+        help="Also store the first N (and M, ...) dimensions of every "
+        "embedding as their own arrays, so a client can read a prefix "
+        "without decoding all 128 bands (e.g. 4,16). Requires "
+        "matryoshka-ordered dimensions, so v2 datasets and later only. "
+        "Costs (N+M)/128 extra storage; see "
+        "docs/specs/zarr-matryoshka-depths.md",
     )
+    _add_source_args(zarr_init_parser)
+    _add_storage_args(zarr_init_parser, "source", "Tile source")
+    _add_storage_args(zarr_init_parser, "store", "Output store", writable=True)
     zarr_init_parser.set_defaults(func=zarr_init_command)
 
     # Zarr-fill command
     zarr_fill_parser = subparsers.add_parser(
         "zarr-fill",
         help="Incrementally fill a tessera store with tile data",
+        description="Fill a tessera store, optionally streaming tiles from a "
+        "remote bucket into a store on another. Restricting a run to one UTM "
+        "zone with --zones makes it safe to run many fills concurrently "
+        "against the same store: each zone owns its own group, tracking file "
+        "and lock. Run zarr-consolidate once after the sweep.",
     )
     zarr_fill_parser.add_argument(
         "base_dir",
-        help="Base directory containing downloaded tile data",
+        help="Base directory containing downloaded tile data, or a URL of a "
+        "repository in the published layout (e.g. s3://bucket/tessera)",
     )
     zarr_fill_parser.add_argument(
         "store_path",
         type=str,
-        help="Path to existing tessera store",
+        nargs="?",
+        default=None,
+        help="Path or URL of an existing tessera store",
     )
     zarr_fill_parser.add_argument(
         "--year",
@@ -4380,7 +5148,8 @@ Directory Structure:
     zarr_fill_parser.add_argument(
         "--zones",
         default=None,
-        help="Zone numbers to fill (e.g. 29-34). Default: all initialised zones",
+        help="Zone numbers to fill (e.g. 30 or 29-34). "
+        "Default: all initialised zones",
     )
     zarr_fill_parser.add_argument(
         "--workers",
@@ -4389,33 +5158,232 @@ Directory Structure:
         help="Number of parallel workers (default: 4)",
     )
     zarr_fill_parser.add_argument(
-        "--registry-dir",
-        type=str,
-        default=None,
-        help="Directory containing manifest.parquet / landmasks.parquet "
-        "(default: auto-detected from base_dir and parents)",
+        "--consolidate",
+        action="store_true",
+        help="Rewrite the root consolidated metadata when done. Unsafe while "
+        "sibling zone fills are running. Default: on for a whole-store fill, "
+        "off when --zones is given.",
     )
     zarr_fill_parser.add_argument(
-        "--dataset-version",
-        type=str,
-        default=None,
-        help="Tessera dataset version (e.g. v1, v1.1). "
-        "Default: read from tessera_metadata.json in base_dir, else v1.",
+        "--no-consolidate",
+        action="store_true",
+        help="Never rewrite the root consolidated metadata.",
     )
     zarr_fill_parser.add_argument(
-        "--dataset-variant",
+        "--rewrite-existing-shards",
+        action="store_true",
+        help="Rebuild shards that are already in the store instead of "
+        "skipping them. Needed only when the tile inventory has grown, since "
+        "a newly-added tile falls inside an existing shard.",
+    )
+    zarr_fill_parser.add_argument(
+        "--no-stretch-stats",
+        action="store_true",
+        help="Skip folding stretch statistics into the zone group as shards "
+        "are written (escape hatch; the global stretch then needs a backfill "
+        "or the legacy shard-sampling path)",
+    )
+    zarr_fill_parser.add_argument(
+        "--backfill-stretch-stats",
+        action="store_true",
+        help="Rebuild the selected zones' stretch statistics by scanning "
+        "their existing shards, instead of ingesting tiles. The repair path "
+        "for stores filled before fill-time collection existed, interrupted "
+        "fills, and suspected double-counting. With this flag the tile "
+        "source is not read; `zarr-fill <store> --backfill-stretch-stats` "
+        "works with the store as the only positional.",
+    )
+    zarr_fill_parser.add_argument(
+        "--spill-dir",
         type=str,
         default=None,
-        help="Tessera dataset variant (e.g. vultr, cambridge). "
-        "Default: read from tessera_metadata.json in base_dir, else the "
-        "version's published variant.",
+        help="Memory-map each worker's shard buffers under this directory "
+        "instead of holding them in RAM. Trades disk for roughly 2 GiB of "
+        "anonymous memory per worker, which is what the OOM killer targets — "
+        "worth it on a memory-tight box with spare disk.",
     )
+    _add_source_args(zarr_fill_parser)
+    _add_storage_args(zarr_fill_parser, "source", "Tile source")
+    _add_storage_args(zarr_fill_parser, "store", "Output store", writable=True)
     zarr_fill_parser.set_defaults(func=zarr_fill_command)
+
+    # Zarr-scan command
+    zarr_scan_parser = subparsers.add_parser(
+        "zarr-scan",
+        help="Report how much of a store still needs filling",
+        description="Inventory a store's shards against the manifest without "
+        "writing anything. Each shard is classified written, missing, or "
+        "empty (no manifest tiles fall in it — ocean or outside coverage), "
+        "so the percentages are over land rather than over the zone's "
+        "bounding box. Prints per-zone/year and per-year summaries and can "
+        "write the full index as parquet.",
+    )
+    # Same positional order as zarr-init/zarr-fill — source first, store
+    # second — with the source optional. argparse binds a lone argument to
+    # store_path, so `zarr-scan <store>` and `zarr-scan <mirror> <store>`
+    # both do the obvious thing.
+    zarr_scan_parser.add_argument(
+        "base_dir",
+        nargs="?",
+        default=None,
+        help="Optional tile mirror or repository URL. Without it, land "
+        "coverage comes from the landmask registry, which is all that is "
+        "needed and far smaller than the manifest. Give it to measure "
+        "against each year's actual embedding coverage instead.",
+    )
+    zarr_scan_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of an existing tessera store",
+    )
+    zarr_scan_parser.add_argument(
+        "--years",
+        default=None,
+        help="Years to scan (e.g. 2024 or 2017-2025). Default: every year "
+        "on the store's time axis",
+    )
+    zarr_scan_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Zones to scan (e.g. 30 or 29-34). Default: every zone",
+    )
+    zarr_scan_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Write the per-shard index here as parquet (path or URL)",
+    )
+    zarr_scan_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress for each zone/year as it is scanned",
+    )
+    _add_source_args(zarr_scan_parser)
+    _add_storage_args(zarr_scan_parser, "source", "Tile source")
+    _add_storage_args(zarr_scan_parser, "store", "Store")
+    zarr_scan_parser.set_defaults(func=zarr_scan_command)
+
+    # Zarr-verify command
+    zarr_verify_parser = subparsers.add_parser(
+        "zarr-verify",
+        help="Check a store's contents against the source tiles",
+        description="Sample random (year, tile) pairs, read a small pixel "
+        "block from each source .npy pair and the same ground position from "
+        "the store, and compare them. Verifies that embeddings round-trip "
+        "exactly, that scales match, and that every nested-depth array is a "
+        "true prefix of the full one. Blocks are taken from the middle of a "
+        "tile, not its edge, so the known reprojection seams at tile corners "
+        "do not mask the thing under test. This checks that what was written "
+        "is correct, not that everything was written — use zarr-scan for "
+        "coverage. Exits non-zero if any sample disagrees.",
+    )
+    zarr_verify_parser.add_argument(
+        "base_dir",
+        type=str,
+        help="Tile source: local mirror or repository root URL",
+    )
+    zarr_verify_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of the store to verify",
+    )
+    zarr_verify_parser.add_argument(
+        "--samples",
+        type=int,
+        default=1000,
+        help="How many (year, tile) pairs to check (default: 1000)",
+    )
+    zarr_verify_parser.add_argument(
+        "--window",
+        type=int,
+        default=6,
+        help="Pixels per side of the block compared at each sample "
+        "(default: 6, so 36 pixels x every band)",
+    )
+    zarr_verify_parser.add_argument(
+        "--years",
+        default=None,
+        help="Years to sample from (e.g. 2024 or 2017-2025). Default: all",
+    )
+    zarr_verify_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Zones to sample from (e.g. 30 or 29-34). Default: all. Restrict "
+        "this to the zones a fill has finished, since an unfinished one "
+        "reports its unwritten shards rather than a mismatch",
+    )
+    zarr_verify_parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Concurrent samples (threads, I/O bound; default: 16)",
+    )
+    zarr_verify_parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed, so a run is reproducible (default: 0)",
+    )
+    zarr_verify_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Write the per-sample results here as parquet",
+    )
+    zarr_verify_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress as samples are checked",
+    )
+    _add_source_args(zarr_verify_parser)
+    _add_storage_args(zarr_verify_parser, "source", "Tile source")
+    _add_storage_args(zarr_verify_parser, "store", "Store")
+    zarr_verify_parser.set_defaults(func=zarr_verify_command)
+
+    # Zarr-extend command
+    zarr_extend_parser = subparsers.add_parser(
+        "zarr-extend",
+        help="Append new years to an existing store's time axis",
+        description="Grow a store's time dimension so a new year can be "
+        "filled. The time axis is chunked one year per chunk, so this is a "
+        "metadata-only edit: existing data is never rewritten. Years may "
+        "only be appended to the end. Run it with no fills in flight, then "
+        "zarr-fill the new year.",
+    )
+    zarr_extend_parser.add_argument(
+        "store_path",
+        type=str,
+        help="Path or URL of an existing tessera store",
+    )
+    zarr_extend_parser.add_argument(
+        "--years",
+        required=True,
+        help="Year(s) to append (e.g. 2026 or 2026-2027)",
+    )
+    zarr_extend_parser.add_argument(
+        "--zones",
+        default=None,
+        help="Restrict to these zones (e.g. 29-34). Default: every zone. "
+        "Leaving zones behind makes the store's time axes disagree, so only "
+        "use this to finish an interrupted run.",
+    )
+    zarr_extend_parser.add_argument(
+        "--no-consolidate",
+        action="store_true",
+        help="Skip re-consolidating the root metadata. Array metadata has "
+        "changed, so readers need a consolidate before they see the new year.",
+    )
+    _add_storage_args(zarr_extend_parser, "store", "Store", writable=True)
+    zarr_extend_parser.set_defaults(func=zarr_extend_command)
 
     # Zarr-consolidate command
     zarr_consolidate_parser = subparsers.add_parser(
         "zarr-consolidate",
         help="Re-consolidate store metadata after in-place changes",
+        description="Rewrite a store's root consolidated metadata and merge "
+        "the per-zone ingestion registries. This is the single-writer step "
+        "that finishes a parallel zone sweep — run it once, with no fills in "
+        "flight.",
     )
     zarr_consolidate_parser.add_argument(
         "store_path",
@@ -4423,6 +5391,20 @@ Directory Structure:
         help="Path or URL of an existing tessera store "
         "(e.g. tessera.zarr or s3://bucket/store.zarr)",
     )
+    zarr_consolidate_parser.add_argument(
+        "--no-merge-registry",
+        action="store_true",
+        help="Skip merging _registry/ per-zone files into _registry.parquet",
+    )
+    zarr_consolidate_parser.add_argument(
+        "--state-url",
+        type=str,
+        default=None,
+        help="Where a pre-stateless build kept its per-zone ingestion "
+        "registries (default: <store>.build alongside the store). Read "
+        "only to merge them into _registry.parquet.",
+    )
+    _add_storage_args(zarr_consolidate_parser, "store", "Store", writable=True)
     zarr_consolidate_parser.set_defaults(func=zarr_consolidate_command)
 
     # Zarr-global-preview command
@@ -4480,6 +5462,64 @@ Directory Structure:
         "Try 1.5–2.5 if colours look washed out. Beyond ~3 most pixels "
         "start clipping at the colour-cube edges.",
     )
+    zarr_gp_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Path or URL of the store to hold the pyramid, with its own "
+        "--output-* credentials. Embeddings stream from the source store "
+        "read-only (sub-shard byte ranges, no copy), so this can write to a "
+        "bucket while reading from a read-only mirror. Default: write the "
+        "pyramid into the source store itself.",
+    )
+    zarr_gp_parser.add_argument(
+        "--reproject-only",
+        action="store_true",
+        help="Render this zone's level 0 and coarsen only as far as the "
+        "depth where zones stay disjoint. Safe to run concurrently across "
+        "zones that share no level-0 chunks — an odd-numbered round then an "
+        "even-numbered one covers all 60. Finish with --coarsen-only.",
+    )
+    zarr_gp_parser.add_argument(
+        "--coarsen-only",
+        action="store_true",
+        help="Build the remaining coarse levels in one global pass, without "
+        "reprojecting. Single-writer: run once after every zone's "
+        "--reproject-only has finished.",
+    )
+    zarr_gp_parser.add_argument(
+        "--state-url",
+        type=str,
+        default=None,
+        help="Where per-zone resume markers live (default: <output>.build, "
+        "alongside the pyramid). Point it at a local directory to keep "
+        "build bookkeeping out of a published bucket.",
+    )
+    _add_storage_args(zarr_gp_parser, "store", "Store")
+    _add_storage_args(zarr_gp_parser, "output", "Pyramid output", writable=True)
+    _add_storage_args(zarr_gp_parser, "state", "Build state", writable=True)
+    zarr_gp_parser.add_argument(
+        "--blend-zone-stretch",
+        action="store_true",
+        help="Colour each chunk with a blend of its zone's stretch and its "
+        "neighbour's, weighted by longitude. Needs `zarr-stretch --per-zone` "
+        "to have run. Both sides of a zone boundary evaluate to the same "
+        "mixture, so no seam appears. Changes every rendered pixel, so discard "
+        "existing preview markers before re-running.",
+    )
+    zarr_gp_parser.add_argument(
+        "--manifest-url",
+        type=str,
+        default=None,
+        help="Tile manifest (parquet). Narrows each zone's work list from the "
+        "chunks its shards touch to the chunks a tile can actually reach. A "
+        "shard is 4096 pixels against a tile's 0.1 degrees, so on a sparse "
+        "dataset most of a shard's footprint holds nothing: measured over "
+        "seven v2 zones, 78.6%% of chunks derived from shards can never "
+        "receive a pixel, and each still costs a scales read.",
+    )
+
+
     zarr_gp_parser.set_defaults(func=zarr_global_preview_command)
 
     # Zarr-stretch command
@@ -4587,6 +5627,60 @@ Directory Structure:
         "(PC1->R, PC2->G, PC3->B). Use '213' to swap R and G (PC2->R, "
         "PC1->G, PC3->B), '321' to fully reverse, etc.",
     )
+    zarr_stretch_parser.add_argument(
+        "--from-shards",
+        action="store_true",
+        help="Force the legacy shard-sampling path (re-reads embeddings; "
+        "local stores only). Default: aggregate the per-zone statistics "
+        "collected at fill time — a few MiB of reads, remote-capable.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--from-sample",
+        action="store_true",
+        help="Take the covariance from the stored per-zone sample instead of "
+        "the summed statistics. Use when the sums are poisoned (the drift "
+        "check fails): a few out-of-range pixels can dominate a sum over "
+        "billions, but almost never land in a uniform reservoir. Runs in "
+        "seconds and needs no rescan.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="Persist the stretch even if the drift check fails. Off by "
+        "default: a stretch that fails its own check is normally wrong, and "
+        "saving it propagates into every preview built from it.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--drift-threshold",
+        type=float,
+        default=0.25,
+        help="Maximum relative Frobenius distance between the stats-derived "
+        "and sample-derived covariances before warning of stale statistics "
+        "(default: 0.25)",
+    )
+    _add_storage_args(zarr_stretch_parser, "store", "Store", writable=True)
+    zarr_stretch_parser.add_argument(
+        "--sample-store",
+        action="store_true",
+        help="With --per-zone, read the percentiles by sampling the store "
+        "rather than from the fill-time statistics. Those statistics exist to "
+        "support a PCA over all 128 dimensions; a bands-mode preview needs "
+        "only the three colour bands, which come from the shallowest depth "
+        "array. About two minutes per zone against the hours "
+        "--backfill-stretch-stats spends, and it works where no statistics "
+        "were collected at all.",
+    )
+    zarr_stretch_parser.add_argument(
+        "--per-zone",
+        action="store_true",
+        help="Compute one stretch per UTM zone instead of a single global one, "
+        "and store them under geoemb:stretch_zones. A single global stretch has "
+        "to serve every region, so a region at one end of the global "
+        "distribution renders with a channel pinned flat; per-zone recovers "
+        "that. Use with `zarr-global-preview --blend-zone-stretch`, which "
+        "blends them in longitude so zone boundaries stay seamless.",
+    )
+
     zarr_stretch_parser.set_defaults(func=zarr_stretch_command)
 
     # Verify-tile command
@@ -4639,8 +5733,16 @@ Directory Structure:
         parser.print_help()
         return
 
-    # Execute the command
-    args.func(args)
+    # Execute the command. Commands return a shell exit status; propagate it
+    # so a failed zone in a parallel sweep is visible to the orchestrator
+    # rather than silently reported as success.
+    try:
+        raise SystemExit(args.func(args) or 0)
+    except KeyboardInterrupt:
+        # A long fill is routinely interrupted; report it as the shell
+        # convention rather than as two pages of traceback.
+        console.print(f"\n[yellow]{emoji('⚠️  ')}Interrupted.[/yellow]")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

@@ -1,23 +1,39 @@
-## Unreleased
+## v0.10.0 (2026-08-24)
+
+This release moves all data hosting to the Source Cooperative and makes the
+Zarr pipeline work end to end against remote object stores. Every zarr
+subcommand now takes `s3://` locations for both the tile source and the
+output store, fills run as one process per UTM zone and resume from the
+store itself, and the global RGB preview can stream from a read-only mirror
+while writing to a credentialed bucket. Stores gained per-zone stretch
+statistics, optional nested embedding depths, and a mode for datasets that
+need no landmask.
 
 ### Breaking Changes
 
 - All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
   Embeddings, landmasks and manifests are served from the public
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
-  replacing the retired `tessera-embeddings` AWS S3 bucket.
+  replacing the retired `tessera-embeddings` AWS S3 bucket. (@avsm)
+
+- `botocore` and `awscrt` are no longer required dependencies as `urllib3`
+  is a new direct dependency. `s3://` locations need the new optional `s3`
+  extra (`pip install 'geotessera[s3]'`), which pulls in `s3fs` and
+  `botocore`; the core install stays free of both, and `https://` sources
+  work without it. (@avsm)
+
+- Convention metadata now comes from `zarr-cm`, replacing `geozarr-toolkit`.
+  Stores stamp `spatial:`/`proj:` at revision r3 and `multiscales` at r2. (@avsm)
 
 - `sphinx` and `cram` are no longer runtime dependencies.
   Sphinx moved to a `docs` extra (`pip install geotessera[docs]`)
   and cram to the `dev` dependency group (@avsm)
 
-- The Zarr read API drops `crs=`. The store is UTM-native, so 
+- The Zarr read API drops `crs=`. The store is UTM-native, so
   `GeoTesseraZarr` takes lon/lat and routes to the `utm{NN}` group holding
   the point, and the `.tessera` accessor takes eastings and northings in
   that zone's own CRS. Project to lon/lat once up front, rather than per call.
-
-- `botocore` and `awscrt` are no longer required dependencies as `urllib3`
-  is a new direct dependency (@avsm)
+  (@avsm)
 
 ### New Features
 
@@ -29,9 +45,9 @@
   Tiles are 0.1 degrees and UTM zones 6 degrees, so round coordinates fall on
   tile edges and multiples of 6 fall on zone seams.  Our Zarr wrapper now
   tries the neighbouring UTM zone within 0.1 degrees of a seam, and
-  `search_px` accepts the nearest valid pixel within 1 pixel.
+  `search_px` accepts the nearest valid pixel within 1 pixel. (@avsm)
 
--  A new `probe()` on the store and on the `.tessera` accessor returns
+- A new `probe()` on the store and on the `.tessera` accessor returns
   `(embedding, status)`, the status one of `valid`, `water`, `nodata` or
   `outside`. Use it to tell open water from a location the store does not
   cover, which `sample_at` reports alike as NaN. It also rejects a point
@@ -41,17 +57,60 @@
 - Per-version default variant allows omitting the dataset-variant.
   `--dataset-variant` now selects the version's default variant (`vultr`
   for v1, `cambridge` for v1.1, `2B-L~beta1` for v2) so
-  `GeoTessera(dataset_version="v1.1")` works. 
+  `GeoTessera(dataset_version="v1.1")` works.
   The known datasets are listed in the new "Known Datasets" table printed by
   `geotessera info` (@avsm)
-
-- `geotessera-registry zarr-consolidate` is a new subcommand that
-  re-consolidates a store's root metadata after in-place changes.
-  Mostly only for repairs and not regular use.
 
 - `geotessera-registry s3scan` scans Source Cooperative to list
   embeddings. This allows manifests and landmask registries to be
   regenerated directly from the Source Cooperative repository.  (@avsm)
+
+- `zarr-init` and `zarr-fill` take locations rather than paths, so a store on
+  one S3 node can be filled from tiles on another with no local mirror. (@avsm)
+
+- `zarr-fill --zones N` is safe to run as one process per UTM zone against a
+  shared store, and fills are stateless.
+  `--rewrite-existing-shards` forces a rebuild, needed only when the tile
+  inventory has grown. (@avsm)
+
+- Each zone group carries stretch statistics collected during the fill, at no
+  extra I/O: exact mean and covariance sufficient statistics per (zone, year)
+  plus a weighted 20,000-pixel sample for quantiles. (@avsm)
+
+- `zarr-stretch --per-zone` computes one stretch per UTM zone, and
+  `zarr-global-preview --blend-zone-stretch` colours each chunk with a blend
+  of its zone's stretch and its neighbour's, weighted by longitude, so zone
+  boundaries stay seamless by construction. `zarr-global-preview` builds the
+  EPSG:4326 RGB pyramid from a remote store.  (@avsm)
+
+- `zarr-init --matryoshka-depths 4,16` also stores the first N dimensions of
+  every embedding as their own arrays, so a client can read a 4- or
+  16-dimensional prefix without decoding all 128 bands. Depth arrays share
+  the shard grid with `embeddings` and are dequantised by the same `scales`;
+  storage overhead is about 16%. Requires matryoshka-ordered dimensions and
+  is refused below v2, where a prefix would be an arbitrary slice.
+  `zarr-fill`, `zarr-extend` and `zarr-scan` follow the store's declaration,
+  and `zarr-global-preview` reads its colour bands from the shallowest array
+  that holds them. (@avsm)
+
+- `geotessera-registry zarr-scan` inventories a store's shards without
+  writing anything, classifying each as `written`, `missing`, or `empty`.
+  `geotessera-registry zarr-verify` checks a store's contents against the
+  source tiles it was built from: it samples random (year, tile) pairs,
+  reads a pixel block from each source `.npy` pair and the same ground
+  position from the store, and requires embeddings to round-trip exactly,
+  scales to match. `zarr-scan` remains the coverage check. (@avsm)
+
+- `geotessera-registry zarr-extend` appends years to an existing store's
+  time axis. Time is chunked one year per chunk, making this a metadata-only
+  edit; years may only be appended, since inserting an earlier one would
+  renumber every chunk. (@avsm)
+
+- `geotessera-registry zarr-consolidate` re-consolidates a store's root
+  metadata after in-place changes and merges the per-zone ingestion
+  registries into `_registry.parquet` — the single-writer step that finishes
+  a parallel sweep. Accepts a remote store URL as well as a local path.
+  (@avsm)
 
 - `open_zone(lon=...)` and `GeoTesseraZarr.open_zone(lon=...)` accept a
   whole-number longitude. `lon=-3` previously raised `TypeError`.  (@avsm)
@@ -59,6 +118,55 @@
 ### Performance
 
 - Point sampling no longer rebuilds a pyproj transformer for every point.
+  (@avsm)
+
+### Bug Fixes
+
+- Out-of-range scales no longer poison the stretch statistics.  (@avsm)
+
+- `zarr-stretch` refuses to persist a stretch that fails its own drift check
+  unless `--allow-drift`. It previously warned and saved anyway, which is
+  how a covariance known to be wrong reached every preview built from it.
+  (@avsm)
+
+- Fills no longer deadlock against an object store: a forked worker
+  inherited `s3fs`'s cached event loop but not the thread running it, and
+  waited forever on its first call. Workers now start with "spawn" and
+  reset any inherited fsspec state. (@avsm)
+
+- `zarr-global-preview` no longer races itself creating the pyramid: zarr's
+  create is check-then-write, so parallel zone sweeps died on "already
+  exists" errors. Every creation step is now idempotent. (@avsm)
+
+- Zones at the antimeridian no longer claim the whole grid width. A shard
+  straddling 180° samples corners near both -180 and +180, so the naive
+  span claimed every chunk column at that latitude — utm60 enqueued 1.4M
+  level-0 chunks to reproject 360 shards, and the coarsening pass rewrote
+  16M chunk slots for utm01's 18.8k real chunks. Both now detect the wrap
+  and split into two tight ranges; every other zone is bit-identical. (@avsm)
+
+- The reprojection work list comes from the footprints of the shards that
+  exist rather than the zone's bounding rectangle, which at high latitude
+  back-projects across most longitudes. (@avsm)
+
+- Pyramid levels keep their per-level `spatial:shape` and
+  `spatial:transform`, which `geozarr-toolkit`'s layout builder silently
+  dropped. (@avsm)
+
+- Incremental fills no longer erase neighbouring tiles: a shard write
+  replaces the whole shard, so touched shards are now rebuilt from every
+  tile overlapping them. (@avsm)
+
+- Failed shards are no longer recorded as written, so re-running a fill
+  retries exactly the unfinished work, and a fill with any failed shard
+  reports an error. (@avsm)
+
+- `geotessera-registry` propagates exit status. Command return codes were
+  discarded, so failures reported success to the shell. (@avsm)
+
+- Build bookkeeping no longer lives inside the store, which now contains
+  only Zarr. Anything an older build left at the store root is still read
+  so existing stores resume correctly, but nothing is written back. (@avsm)
 
 ### Documentation
 
@@ -223,8 +331,6 @@ This release contains registry tooling improvements.
 This release adds Windows platform support, more robust tolerance to
 interrupted scripts leaving temporary files around, and documentation fixes for
 coordinate printing and tile discovery.
-
-### Windows Support
 
 Added Windows testing infrastructure in CI and applied code fixes (@avsm):
 - New conda-based CI workflow for Windows runners
@@ -427,8 +533,6 @@ diverse hosting options online before the end of 2025.
   - Useful when working directly with downloaded quantized NPY files, but use the Tiles class for normal usage.
   - Example: `embedding = dequantize_embedding(quantized, scales)`
 
-### Migration Notes
-
 From v0.6.0 to v0.7.0:
 - Update initialization code to use new `cache_dir` parameter instead of environment variables
 - Remove any custom `TESSERA_DATA_DIR` or `TESSERA_REGISTRY_DIR` environment variable usage
@@ -540,7 +644,6 @@ system preserved
   - Callback-based progress reporting for programmatic use
   - Integration throughout CLI commands for better user experience
 
-
 ### Performance and Efficiency Improvements
 
 - Registry System Optimization
@@ -561,8 +664,6 @@ system preserved
 - **Added**: `geodatasets>=2024.8.0` for geographic data access
 - **Enhanced**: `rich` and `typer` for improved CLI experience
 - **Updated**: Various dependencies to latest stable versions
-
-### Migration Notes
 
 From v0.4.0 to v0.5.0:
 - **API changes**: Update code to handle new return values from `fetch_embedding()` and `fetch_embeddings()`
@@ -660,8 +761,6 @@ Deprecated Features:
 - **New methods**:
   - `get_available_years()` - List available years in the dataset
   - Multiple georeferencing helper methods
-
-### CLI Enhancements
 
 The `geotessera` tool has also been improved.
 
