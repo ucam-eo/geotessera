@@ -59,6 +59,12 @@ There are several new variants availabile, see `geotessera info`:
   to the v2 default variant's store, and explicit store paths still pass
   through. (@avsm)
 
+- `GeoTesseraZarr` and `open_zone` accept a `zarr.abc.store.Store` as
+  well as a URL, and the new public `zarr_store(location)` builds the
+  default retrying store.  The store can therefore be wrapped, for
+  example in zarr's experimental `CacheStore` for a local cache, and
+  passed in. (@avsm)
+
 - Zarr reads from `http(s)` stores go through `obstore`, which retries
   each request with exponential backoff and jitter — one dropped response
   from a busy data server costs a chunk, not the whole read.  `obstore`

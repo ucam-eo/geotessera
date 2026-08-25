@@ -470,21 +470,58 @@ check(
 
 from zarr.storage import ObjectStore  # noqa: E402
 
-from geotessera.store import RETRY_CONFIG, _zarr_location  # noqa: E402
+from geotessera.store import RETRY_CONFIG, zarr_store  # noqa: E402
 
-_loc = _zarr_location("https://example.org/store")
+_loc = zarr_store("https://example.org/store")
 check(
     "an http url reads through an obstore store with retries configured",
     isinstance(_loc, ObjectStore)
     and _loc.store.retry_config["max_retries"] == RETRY_CONFIG["max_retries"],
 )
+from zarr.storage import FsspecStore, LocalStore  # noqa: E402
+
 check(
-    "a local path passes through untouched",
-    _zarr_location("/tmp/store.zarr") == "/tmp/store.zarr",
+    "a local path becomes a LocalStore",
+    isinstance(zarr_store("/tmp/store.zarr"), LocalStore),
 )
 check(
-    "an s3 url passes through to fsspec",
-    _zarr_location("s3://bucket/store") == "s3://bucket/store",
+    "another url scheme resolves through fsspec",
+    isinstance(zarr_store("file:///tmp/store.zarr"), FsspecStore),
+)
+check("a zarr Store passes through untouched", zarr_store(_loc) is _loc)
+
+# A full GeoTesseraZarr over a Store instance, and the same store wrapped
+# in zarr's experimental cache, must read identically.
+from zarr.experimental.cache_store import CacheStore  # noqa: E402
+from zarr.storage import MemoryStore  # noqa: E402
+
+import warnings  # noqa: E402
+
+_mem = MemoryStore()
+with warnings.catch_warnings():
+    # zarr warns that v3 consolidated metadata is not yet in the spec
+    warnings.simplefilter("ignore")
+    flat.to_zarr(_mem, group="utm53", zarr_format=3, mode="w")
+    _g = zarr.open_group(_mem, mode="a")
+    _g.attrs.update({"geoemb:dimensions": 4, "geoemb:model": "fake"})
+    zarr.consolidate_metadata(_mem)
+
+gt_store = GeoTesseraZarr(_mem)
+check(
+    "a Store instance initialises the full store",
+    gt_store.n_bands == 4 and gt_store.years == [2024],
+)
+_pt53 = Transformer.from_crs(
+    flat.attrs["proj:code"], "EPSG:4326", always_xy=True
+).transform(float(flat.x[6]), float(flat.y[6]))
+_want = gt_store.sample_points([_pt53], 2024, progress=False)
+
+gt_cached = GeoTesseraZarr(
+    CacheStore(_mem, cache_store=MemoryStore(), max_size=64 * 1024 * 1024)
+)
+check(
+    "a cache-wrapped store reads identically",
+    np.array_equal(gt_cached.sample_points([_pt53], 2024, progress=False), _want),
 )
 
 from geotessera.registry import zarr_store_url  # noqa: E402
