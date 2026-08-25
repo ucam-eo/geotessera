@@ -393,6 +393,69 @@ check(
 )
 
 # ---------------------------------------------------------------------------
+# Matryoshka depths and quantised reads
+# ---------------------------------------------------------------------------
+
+# A store that declares a 2-dimension prefix array, as v2 stores do.
+deep = flat.copy()
+deep["embeddings_d2"] = (
+    ("time", "band_d2", "y", "x"),
+    deep["embeddings"].values[:, :2],
+)
+gt_deep = _fake_store({53: deep})
+gt_deep.depths = {2: "embeddings_d2", 4: "embeddings"}
+
+_ll53 = Transformer.from_crs(deep.attrs["proj:code"], "EPSG:4326", always_xy=True)
+_lon53, _lat53 = _ll53.transform(float(deep.x[6]), float(deep.y[6]))
+_w53, _s53 = _ll53.transform(float(deep.x[1]), float(deep.y[10]))
+_e53, _n53 = _ll53.transform(float(deep.x[10]), float(deep.y[1]))
+_box53 = (_w53, _s53, _e53, _n53)
+
+full, _, _ = gt_deep.read_region(_box53, 2024)
+d2, _, _ = gt_deep.read_region(_box53, 2024, depth=2)
+check(
+    "a depth read equals the prefix of the full read",
+    d2.shape[2] == 2 and np.array_equal(d2, full[:, :, :2], equal_nan=True),
+)
+check(
+    "depth point samples match the full prefix",
+    np.array_equal(
+        gt_deep.sample_points([(_lon53, _lat53)], 2024, progress=False, depth=2)[0],
+        gt_deep.sample_points([(_lon53, _lat53)], 2024, progress=False)[0][:2],
+    ),
+)
+_d2cat = np.concatenate(
+    [b for b, _, _ in gt_deep.iter_region(_box53, 2024, depth=2, strip_rows=4)],
+    axis=0,
+)
+check(
+    "depth strips equal the depth region",
+    np.array_equal(_d2cat, d2, equal_nan=True),
+)
+
+
+def _bad_depth():
+    try:
+        gt_deep.read_region(_box53, 2024, depth=16)
+    except ValueError as problem:
+        return "available: [2, 4]" in str(problem)
+    return False
+
+
+check("an undeclared depth raises and lists what exists", _bad_depth())
+
+emb_q, scales_q, t_q, crs_q = gt_deep.read_region_quantized(_box53, 2024)
+check(
+    "a quantised read dequantises to exactly read_region",
+    emb_q.dtype == np.int8
+    and np.array_equal(
+        deep.tessera.dequantise(emb_q.transpose(2, 0, 1), scales_q),
+        full,
+        equal_nan=True,
+    ),
+)
+
+# ---------------------------------------------------------------------------
 # Streamed region reads (iter_region)
 # ---------------------------------------------------------------------------
 
