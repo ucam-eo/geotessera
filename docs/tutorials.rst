@@ -1,7 +1,11 @@
 Tutorials
 =========
 
-This section contains comprehensive tutorials for different use cases with GeoTessera.
+These tutorials use the tile-download interface. For zarr-based
+pipelines — classification, large-region inference, and false-colour
+visualisation built on ``GeoTesseraZarr`` — see the
+`geotessera-examples <https://github.com/ucam-eo/geotessera-examples>`_
+repository and the :doc:`zarr_quickstart`.
 
 Tutorial 1: Basic Data Analysis
 -------------------------------
@@ -379,7 +383,7 @@ Create interactive web tiles from the PCA mosaic::
     print("Interactive map should open in your browser")
 
 QGIS Integration
-~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~
 
 Tips for using the GeoTIFF files in QGIS:
 
@@ -592,7 +596,7 @@ Export multiple regions efficiently using CLI commands::
     batch_export_regions(regions, "./batch_exports")
 
 Multi-Year Comparison
-~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~
 
 Compare embeddings across different years::
 
@@ -645,7 +649,7 @@ Compare embeddings across different years::
     plt.show()
 
 Tutorial 5: Coverage Analysis with Boundary Visualization
---------------------------------------------------------
+---------------------------------------------------------
 
 Understanding data coverage with precise geographic boundaries.
 
@@ -687,7 +691,7 @@ Tutorial 6: Custom Analysis Workflows
 Advanced analysis techniques and custom workflows.
 
 Principal Component Analysis
-~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Reduce dimensionality of the 128-channel embeddings::
 
