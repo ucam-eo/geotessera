@@ -3157,6 +3157,577 @@ def s3scan_command(args):
         return 1
 
 
+# ---------------------------------------------------------------------------
+# s3sync: incremental npy -> manifest -> Zarr store -> RGB preview
+# ---------------------------------------------------------------------------
+
+
+def compute_sync_plan(
+    fresh: "pd.DataFrame",
+    synced: Optional["pd.DataFrame"],
+    store_years: Optional[List[int]],
+    preview_year: int,
+) -> Dict[str, Any]:
+    """Diff a fresh tile scan against the manifest as of the last sync.
+
+    Pure planning: no I/O. *synced* is None when there is no baseline (first
+    sync, or the store does not exist yet), in which case every tile is in
+    scope. *store_years* is None when the store does not exist yet (it will
+    be initialised with every year the scan found); otherwise tiles in years
+    the store does not carry are *deferred* — reported, excluded from the
+    plan, and excluded from the ``pending`` baseline so they surface again
+    on the first run after a manual ``zarr-extend``.
+
+    A tile counts as changed when its key ``(year, lon_i, lat_i)`` is new,
+    or when any of its object sizes/mtimes differ from the baseline (a
+    re-uploaded tile must be re-ingested even though its key is unchanged).
+
+    Returns a dict with:
+        pairs:          sorted ``(zone, year)`` pairs needing a fill
+        zone_years:     ``{zone: [years]}`` grouping of ``pairs``
+        changed:        number of new/updated tiles in scope
+        removed:        baseline tiles no longer in the bucket (not synced)
+        deferred:       changed tiles excluded for missing store years
+        deferred_years: those years, sorted
+        preview_zones:  zones of ``pairs`` whose year is *preview_year*
+        years:          every year present in the scan, sorted
+        pending:        the manifest to commit as the baseline on success
+    """
+    from .zarr import tile_zone
+
+    key = ["year", "lon_i", "lat_i"]
+    cmp_cols = ["grid_size", "scales_size", "grid_mtime", "scales_mtime"]
+
+    old = fresh.iloc[0:0] if synced is None else synced
+    merged = fresh.merge(old[key + cmp_cols], on=key, how="left", suffixes=("", "_old"))
+    new = merged["grid_size_old"].isna()
+    differs = pd.Series(False, index=merged.index)
+    for c in cmp_cols:
+        differs |= merged[c] != merged[f"{c}_old"]
+    changed = merged[new | (~new & differs)]
+    removed = int(
+        old.merge(fresh[key], on=key, how="left", indicator=True)["_merge"]
+        .eq("left_only")
+        .sum()
+    )
+
+    years_all = sorted(int(y) for y in fresh["year"].unique())
+    scope_years = set(years_all) if store_years is None else set(store_years)
+    in_scope = changed[changed["year"].isin(scope_years)]
+    deferred = changed[~changed["year"].isin(scope_years)]
+
+    pairs = sorted(
+        {
+            (tile_zone(float(lon)), int(y))
+            for lon, y in zip(in_scope["lon"], in_scope["year"])
+        }
+    )
+    zone_years: Dict[int, List[int]] = {}
+    for z, y in pairs:
+        zone_years.setdefault(z, []).append(y)
+
+    return {
+        "pairs": pairs,
+        "zone_years": zone_years,
+        "changed": len(in_scope),
+        "removed": removed,
+        "deferred": len(deferred),
+        "deferred_years": sorted(int(y) for y in deferred["year"].unique()),
+        "preview_zones": sorted({z for z, y in pairs if y == preview_year}),
+        "years": years_all,
+        "pending": fresh[fresh["year"].isin(scope_years)],
+    }
+
+
+def _storage_flag_args(args, prefix: str, out_prefix: Optional[str] = None) -> List[str]:
+    """Re-emit ``--{prefix}-*`` storage flags for a child subcommand.
+
+    *out_prefix* renames the prefix for children whose read/write sides are
+    named differently: zarr-global-preview reads the embeddings store via
+    ``--store-*`` and writes the pyramid via ``--output-*``, so s3sync's
+    ``source`` flags become its ``store`` flags and s3sync's ``store``
+    flags its ``output`` flags.
+    """
+    out_prefix = out_prefix or prefix
+    flags: List[str] = []
+    for name in ("endpoint-url", "region", "profile", "acl"):
+        value = getattr(args, f"{prefix}_{name.replace('-', '_')}", None)
+        if value:
+            flags += [f"--{out_prefix}-{name}", value]
+    for name in ("anon", "requester-pays", "path-style"):
+        if getattr(args, f"{prefix}_{name.replace('-', '_')}", False):
+            flags.append(f"--{out_prefix}-{name}")
+    return flags
+
+
+def _run_child(
+    cmd: List[str],
+    log_path: Path,
+    console: "Console",
+    label: str,
+    retries: int = 1,
+    backoff: int = 30,
+) -> bool:
+    """Run a child subcommand, appending its output to *log_path*.
+
+    Retries with linear backoff; the log carries every attempt's command
+    line so a failure can be reproduced by hand.
+    """
+    import subprocess
+    import time
+
+    for attempt in range(1, retries + 1):
+        with open(log_path, "ab") as log:
+            log.write(f"\n==> attempt {attempt}: {' '.join(cmd)}\n".encode())
+            log.flush()
+            rc = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT)
+        if rc == 0:
+            return True
+        console.print(
+            f"[yellow]  [{label}] attempt {attempt} failed (exit {rc}), "
+            f"see {log_path}[/yellow]"
+        )
+        if attempt < retries:
+            time.sleep(attempt * backoff)
+    return False
+
+
+def _zone_pool(
+    tasks: List[Tuple[int, Any]],
+    jobs: int,
+    run_task: Callable[[int, Any], bool],
+    console: "Console",
+    exclusive_neighbours: bool = False,
+) -> List[int]:
+    """Run per-zone tasks with at most *jobs* in flight; return failed zones.
+
+    With *exclusive_neighbours*, a zone never starts while an adjacent zone
+    (±1, and utm01/utm60 across the antimeridian) is running: preview zones
+    composite into shared level-0 chunks with a read-modify-write, so two
+    neighbours running at once would lose each other's pixels. The scheduler
+    keeps starting whatever is currently safe rather than draining in fixed
+    rounds, which holds the pool busy even though zones differ hugely in
+    size.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+    from concurrent.futures import wait as futures_wait
+
+    pending = list(tasks)
+    running: Dict[Any, int] = {}
+    failed: List[int] = []
+
+    def blocked(zone: int) -> bool:
+        if not exclusive_neighbours:
+            return False
+        active = set(running.values())
+        return (
+            zone - 1 in active
+            or zone + 1 in active
+            or (zone == 1 and 60 in active)
+            or (zone == 60 and 1 in active)
+        )
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        while pending or running:
+            for zone, payload in list(pending):
+                if len(running) >= jobs:
+                    break
+                if blocked(zone):
+                    continue
+                running[pool.submit(run_task, zone, payload)] = zone
+                pending.remove((zone, payload))
+            if not running:
+                break
+            done, _ = futures_wait(set(running), return_when=FIRST_COMPLETED)
+            for fut in done:
+                zone = running.pop(fut)
+                if fut.result():
+                    console.print(f"  zone {zone} done")
+                else:
+                    failed.append(zone)
+    return failed
+
+
+def s3sync_command(args):
+    """One incremental sync pass for a dataset: npy tiles -> everything else.
+
+    Re-scan the bucket for tiles, diff against the manifest as of the last
+    successful sync, publish the fresh manifest, fill only the (zone, year)
+    pairs that gained or changed tiles, then re-render just those zones of
+    the preview year's RGB pyramid. A run that finds nothing new stops after
+    the scan. Orchestration only: every unit of work is a child invocation
+    of the existing subcommands (s3scan, zarr-init, zarr-fill,
+    zarr-consolidate, zarr-stretch, zarr-global-preview), so each remains
+    independently re-runnable by hand.
+
+    Interrupted runs just re-run: fills resume from the store itself (shard
+    objects are the record of what is done), preview zones from their
+    markers, and the baseline manifest — committed only on full success —
+    makes the next diff conservative.
+
+    New *years* are deliberately not appended here: growing the time axis is
+    a single-writer edit with no fills in flight (``zarr-extend``, run by
+    hand). Tiles in years the store does not carry are excluded from the
+    plan and from the committed baseline, so they sync on the first run
+    after the extend.
+    """
+    import sys
+
+    from .registry import _parse_dataset_version, dataset_path, default_variant
+
+    console = Console()
+    os.environ.setdefault("AWS_MAX_ATTEMPTS", "10")
+    os.environ.setdefault("AWS_RETRY_MODE", "adaptive")
+
+    version = args.dataset_version or "v1"
+    _, norm = _parse_dataset_version(version)
+    variant = args.dataset_variant or default_variant(norm)
+    try:
+        ddir = dataset_path(norm, variant)
+    except ValueError as e:
+        console.print(f"[red]{emoji('❌ ')}{e}[/red]")
+        return 1
+
+    tag = f"{version}-{variant}"
+    repo = args.repo_root.rstrip("/")
+    publish = args.publish_base.rstrip("/")
+    store_url = args.store or f"{publish}/zarr/{tag}"
+    manifest_dest = f"{publish}/npy/{ddir}/manifest.parquet"
+
+    workdir = Path(
+        args.workdir or (Path.home() / f"tessera-{tag.replace('~', '-')}.sync")
+    ).expanduser()
+    logs = workdir / "logs"
+    spill = workdir / "spill"
+    scan_dir = workdir / "scan"
+    synced_path = workdir / "manifest.synced.parquet"
+    for d in (logs, spill, scan_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    cli = [sys.executable, "-m", "geotessera.registry_cli"]
+    src_flags = _storage_flag_args(args, "source")
+    store_flags = _storage_flag_args(args, "store")
+    dataset_flags = ["--dataset-version", version, "--dataset-variant", variant]
+
+    # -- 1. Scan the bucket for the current tile inventory -------------------
+    console.print(f"[bold]==> [1/6] Scanning npy/{ddir} for tiles[/bold]")
+    scan_cmd = cli + [
+        "s3scan",
+        f"{repo}/npy/{ddir}/",
+        "--no-landmasks",
+        "--output",
+        str(scan_dir),
+    ]
+    if args.source_endpoint_url:
+        scan_cmd += ["--endpoint-url", args.source_endpoint_url]
+    if not _run_child(scan_cmd, logs / "s3scan.log", console, "s3scan"):
+        console.print("[red]scan failed[/red]")
+        return 1
+    fresh_path = scan_dir / ddir / "manifest.parquet"
+    if not fresh_path.is_file():
+        console.print(f"[red]scan wrote no manifest at {fresh_path}[/red]")
+        return 1
+    fresh = pd.read_parquet(fresh_path)
+
+    # -- 2. Probe the store and plan ----------------------------------------
+    from .zarr import StoreLocation, _preview_marker_parts, _store_years
+
+    so_store = _storage_options_for(args, "store", store_url)
+    try:
+        store = StoreLocation.resolve(store_url, so_store)
+        store_exists = store.exists("zarr.json", on_denied=False)
+        store_years = [int(y) for y in _store_years(store)] if store_exists else None
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    # Without a baseline the whole scan is the plan. A present store with no
+    # baseline is an interrupted (or adopted) initial build: the skip-existing
+    # resume makes refilling everything cheap, and the sweep establishes the
+    # baseline. A store that post-dates increments the baseline never saw
+    # needs --force-rewrite once, because a tile added since a shard was
+    # written falls inside it and a skip-existing fill would miss it.
+    have_baseline = store_exists and synced_path.is_file()
+    synced = pd.read_parquet(synced_path) if have_baseline else None
+    rewrite = store_exists and (have_baseline or args.force_rewrite)
+
+    plan = compute_sync_plan(fresh, synced, store_years, args.preview_year)
+
+    console.print("[bold]==> [2/6] Plan[/bold]")
+    console.print(
+        f"    {len(fresh):,} tiles in scan; {plan['changed']:,} new/updated "
+        f"across {len(plan['pairs'])} (zone, year) pair(s)"
+    )
+    if plan["removed"]:
+        console.print(
+            f"[yellow]    {plan['removed']:,} baseline tile(s) no longer in "
+            f"the bucket; removal is not synced[/yellow]"
+        )
+    if plan["deferred"]:
+        console.print(
+            f"[yellow]    {plan['deferred']:,} tile(s) deferred: year(s) "
+            f"{', '.join(map(str, plan['deferred_years']))} not in the store "
+            f"— run zarr-extend, they will sync on the next run[/yellow]"
+        )
+    if not plan["pairs"]:
+        console.print(f"{emoji('✅ ')}In sync: no new or updated tiles.")
+        return 0
+    console.print(
+        f"    store: {'fill incrementally' if rewrite else ('resume initial build' if store_exists else 'initialise, then full build')}"
+    )
+    console.print(
+        f"    preview ({args.preview_year}) zones to re-render: "
+        f"{' '.join(map(str, plan['preview_zones'])) or 'none'}"
+    )
+    if args.dry_run:
+        for zone, years in sorted(plan["zone_years"].items()):
+            console.print(f"      zone {zone}: {' '.join(map(str, years))}")
+        console.print("==> --dry-run: stopping before any write")
+        return 0
+
+    # -- 3. Publish the fresh manifest (what geotessera clients read) --------
+    console.print(
+        f"[bold]==> [3/6] Publishing manifest to npy/{ddir}/manifest.parquet[/bold]"
+    )
+    try:
+        import fsspec
+
+        fs, dest = fsspec.core.url_to_fs(manifest_dest, **(so_store or {}))
+        fs.put_file(str(fresh_path), dest)
+    except (ImportError, *_object_store_errors()) as e:
+        return _report_store_error(e, console)
+
+    # -- 4. Fill the changed (zone, year) pairs ------------------------------
+    fill_extra: List[str] = []
+    if rewrite:
+        # A tile added since the last sync can fall inside a shard that
+        # already exists, which the default skip-existing resume would skip.
+        # Statistics stay off because the fold is additive — re-folding a
+        # rewritten shard would double-count it; the preview samples
+        # percentiles from the store instead (--sample-store below).
+        fill_extra += ["--rewrite-existing-shards", "--no-stretch-stats"]
+    elif args.no_stretch_stats:
+        fill_extra += ["--no-stretch-stats"]
+
+    if not store_exists:
+        years_range = f"{plan['years'][0]}-{plan['years'][-1]}"
+        console.print(f"[bold]==> [4/6] Initialising store ({years_range})[/bold]")
+        init_cmd = cli + [
+            "zarr-init",
+            repo,
+            "--years",
+            years_range,
+            "--output",
+            store_url,
+            "--no-landmask",
+            "--manifest-url",
+            str(fresh_path),
+        ]
+        if args.matryoshka_depths:
+            init_cmd += ["--matryoshka-depths", args.matryoshka_depths]
+        init_cmd += dataset_flags + src_flags + store_flags
+        if not _run_child(init_cmd, logs / "init.log", console, "zarr-init"):
+            console.print("[red]zarr-init failed[/red]")
+            return 1
+    else:
+        console.print("[bold]==> [4/6] Filling[/bold]")
+
+    def fill_zone(zone: int, years: List[int]) -> bool:
+        log = logs / f"fill-z{zone}.log"
+        for year in years:
+            cmd = cli + [
+                "zarr-fill",
+                repo,
+                store_url,
+                "--zones",
+                str(zone),
+                "--year",
+                str(year),
+                "--workers",
+                str(args.workers),
+                "--spill-dir",
+                str(spill / f"z{zone}"),
+                "--no-consolidate",
+                "--manifest-url",
+                str(fresh_path),
+            ]
+            cmd += fill_extra + dataset_flags + src_flags + store_flags
+            if not _run_child(
+                cmd, log, console, f"z{zone}/{year}", retries=args.retries
+            ):
+                return False
+        return True
+
+    console.print(
+        f"    {len(plan['zone_years'])} zone(s), {args.zone_jobs} at once "
+        f"x {args.workers} workers"
+    )
+    failed = _zone_pool(
+        sorted(plan["zone_years"].items()), args.zone_jobs, fill_zone, console
+    )
+    if failed:
+        console.print(
+            f"[red]{emoji('❌ ')}zone(s) {' '.join(map(str, failed))} failed; "
+            f"re-run to retry (fills resume from the store)[/red]"
+        )
+        return 1
+
+    console.print("[bold]==> [5/6] Consolidating store metadata[/bold]")
+    if not _run_child(
+        cli + ["zarr-consolidate", store_url] + store_flags,
+        logs / "consolidate.log",
+        console,
+        "zarr-consolidate",
+    ):
+        console.print("[red]zarr-consolidate failed[/red]")
+        return 1
+
+    # -- 5. Refresh the preview pyramid for the changed zones ----------------
+    # Changed zones drop their resume markers even when the render itself is
+    # skipped, so the debt is recorded in the marker state and a later run's
+    # sweep picks those zones up rather than forgetting them.
+    state = workdir / f"preview-{args.preview_year}.state"
+    state.mkdir(parents=True, exist_ok=True)
+    for zone in plan["preview_zones"]:
+        subdir, marker = _preview_marker_parts(zone)
+        (state / subdir / marker).unlink(missing_ok=True)
+
+    if not plan["preview_zones"]:
+        console.print(
+            f"[bold]==> [6/6] No changes in {args.preview_year}: preview "
+            f"left as is[/bold]"
+        )
+    elif args.no_preview:
+        console.print(
+            "[bold]==> [6/6] Preview skipped (--no-preview); zone markers "
+            "cleared so the next preview run re-renders them[/bold]"
+        )
+    else:
+        console.print(
+            f"[bold]==> [6/6] Re-rendering preview for {args.preview_year}, "
+            f"zones: {' '.join(map(str, plan['preview_zones']))}[/bold]"
+        )
+        stretch_mode = args.stretch_mode or (
+            "bands" if version.startswith("v2") else "pca"
+        )
+        # One cross-zone stretch, persisted to the store root. zarr-stretch
+        # refuses to save a stretch that drifts too far from the one the
+        # standing zones were rendered with — if it stops here, the whole
+        # mosaic needs one re-render: delete <workdir>/preview-*/. _preview
+        # and re-run.
+        stretch_cmd = cli + [
+            "zarr-stretch",
+            store_url,
+            "--year",
+            str(args.preview_year),
+            "--mode",
+            stretch_mode,
+        ]
+        if not _run_child(
+            stretch_cmd + store_flags, logs / "stretch.log", console, "stretch"
+        ):
+            console.print(
+                "[red]global stretch failed — a drift-check refusal means the "
+                "standing mosaic was rendered with materially different "
+                "colours; delete the _preview markers under "
+                f"{state} to re-render every zone, then re-run[/red]"
+            )
+            return 1
+        # Per-zone stretches, blended across boundaries. --sample-store reads
+        # percentiles from the store itself: seconds per zone, and correct
+        # for zones filled with --no-stretch-stats.
+        if not _run_child(
+            stretch_cmd + ["--per-zone", "--sample-store"] + store_flags,
+            logs / "stretch-zones.log",
+            console,
+            "stretch-zones",
+        ):
+            console.print("[red]per-zone stretch failed[/red]")
+            return 1
+
+        pv_src = f"{repo}/zarr/{tag}"
+        pv_flags = (
+            [
+                "--year",
+                str(args.preview_year),
+                "--output",
+                store_url,
+                "--state-url",
+                str(state),
+            ]
+            + _storage_flag_args(args, "source", "store")
+            + _storage_flag_args(args, "store", "output")
+        )
+
+        def preview_zone(zone: int, _payload) -> bool:
+            cmd = cli + [
+                "zarr-global-preview",
+                pv_src,
+                "--reproject-only",
+                "--zones",
+                str(zone),
+                "--workers",
+                str(args.preview_workers),
+                "--gamma",
+                str(args.gamma),
+                "--saturation",
+                str(args.saturation),
+                "--blend-zone-stretch",
+                "--manifest-url",
+                str(fresh_path),
+            ]
+            return _run_child(
+                cmd + pv_flags,
+                logs / f"preview-z{zone}.log",
+                console,
+                f"preview z{zone}",
+                retries=args.retries,
+                backoff=10,
+            )
+
+        # All 60 zones: marked zones return immediately, cleared ones render.
+        failed = _zone_pool(
+            [(z, None) for z in range(1, 61)],
+            args.preview_zone_jobs,
+            preview_zone,
+            console,
+            exclusive_neighbours=True,
+        )
+        if failed:
+            console.print(
+                f"[red]{emoji('❌ ')}preview zone(s) "
+                f"{' '.join(map(str, failed))} failed; re-run to resume[/red]"
+            )
+            return 1
+
+        coarsen_cmd = cli + [
+            "zarr-global-preview",
+            pv_src,
+            "--coarsen-only",
+            "--workers",
+            str(args.coarsen_workers),
+        ]
+        if not _run_child(
+            coarsen_cmd + pv_flags, logs / "coarsen.log", console, "coarsen"
+        ):
+            console.print("[red]coarsen failed[/red]")
+            return 1
+
+    # -- 6. Commit: this scan is now the baseline ----------------------------
+    _atomic_write_parquet(plan["pending"], synced_path)
+    console.print(
+        f"\n{emoji('✅ ')}{plan['changed']:,} tile(s) synced into {store_url}"
+    )
+    if plan["deferred"]:
+        console.print(
+            f"[yellow]   {plan['deferred']:,} tile(s) in year(s) "
+            f"{', '.join(map(str, plan['deferred_years']))} still deferred — "
+            f"run zarr-extend[/yellow]"
+        )
+    console.print(f"   logs:     {logs}")
+    console.print(f"   baseline: {synced_path}")
+    return 0
+
+
 def file_check_command(args):
     """Check multiple inventory parquet files for duplicate year/lon/lat coordinates.
 
@@ -5048,6 +5619,159 @@ Directory Structure:
         "prefix yields no tiles, so a landmasks-only regeneration is possible.",
     )
     s3scan_parser.set_defaults(func=s3scan_command)
+
+    # S3sync command
+    s3sync_parser = subparsers.add_parser(
+        "s3sync",
+        help="One incremental sync pass for a dataset: scan npy/ for new "
+        "tiles, publish the manifest, fill the Zarr store, refresh the "
+        "RGB preview",
+        description="Rescan the bucket for tiles, diff against the manifest "
+        "as of the last successful sync, publish the fresh manifest, fill "
+        "only the (zone, year) pairs that gained or changed tiles, and "
+        "re-render just those zones of the preview year's pyramid. A run "
+        "that finds nothing new stops after the scan; an interrupted run "
+        "is simply re-run. New years are not appended — run zarr-extend "
+        "by hand, and the deferred tiles sync on the next run.",
+    )
+    s3sync_parser.add_argument(
+        "repo_root",
+        help="Repository root the tiles are read from, e.g. "
+        "s3://tessera/tessera (list/read via --source-* flags)",
+    )
+    s3sync_parser.add_argument(
+        "--dataset-version",
+        type=str,
+        default=None,
+        help="Tessera dataset version (e.g. v2; default v1)",
+    )
+    s3sync_parser.add_argument(
+        "--dataset-variant",
+        type=str,
+        default=None,
+        help="Tessera dataset variant (e.g. 2B-L~beta2; default: the "
+        "version's default variant)",
+    )
+    s3sync_parser.add_argument(
+        "--publish-base",
+        type=str,
+        default="s3://us-west-2.opendata.source.coop/tessera/tessera",
+        help="Writable repository root: the manifest goes to "
+        "{base}/npy/{dataset}/manifest.parquet and the store to "
+        "{base}/zarr/{version}-{variant} (default: the Source Cooperative "
+        "backing bucket)",
+    )
+    s3sync_parser.add_argument(
+        "--store",
+        type=str,
+        default=None,
+        help="Zarr store URL, overriding the --publish-base derivation",
+    )
+    s3sync_parser.add_argument(
+        "--workdir",
+        type=str,
+        default=None,
+        help="Directory for sync state, logs and spill "
+        "(default: ~/tessera-{version}-{variant}.sync). The baseline "
+        "manifest lives here: point every run at the same one.",
+    )
+    s3sync_parser.add_argument(
+        "--preview-year",
+        type=int,
+        default=2024,
+        help="Year whose global_rgb pyramid this store publishes; only its "
+        "changed zones are re-rendered (default: 2024)",
+    )
+    s3sync_parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="Skip the preview refresh even when the preview year changed",
+    )
+    s3sync_parser.add_argument(
+        "--zone-jobs",
+        type=int,
+        default=8,
+        help="Zones filled concurrently; size jobs x workers against RAM, "
+        "not cores (default: 8)",
+    )
+    s3sync_parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Shard workers per zone fill (default: 4)",
+    )
+    s3sync_parser.add_argument(
+        "--preview-zone-jobs",
+        type=int,
+        default=30,
+        help="Preview zones reprojected concurrently; 30 is the ceiling "
+        "since no two adjacent zones may run at once (default: 30)",
+    )
+    s3sync_parser.add_argument(
+        "--preview-workers",
+        type=int,
+        default=40,
+        help="Workers per preview zone, I/O bound (default: 40)",
+    )
+    s3sync_parser.add_argument(
+        "--coarsen-workers",
+        type=int,
+        default=32,
+        help="Threads for the single-writer coarsen pass (default: 32)",
+    )
+    s3sync_parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="Attempts per zone before giving up (default: 3)",
+    )
+    s3sync_parser.add_argument(
+        "--matryoshka-depths",
+        type=str,
+        default="4,16",
+        help="Nested embedding depths, applied only when this run "
+        "initialises the store; empty disables them (default: 4,16)",
+    )
+    s3sync_parser.add_argument(
+        "--stretch-mode",
+        choices=["pca", "bands"],
+        default=None,
+        help="Preview stretch mode (default: bands for v2 datasets, "
+        "else pca)",
+    )
+    s3sync_parser.add_argument(
+        "--gamma", type=float, default=0.7, help="Preview gamma (default: 0.7)"
+    )
+    s3sync_parser.add_argument(
+        "--saturation",
+        type=float,
+        default=1.0,
+        help="Preview saturation (default: 1.0)",
+    )
+    s3sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan, diff and print the plan, then stop before any write",
+    )
+    s3sync_parser.add_argument(
+        "--force-rewrite",
+        action="store_true",
+        help="Treat every changed pair as needing --rewrite-existing-shards "
+        "even without a baseline manifest. Needed once if the sync state "
+        "was lost after increments were written from elsewhere; otherwise "
+        "a store without a baseline is resumed with the cheap skip-existing "
+        "fill.",
+    )
+    s3sync_parser.add_argument(
+        "--no-stretch-stats",
+        action="store_true",
+        help="Pass --no-stretch-stats to non-rewrite fills (escape hatch "
+        "for the stats catch-up hang on resumed zones; rewrite fills "
+        "always disable stats to avoid double-counting)",
+    )
+    _add_storage_args(s3sync_parser, "source", "Tile source")
+    _add_storage_args(s3sync_parser, "store", "Store", writable=True)
+    s3sync_parser.set_defaults(func=s3sync_command)
 
     # File-check command
     file_check_parser = subparsers.add_parser(

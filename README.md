@@ -525,6 +525,7 @@ repository's `npy/` tree:
 | `1.1`   | `cambridge` (default)  | `v1.1-cam/`      | available   |
 | `1.1`   | `dclimate`             | —                | coming soon |
 | `2.0`   | `2B-L~beta1` (default) | `v2-2B-L~beta1/` | available   |
+| `2.0`   | `2B-L~beta2`           | `v2-2B-L~beta2/` | available   |
 
 The v1 series predates the variant-suffix scheme, so all its variants share
 the bare `v1/` directory. The library defaults remain `dataset_version="v1"`

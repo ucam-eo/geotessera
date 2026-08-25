@@ -1,3 +1,20 @@
+## unreleased
+
+- Add the v2 `2B-L~beta2` dataset (`npy/v2-2B-L~beta2/`, years 2017–2025)
+  to the known datasets. `2B-L~beta1` remains the default variant for
+  `--dataset-version v2` until the beta2 manifest and Zarr store are
+  published. (@avsm)
+
+- New `geotessera-registry s3sync` subcommand: one incremental pass that
+  rescans a dataset's npy tree, diffs against the manifest as of the last
+  successful sync, publishes the fresh manifest, fills only the changed
+  `(zone, year)` pairs of the Zarr store (rewriting shards that absorbed
+  new tiles), and re-renders just the changed zones of the preview year's
+  RGB pyramid. `scripts/zarr-sync.sh` wraps it with the deployment-host
+  defaults. New years are not appended automatically — run `zarr-extend`
+  by hand; the deferred tiles are excluded from the committed baseline and
+  sync on the next run. (@avsm)
+
 ## v0.10.0 (2026-08-24)
 
 This release moves all data hosting to the Source Cooperative and makes the

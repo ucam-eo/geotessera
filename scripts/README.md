@@ -41,6 +41,35 @@ earn much less than for a 128-band PCA).
 ZONES="30 31 32" ./scripts/zarr-convert-v2.sh            # just those zones
 ```
 
+## zarr-sync.sh — incremental npy → manifest → Zarr → preview
+
+Thin wrapper over `geotessera-registry s3sync`, which owns the whole
+incremental pipeline: rescan the bucket for tiles, diff against the
+manifest as of the last successful sync, publish the fresh manifest, fill
+only the `(zone, year)` pairs that gained or changed tiles
+(`--rewrite-existing-shards`, since a new tile can fall inside an existing
+shard), and re-render just the changed zones of the preview year's
+pyramid. A run that finds nothing new stops after the scan; an interrupted
+run is simply re-run. On a store that does not exist yet, the first run is
+the full build (init + fill + preview).
+
+```sh
+./scripts/zarr-sync.sh                                   # v2 2B-L~beta2
+DRY_RUN=1 ./scripts/zarr-sync.sh                         # plan only
+VARIANT=2B-L~beta1 ZONE_JOBS=30 WORKERS=8 ./scripts/zarr-sync.sh
+```
+
+Key variables: `VERSION`/`VARIANT` select the dataset; `PREVIEW_YEAR`
+(default 2024) the published pyramid year; `REF` pins the git ref to
+install; `PROFILE` the AWS profile with write access; `ZONE_JOBS`×`WORKERS`
+size the fill pool; `WORKDIR` holds the sync baseline, logs and preview
+markers — point every run at the same one. Anything after the environment
+is forwarded: `./scripts/zarr-sync.sh --force-rewrite` etc.
+
+New *years* are deliberately not appended: run
+`geotessera-registry zarr-extend` by hand, and the deferred tiles sync on
+the next run.
+
 ## zarr-preview.sh — global RGB preview pyramid
 
 Renders one year of a store into the EPSG:4326 RGB pyramid at

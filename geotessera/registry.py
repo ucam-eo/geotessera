@@ -50,6 +50,7 @@ KNOWN_DATASETS = (
     ("1.1", "cambridge", "v1.1-cam"),
     ("1.1", "dclimate", None),  # complete global v1.1 run — coming soon
     ("2.0", "2B-L~beta1", "v2-2B-L~beta1"),
+    ("2.0", "2B-L~beta2", "v2-2B-L~beta2"),
 )
 
 # Each version's default variant is the first *published* (non-None)
