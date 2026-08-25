@@ -199,15 +199,25 @@ check(
 from pyproj import Transformer  # noqa: E402  (import here keeps the header light)
 
 
+import zarr  # noqa: E402
+
+
 def _fake_store(zone_datasets, n_bands=4):
-    """A GeoTesseraZarr with its zone cache pre-filled — no store opened."""
+    """A GeoTesseraZarr over in-memory zarr groups built from the datasets."""
     gt = GeoTesseraZarr.__new__(GeoTesseraZarr)
     gt.url = "fake://"
     gt.model_version = ""
     gt.build_version = ""
     gt.n_bands = n_bands
     gt.years = [2024]
+    gt.depths = {n_bands: "embeddings"}
     gt._cache = dict(zone_datasets)
+    gt._root = zarr.group()
+    for zone, ds in zone_datasets.items():
+        group = gt._root.create_group(f"utm{zone:02d}")
+        for name, var in ds.data_vars.items():
+            arr = group.create_array(name, shape=var.shape, dtype=var.dtype)
+            arr[:] = var.values
     return gt
 
 
@@ -287,7 +297,10 @@ gt_seam = _fake_store({30: _seam_zone(32630, True), 31: _seam_zone(32631, False)
 patch, transform, crs = gt_seam.read_patch(0.0, 52.0, 2024, 64)
 
 check("a seam patch has the exact shape asked for", patch.shape == (64, 64, 4))
-check("a seam patch comes back in a patch-centred CRS", "+proj=tmerc" in crs)
+check(
+    "a seam patch comes back in a named patch-centred CRS",
+    "Transverse Mercator" in crs and "Tessera patch" in crs,
+)
 coverage = np.isfinite(patch).any(axis=2).mean()
 check("a seam patch is covered from both zones", coverage > 0.98)
 check(
@@ -367,29 +380,6 @@ vals = gt_overlap.sample_points([_gap_pt], 2024, progress=False)
 check(
     "a point in the owner's gap is served by the zone next door",
     np.allclose(vals[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
-)
-
-# The zarr-native point reader must agree with the Dataset path.
-import zarr  # noqa: E402
-
-_zroot = zarr.group()
-_zg = _zroot.create_group("utm53")
-_ze = _zg.create_array("embeddings", shape=(1, 4, 12, 12), dtype="int8")
-_ze[:] = np.tile(np.arange(1, 5, dtype=np.int8)[:, None, None], (1, 12, 12))[None]
-_zs = _zg.create_array("scales", shape=(1, 12, 12), dtype="float32")
-_zs[:] = np.full((1, 12, 12), np.float32(0.05))
-
-gt_native = _fake_store({53: flat})
-gt_native._root = _zroot
-_pt = _back53 = Transformer.from_crs(
-    flat.attrs["proj:code"], "EPSG:4326", always_xy=True
-).transform(float(flat.x[6]), float(flat.y[6]))
-_native = gt_native.sample_points([_pt], 2024, progress=False)
-_ds_path = _fake_store({53: flat}).sample_points([_pt], 2024, progress=False)
-check(
-    "the zarr-native point reader agrees with the Dataset path",
-    np.array_equal(_native, _ds_path)
-    and np.allclose(_native[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
 )
 
 # ---------------------------------------------------------------------------

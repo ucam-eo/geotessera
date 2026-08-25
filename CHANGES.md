@@ -186,6 +186,18 @@ There are several new variants availabile, see `geotessera info`:
 
 ### Bug Fixes
 
+- A single-zone `read_patch` reads its window through zarr's own pipeline
+  instead of a dask `reindex` that materialised whole shard chunks — a
+  64 px patch dropped from minutes to seconds.  Its two dask progress
+  bars (scales, then embeddings) had suggested two UTM zones were being
+  queried; they were not.  Reported by Aneesh Naik. (@avsm)
+
+- The cross-zone `read_patch` CRS is returned as WKT with a descriptive
+  name ("Tessera patch Transverse Mercator lon_0=...") rather than an
+  anonymous PROJ.4 string.  Single-zone patches keep returning the
+  zone's EPSG code; no EPSG code exists for the patch-centred meridian.
+  Reported by Aneesh Naik. (@avsm)
+
 - `read_region` and `iter_region` size their window from all four corners
   of the lon/lat bbox.  Northing extremes sit on different corners as the
   UTM grid curves away from the central meridian, so the old two-corner

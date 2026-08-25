@@ -294,12 +294,19 @@ def _patch_crs(lon: float, lat: float) -> str:
 
     UTM's projection, centred on the patch rather than on a 6-degree zone,
     which keeps distortion small and symmetric whatever the patch spans.
+    Returned as WKT with a descriptive name; no EPSG code exists for an
+    arbitrary central meridian.
     """
+    from pyproj import CRS
+
     y0 = 0 if lat >= 0 else 10000000
-    return (
+    crs = CRS.from_proj4(
         f"+proj=tmerc +lat_0=0 +lon_0={lon:.8f} +k=0.9996 "
         f"+x_0=500000 +y_0={y0} +datum=WGS84 +units=m +no_defs"
     )
+    named = crs.to_json_dict()
+    named["name"] = f"Tessera patch Transverse Mercator lon_0={lon:.4f}"
+    return CRS.from_json_dict(named).to_wkt()
 
 
 def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
@@ -908,14 +915,8 @@ class GeoTesseraZarr:
         return self.depths[depth], depth
 
     def _point_reader(self, zone: int, ds: xr.Dataset, year: int, array: str):
-        """A pixel-index reader through zarr's own concurrent pipeline,
-        or None when this store has no zarr group and the Dataset path
-        serves instead."""
-        root = getattr(self, "_root", None)
-        name = f"utm{zone:02d}"
-        if root is None or name not in root:
-            return None
-        group = root[name]
+        """A pixel-index reader through zarr's own concurrent pipeline."""
+        group = self._root[f"utm{zone:02d}"]
         ti = int(np.flatnonzero(ds["time"].values == year)[0])
 
         def read(xi, yi):
@@ -1023,17 +1024,8 @@ class GeoTesseraZarr:
         zone_crs = acc.crs
         utm_bbox = _utm_envelope(bbox, zone_crs)
 
-        root = getattr(self, "_root", None)
-        name = f"utm{z:02d}"
-        if root is None or name not in root:
-            for block, transform in acc.iter_region(
-                utm_bbox, year, array=array, strip_rows=strip_rows, progress=progress
-            ):
-                yield block, transform, zone_crs
-            return
-
         # A strip is one getitem, so its chunk fetches run concurrently.
-        group = root[name]
+        group = self._root[f"utm{z:02d}"]
         xs, ys = ds["x"].values, ds["y"].values
         x0 = int(np.searchsorted(xs, utm_bbox[0], "left"))
         x1 = int(np.searchsorted(xs, utm_bbox[2], "right"))
@@ -1134,35 +1126,33 @@ class GeoTesseraZarr:
         array: str,
         progress: bool,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
-        """Slice a patch straight off one zone's grid, NaN-padded at edges."""
+        """Slice a patch straight off one zone's grid, NaN-padded at edges.
+
+        One getitem through zarr's own pipeline; reading through dask
+        would materialise whole shard chunks for a small window.
+        """
         acc = ds.tessera
         px = acc.pixel_size
+        xs, ys = ds["x"].values, ds["y"].values
+        ix = int(np.abs(xs - centre_e).argmin())
+        iy = int(np.abs(ys - centre_n).argmin())
+        x0, y0 = ix - size_px // 2, iy - size_px // 2
+        cx0, cx1 = max(0, x0), min(len(xs), x0 + size_px)
+        cy0, cy1 = max(0, y0), min(len(ys), y0 + size_px)
 
-        # Off-grid pixels get a NaN scale, which dequantise() masks.
-        near = ds.sel(x=centre_e, y=centre_n, method="nearest")
-        offsets = (np.arange(size_px) - size_px // 2) * px
-        want_x = float(near["x"]) + offsets
-        want_y = float(near["y"]) - offsets
-        sub = ds[[array, "scales"]].sel(time=year).reindex(
-            x=want_x,
-            y=want_y,
-            method="nearest",
-            tolerance=0.5 * px,
-            fill_value={array: np.int8(0), "scales": np.float32("nan")},
-        )
-        if progress:
-            from dask.diagnostics import ProgressBar
-
-            with ProgressBar():
-                scales = sub["scales"].values
-                emb_int8 = sub[array].values
-        else:
-            scales = sub["scales"].values
-            emb_int8 = sub[array].values
-        out = acc.dequantise(emb_int8, scales)
+        out = np.full((size_px, size_px, int(ds[array].shape[1])), np.nan, np.float32)
+        if cx1 > cx0 and cy1 > cy0:
+            group = self._root[f"utm{int(acc.crs.split(':')[1]) % 100:02d}"]
+            ti = int(np.flatnonzero(ds["time"].values == year)[0])
+            with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
+                emb_int8 = group[array][ti, :, cy0:cy1, cx0:cx1]
+                scales = group["scales"][ti, cy0:cy1, cx0:cx1]
+            out[cy0 - y0 : cy1 - y0, cx0 - x0 : cx1 - x0] = acc.dequantise(
+                emb_int8, scales
+            )
 
         transform = rasterio.transform.Affine(
-            px, 0, want_x[0] - 0.5 * px, 0, -px, want_y[0] + 0.5 * px
+            px, 0, (xs[0] - 0.5 * px) + x0 * px, 0, -px, (ys[0] + 0.5 * px) - y0 * px
         )
         self._log_patch_coverage(out, size_px)
         return out, transform, acc.crs
