@@ -64,6 +64,18 @@ There are several new variants availabile, see `geotessera info`:
   from a busy data server costs a chunk, not the whole read.  `obstore`
   is a new dependency. (@avsm)
 
+- Matryoshka depth reads.  `sample_points`, `read_region`, `iter_region`
+  and `read_patch` take `depth=` on stores that declare depth arrays
+  (v2 onwards): `depth=16` reads the 16-dimension `embeddings_d16`
+  prefix for an eighth of the bytes, dequantised by the shared `scales`
+  as usual.  A store without the requested depth raises and lists what
+  it has. (@avsm)
+
+- `read_region_quantized` on `GeoTesseraZarr` and the `.tessera`
+  accessor returns the int8 window and its scales without dequantising,
+  at a quarter of the bytes of `read_region`; combined with `depth=16`
+  a window costs 1/32 of the full float32 mosaic. (@avsm)
+
 - A new `iter_region(bbox, year, strip_rows=...)` on `GeoTesseraZarr` and
   the `.tessera` accessor streams a region as row strips of dequantised
   pixels with their transforms, downloading the next strip while the
@@ -173,6 +185,18 @@ There are several new variants availabile, see `geotessera info`:
   (@avsm)
 
 ### Bug Fixes
+
+- A single-zone `read_patch` reads its window through zarr's own pipeline
+  instead of a dask `reindex` that materialised whole shard chunks — a
+  64 px patch dropped from minutes to seconds.  Its two dask progress
+  bars (scales, then embeddings) had suggested two UTM zones were being
+  queried; they were not.  Reported by Aneesh Naik. (@avsm)
+
+- The cross-zone `read_patch` CRS is returned as WKT with a descriptive
+  name ("Tessera patch Transverse Mercator lon_0=...") rather than an
+  anonymous PROJ.4 string.  Single-zone patches keep returning the
+  zone's EPSG code; no EPSG code exists for the patch-centred meridian.
+  Reported by Aneesh Naik. (@avsm)
 
 - `read_region` and `iter_region` size their window from all four corners
   of the lon/lat bbox.  Northing extremes sit on different corners as the
