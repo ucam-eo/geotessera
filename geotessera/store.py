@@ -41,16 +41,19 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import timedelta
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 import rasterio.transform
 import xarray as xr
 import zarr
+from obstore.store import HTTPStore
 from pyproj import Transformer
 from rasterio.warp import Resampling, reproject
 from rich.progress import track
+from zarr.storage import ObjectStore
 
 from .registry import zarr_store_url
 
@@ -60,6 +63,35 @@ DEFAULT_STORE = zarr_store_url("v1")
 
 # Shard-aligned chunk sizes so dask tasks match zarr shards
 SHARD_CHUNKS = {"time": 1, "band": 128, "y": 4096, "x": 4096}
+
+# obstore retries each request with exponential backoff and jitter, so
+# one dropped response from a busy server costs a chunk, not the read.
+RETRY_CONFIG = {
+    "max_retries": 5,
+    "backoff": {
+        "init_backoff": timedelta(seconds=1),
+        "max_backoff": timedelta(seconds=30),
+        "base": 2,
+    },
+    "retry_timeout": timedelta(minutes=5),
+}
+
+CLIENT_OPTIONS = {"timeout": timedelta(seconds=120)}
+
+# Chunk fetches in flight for reads through zarr's own pipeline.  Remote
+# reads are latency-bound, so more than zarr's default of 10 helps; kept
+# scoped, since dask paths multiply it by their thread count.
+POINT_CONCURRENCY = 32
+
+
+def _zarr_location(url: str):
+    """Where zarr should read *url* from: a retrying store for http(s)."""
+    if url.startswith(("http://", "https://")):
+        http = HTTPStore.from_url(
+            url, retry_config=RETRY_CONFIG, client_options=CLIENT_OPTIONS
+        )
+        return ObjectStore(http, read_only=True)
+    return url
 
 
 def enable_http_logging(level: int = logging.DEBUG) -> None:
@@ -121,12 +153,96 @@ SEAM_DEGREES = 0.1
 VALID, WATER, NODATA, OUTSIDE = "valid", "water", "nodata", "outside"
 
 
+def _prefetched(load, tops):
+    """Yield ``load(t)`` for each t, loading one step ahead on a thread."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    tops = list(tops)
+    if not tops:
+        return
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(load, tops[0])
+        for i in range(len(tops)):
+            ready = pending.result()
+            if i + 1 < len(tops):
+                pending = pool.submit(load, tops[i + 1])
+            yield ready
+
+
 def _sample_each(sample_at, coords, progress: bool) -> np.ndarray:
     """Apply a per-point ``sample_at(x, y)`` across *coords*, giving ``(N, B)``."""
     it = coords
     if progress:
         it = track(coords, description="Sampling points...", transient=True)
     return np.array([sample_at(x, y) for x, y in it])
+
+
+# Causes a bulk read can assign to a point; only some deserve a retry
+# through the per-point path.
+_OK, _WATER, _HOLE, _OUT = 0, 1, 2, 3
+
+
+def _nearest_indices(ascending: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    """Index of the nearest value in a sorted array, for each target."""
+    i = np.clip(np.searchsorted(ascending, targets), 1, len(ascending) - 1)
+    left, right = ascending[i - 1], ascending[i]
+    return np.where(targets - left <= right - targets, i - 1, i)
+
+
+def _bulk_sample(
+    ds: xr.Dataset,
+    es: np.ndarray,
+    ns: np.ndarray,
+    year: int,
+    read=None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Nearest-pixel embeddings for arrays of zone-CRS points, in one read.
+
+    Returns ``(values, cause)``: ``(N, B)`` float32, NaN wherever cause
+    is not ``_OK``.  No repair happens here; callers retry those rows
+    per point.  ``read(xi, yi)`` fetches ``(embeddings, scales)``; the
+    default reads through the Dataset.
+    """
+    acc = ds.tessera
+    es = np.asarray(es, dtype=float)
+    ns = np.asarray(ns, dtype=float)
+    xname, yname = ("xc", "yc") if "xc" in ds.coords else ("x", "y")
+    xs, ys = ds.coords[xname].values, ds.coords[yname].values
+    px = acc.pixel_size
+
+    values = np.full((len(es), acc.n_bands), np.nan, np.float32)
+    cause = np.full(len(es), _OUT, np.int8)
+    inside = (
+        (es >= xs[0] - px)
+        & (es <= xs[-1] + px)
+        & (ns <= ys[0] + px)
+        & (ns >= ys[-1] - px)
+    )
+    if not inside.any():
+        return values, cause
+
+    xi = _nearest_indices(xs, es[inside])
+    yi = len(ys) - 1 - _nearest_indices(ys[::-1], ns[inside])
+    if read is None:
+
+        def read(xi, yi):
+            sel = ds.sel(time=year).isel(
+                {
+                    xname: xr.DataArray(xi, dims="points"),
+                    yname: xr.DataArray(yi, dims="points"),
+                }
+            )
+            return sel["embeddings"].values.T, sel["scales"].values
+
+    emb, scales = read(xi, yi)
+    emb = emb.astype(np.float32) * np.where(
+        np.isfinite(scales), scales, np.nan
+    )[:, None]
+    values[inside] = emb
+    cause[inside] = np.where(
+        np.isnan(scales), _WATER, np.where(np.isinf(scales), _HOLE, _OK)
+    )
+    return values, cause
 
 
 def _resolve_zone(
@@ -194,6 +310,24 @@ def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
     return [(zc - 1 + o) % 60 + 1 for o in range(min(offs), max(offs) + 1)]
 
 
+def _utm_envelope(
+    bbox: Tuple[float, float, float, float], crs: str
+) -> Tuple[float, float, float, float]:
+    """The UTM extent enclosing a lon/lat bbox, from all four corners.
+
+    Northing extremes sit on different corners as the grid curves away
+    from the central meridian; two corners under-cover a wide box.
+    """
+    corners = [
+        _project(lon, lat, "EPSG:4326", crs)
+        for lon in (bbox[0], bbox[2])
+        for lat in (bbox[1], bbox[3])
+    ]
+    es = [c[0] for c in corners]
+    ns = [c[1] for c in corners]
+    return min(es), min(ns), max(es), max(ns)
+
+
 def open_zone(
     store_url: str = DEFAULT_STORE,
     *,
@@ -224,7 +358,7 @@ def open_zone(
 
     log.debug("open_zone: utm%02d from %s", z, store_url)
     ds = xr.open_zarr(
-        store_url,
+        _zarr_location(store_url),
         group=f"utm{z:02d}",
         zarr_format=3,
         consolidated=True,
@@ -385,12 +519,29 @@ class TesseraAccessor:
         *,
         progress: bool = True,
     ) -> np.ndarray:
-        """Sample embeddings at points.  Returns ``(N, B)`` float32.
+        """Sample embeddings at points in one vectorised read.
 
         Args:
             coords: List of ``(easting, northing)`` in this zone's CRS.
+
+        Returns ``(N, B)`` float32, NaN for water and points beyond the
+        grid.  Unwritten pixels retry through :meth:`sample_at`.
         """
-        return _sample_each(lambda e, n: self.sample_at(e, n, year), coords, progress)
+        coords = list(coords)
+        if not coords:
+            return np.empty((0, self.n_bands), np.float32)
+        es = np.array([c[0] for c in coords], dtype=float)
+        ns = np.array([c[1] for c in coords], dtype=float)
+        values, cause = _bulk_sample(self._ds, es, ns, year)
+        holes = np.flatnonzero(cause == _HOLE)
+        it = (
+            track(holes, description="Repairing pixels...", transient=True)
+            if progress and len(holes)
+            else holes
+        )
+        for i in it:
+            values[i] = self.sample_at(es[i], ns[i], year)
+        return values
 
     # -- Region reading -----------------------------------------------------
 
@@ -442,6 +593,49 @@ class TesseraAccessor:
         transform = rasterio.transform.Affine(self._px, 0, x0, 0, -self._px, y0)
         return mosaic, transform
 
+    def iter_region(
+        self,
+        bbox: Tuple[float, float, float, float],
+        year: int,
+        *,
+        strip_rows: int = 512,
+        progress: bool = False,
+    ) -> Iterator[Tuple[np.ndarray, rasterio.transform.Affine]]:
+        """:meth:`read_region` as a stream of row strips.
+
+        Yields ``(block, transform)`` top to bottom, each block a
+        ``(strip_rows, W, B)`` float32 slice of the region, downloading
+        the next strip while the caller works on the current one.  For a
+        dask-native pipeline, apply ``xarray.apply_ufunc`` to the
+        Dataset instead.
+
+        Args:
+            bbox: ``(e_min, n_min, e_max, n_max)`` in this zone's CRS.
+            strip_rows: Rows per yielded block.
+        """
+        e_min, e_max = min(bbox[0], bbox[2]), max(bbox[0], bbox[2])
+        n_min, n_max = min(bbox[1], bbox[3]), max(bbox[1], bbox[3])
+        sub = self._ds.sel(time=year, x=slice(e_min, e_max), y=slice(n_max, n_min))
+        height = int(sub.sizes["y"])
+
+        def load(top):
+            strip = sub.isel(y=slice(top, min(top + strip_rows, height)))
+            # One or two dask tasks per strip; raise zarr's per-task concurrency.
+            with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
+                block = self.dequantise(
+                    strip["embeddings"].values, strip["scales"].values
+                )
+            x0 = float(strip["x"].values[0]) - 0.5 * self._px
+            y0 = float(strip["y"].values[0]) + 0.5 * self._px
+            return block, rasterio.transform.Affine(
+                self._px, 0, x0, 0, -self._px, y0
+            )
+
+        tops = range(0, height, strip_rows)
+        if progress:
+            tops = track(list(tops), description="Reading strips...", transient=True)
+        yield from _prefetched(load, tops)
+
 
 # ---------------------------------------------------------------------------
 # GeoTesseraZarr — store-level API with zone routing
@@ -476,7 +670,8 @@ class GeoTesseraZarr:
 
     def __init__(self, store_url: str = DEFAULT_STORE):
         self.url = store_url.rstrip("/")
-        root = zarr.open_group(self.url, mode="r")
+        root = zarr.open_group(_zarr_location(self.url), mode="r")
+        self._root = root
         root_attrs = dict(root.attrs)
         self.model_version: str = root_attrs.get("geoemb:model", "")
         self.build_version: str = root_attrs.get("geoemb:build_version", "")
@@ -614,15 +809,70 @@ class GeoTesseraZarr:
             cross_zone: See :meth:`sample_at`.
             search_px: See :meth:`sample_at`.
 
-        Returns ``(N, B)`` float32.  Points without an embedding get NaN rows.
+        Returns ``(N, B)`` float32, one bulk read per UTM zone, NaN rows
+        for points without an embedding.  Unwritten pixels and points
+        near a zone seam retry through :meth:`sample_at`.
         """
-        return _sample_each(
-            lambda lon, lat: self.sample_at(
-                lon, lat, year, cross_zone=cross_zone, search_px=search_px
-            ),
-            coords,
-            progress,
+        coords = list(coords)
+        if not coords:
+            return np.empty((0, self.n_bands), np.float32)
+        lons = np.array([c[0] for c in coords], dtype=float)
+        lats = np.array([c[1] for c in coords], dtype=float)
+        values = np.full((len(coords), self.n_bands), np.nan, np.float32)
+        cause = np.full(len(coords), _OUT, np.int8)
+
+        zones = np.array([_zone_for_lon(lon) for lon in lons])
+        for z in np.unique(zones):
+            idx = np.flatnonzero(zones == z)
+            try:
+                ds = self.open_zone(zone=int(z))
+            except KeyError:
+                continue  # not in this store; the seam retry may still answer
+            es, ns = _transformer("EPSG:4326", ds.tessera.crs).transform(
+                lons[idx], lats[idx]
+            )
+            values[idx], cause[idx] = _bulk_sample(
+                ds, es, ns, year, read=self._point_reader(int(z), ds, year)
+            )
+
+        near_seam = np.array([bool(_seam_neighbours(lon)) for lon in lons])
+        retry = ((cause == _HOLE) & (search_px > 0)) | (
+            (cause != _OK) & near_seam & cross_zone
         )
+        retry_idx = np.flatnonzero(retry)
+        it = (
+            track(retry_idx, description="Repairing points...", transient=True)
+            if progress and len(retry_idx)
+            else retry_idx
+        )
+        for i in it:
+            values[i] = self.sample_at(
+                lons[i], lats[i], year, cross_zone=cross_zone, search_px=search_px
+            )
+        return values
+
+    def _point_reader(self, zone: int, ds: xr.Dataset, year: int):
+        """A pixel-index reader through zarr's own concurrent pipeline,
+        or None when this store has no zarr group and the Dataset path
+        serves instead."""
+        root = getattr(self, "_root", None)
+        name = f"utm{zone:02d}"
+        if root is None or name not in root:
+            return None
+        group = root[name]
+        ti = int(np.flatnonzero(ds["time"].values == year)[0])
+
+        def read(xi, yi):
+            bands = np.arange(ds.tessera.n_bands)
+            t, b, y, x = np.broadcast_arrays(
+                np.full((len(xi), 1), ti), bands[None, :], yi[:, None], xi[:, None]
+            )
+            with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
+                emb = group["embeddings"].vindex[t, b, y, x]
+                scales = group["scales"].vindex[np.full(len(xi), ti), yi, xi]
+            return emb, scales
+
+        return read
 
     # -- Region reading (dominant zone) -------------------------------------
 
@@ -659,20 +909,64 @@ class GeoTesseraZarr:
         ds = self.open_zone(zone=z)
         zone_crs = ds.tessera.crs
 
-        # Project the corners to pick the window; the data itself is never
-        # resampled.  A lon/lat box is not axis-aligned in UTM, so take the
-        # enclosing easting/northing extent.
-        e_nw, n_nw = _project(bbox[0], bbox[3], "EPSG:4326", zone_crs)
-        e_se, n_se = _project(bbox[2], bbox[1], "EPSG:4326", zone_crs)
-        utm_bbox = (
-            min(e_nw, e_se),
-            min(n_nw, n_se),
-            max(e_nw, e_se),
-            max(n_nw, n_se),
-        )
-
+        utm_bbox = _utm_envelope(bbox, zone_crs)
         mosaic, transform = ds.tessera.read_region(utm_bbox, year, progress=progress)
         return mosaic, transform, zone_crs
+
+    def iter_region(
+        self,
+        bbox: Tuple[float, float, float, float],
+        year: int,
+        *,
+        strip_rows: int = 512,
+        progress: bool = False,
+    ) -> Iterator[Tuple[np.ndarray, rasterio.transform.Affine, str]]:
+        """:meth:`read_region` as a stream of row strips.
+
+        Yields ``(block, transform, crs)`` top to bottom; see
+        :meth:`TesseraAccessor.iter_region`.  Routed like
+        :meth:`read_region`, to the zone holding the bbox centre.
+        """
+        z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
+        ds = self.open_zone(zone=z)
+        acc = ds.tessera
+        zone_crs = acc.crs
+        utm_bbox = _utm_envelope(bbox, zone_crs)
+
+        root = getattr(self, "_root", None)
+        name = f"utm{z:02d}"
+        if root is None or name not in root:
+            for block, transform in acc.iter_region(
+                utm_bbox, year, strip_rows=strip_rows, progress=progress
+            ):
+                yield block, transform, zone_crs
+            return
+
+        # A strip is one getitem, so its chunk fetches run concurrently.
+        group = root[name]
+        xs, ys = ds["x"].values, ds["y"].values
+        x0 = int(np.searchsorted(xs, utm_bbox[0], "left"))
+        x1 = int(np.searchsorted(xs, utm_bbox[2], "right"))
+        y0 = int(np.searchsorted(-ys, -utm_bbox[3], "left"))
+        y1 = int(np.searchsorted(-ys, -utm_bbox[1], "right"))
+        ti = int(np.flatnonzero(ds["time"].values == year)[0])
+        px = acc.pixel_size
+
+        def load(top):
+            end = min(top + strip_rows, y1)
+            with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
+                emb = group["embeddings"][ti, :, top:end, x0:x1]
+                scales = group["scales"][ti, top:end, x0:x1]
+            transform = rasterio.transform.Affine(
+                px, 0, xs[x0] - 0.5 * px, 0, -px, ys[top] + 0.5 * px
+            )
+            return acc.dequantise(emb, scales), transform
+
+        tops = range(y0, y1, strip_rows)
+        if progress:
+            tops = track(list(tops), description="Reading strips...", transient=True)
+        for block, transform in _prefetched(load, tops):
+            yield block, transform, zone_crs
 
     # -- Patch reading (cross-zone) ------------------------------------------
 

@@ -325,6 +325,116 @@ patch, transform, crs = gt_one.read_patch(_clon, _clat, 2024, 6, dst_crs="EPSG:3
 check("an explicit dst_crs is honoured", crs == "EPSG:3857" and patch.shape == (6, 6, 4))
 
 
+# ---------------------------------------------------------------------------
+# Bulk point sampling (sample_points)
+# ---------------------------------------------------------------------------
+
+# One vectorised read must answer like the per-point path.
+_far = float(holed.x[0]) - 10_000.0
+vals = holed.tessera.sample_points(
+    [(cx - 10, cy), (cx, cy), (_far, cy)], 2024, progress=False
+)
+check(
+    "bulk sampling reads land natively and repairs the hole",
+    np.allclose(vals[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6)
+    and np.allclose(vals[1], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
+)
+check("bulk sampling reports beyond-grid points as NaN", np.all(np.isnan(vals[2])))
+check(
+    "bulk sampling answers water as NaN without repairing it",
+    np.all(np.isnan(watery.tessera.sample_points(
+        [(float(watery.x[2]), float(watery.y[2]))], 2024, progress=False))),
+)
+
+# Store level: one bulk read per zone, seam gaps served by the neighbour.
+_t30 = Transformer.from_crs("EPSG:4326", "EPSG:32630", always_xy=True)
+_t31 = Transformer.from_crs("EPSG:4326", "EPSG:32631", always_xy=True)
+_seam30 = _t30.transform(0.0, 52.0)
+_seam31 = _t31.transform(0.0, 52.0)
+_back30 = Transformer.from_crs("EPSG:32630", "EPSG:4326", always_xy=True)
+_back31 = Transformer.from_crs("EPSG:32631", "EPSG:4326", always_xy=True)
+_west_pt = _back30.transform(_seam30[0] - 500.0, _seam30[1])
+_east_pt = _back31.transform(_seam31[0] + 500.0, _seam31[1])
+_gap_pt = _back31.transform(_seam31[0] + 15.0, _seam31[1])  # zone 31 starts 3 px in
+
+vals = gt_seam.sample_points([_west_pt, _east_pt], 2024, progress=False)
+check(
+    "store-level bulk sampling routes zones and preserves order",
+    np.allclose(vals[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6)
+    and np.allclose(vals[1], np.array([1, 2, 3, 4]) * 0.07, atol=1e-6),
+)
+vals = gt_overlap.sample_points([_gap_pt], 2024, progress=False)
+check(
+    "a point in the owner's gap is served by the zone next door",
+    np.allclose(vals[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
+)
+
+# The zarr-native point reader must agree with the Dataset path.
+import zarr  # noqa: E402
+
+_zroot = zarr.group()
+_zg = _zroot.create_group("utm53")
+_ze = _zg.create_array("embeddings", shape=(1, 4, 12, 12), dtype="int8")
+_ze[:] = np.tile(np.arange(1, 5, dtype=np.int8)[:, None, None], (1, 12, 12))[None]
+_zs = _zg.create_array("scales", shape=(1, 12, 12), dtype="float32")
+_zs[:] = np.full((1, 12, 12), np.float32(0.05))
+
+gt_native = _fake_store({53: flat})
+gt_native._root = _zroot
+_pt = _back53 = Transformer.from_crs(
+    flat.attrs["proj:code"], "EPSG:4326", always_xy=True
+).transform(float(flat.x[6]), float(flat.y[6]))
+_native = gt_native.sample_points([_pt], 2024, progress=False)
+_ds_path = _fake_store({53: flat}).sample_points([_pt], 2024, progress=False)
+check(
+    "the zarr-native point reader agrees with the Dataset path",
+    np.array_equal(_native, _ds_path)
+    and np.allclose(_native[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6),
+)
+
+# ---------------------------------------------------------------------------
+# Streamed region reads (iter_region)
+# ---------------------------------------------------------------------------
+
+_box = (float(flat.x[1]), float(flat.y[10]), float(flat.x[10]), float(flat.y[1]))
+_whole, _t_whole = flat.tessera.read_region(_box, 2024)
+_strips = list(flat.tessera.iter_region(_box, 2024, strip_rows=4))
+check(
+    "iter_region strips concatenate to exactly read_region",
+    np.array_equal(
+        np.concatenate([b for b, _ in _strips], axis=0), _whole, equal_nan=True
+    ),
+)
+check(
+    "the first strip shares read_region's transform and later ones step down",
+    _strips[0][1] == _t_whole
+    and _strips[1][1].f == _t_whole.f - 4 * flat.tessera.pixel_size,
+)
+
+# ---------------------------------------------------------------------------
+# Per-request HTTP retries (obstore wiring)
+# ---------------------------------------------------------------------------
+
+from zarr.storage import ObjectStore  # noqa: E402
+
+from geotessera.store import RETRY_CONFIG, _zarr_location  # noqa: E402
+
+_loc = _zarr_location("https://example.org/store")
+check(
+    "an http url reads through an obstore store with retries configured",
+    isinstance(_loc, ObjectStore)
+    and _loc.store.retry_config["max_retries"] == RETRY_CONFIG["max_retries"],
+)
+check(
+    "a local path passes through untouched",
+    _zarr_location("/tmp/store.zarr") == "/tmp/store.zarr",
+)
+check(
+    "an s3 url passes through to fsspec",
+    _zarr_location("s3://bucket/store") == "s3://bucket/store",
+)
+
+
 if FAILED:
     print(f"{len(FAILED)} check(s) failed", file=sys.stderr)
     sys.exit(1)

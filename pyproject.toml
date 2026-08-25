@@ -35,6 +35,7 @@ dependencies = [
     "xarray",
     "rioxarray",
     "zarr",
+    "obstore",
     "dask",
     "fsspec",
     "aiohttp",
