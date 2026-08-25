@@ -434,6 +434,15 @@ check(
     _zarr_location("s3://bucket/store") == "s3://bucket/store",
 )
 
+from geotessera.registry import zarr_store_url  # noqa: E402
+
+check(
+    "version names resolve to their store path",
+    zarr_store_url("v1").endswith("/zarr/v1")
+    and zarr_store_url("v2").endswith("/zarr/v2-2B-L~beta1")
+    and zarr_store_url("v2-2B-L~beta1").endswith("/zarr/v2-2B-L~beta1"),
+)
+
 
 if FAILED:
     print(f"{len(FAILED)} check(s) failed", file=sys.stderr)

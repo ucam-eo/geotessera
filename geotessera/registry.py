@@ -500,9 +500,17 @@ def landmask_url(version_path: str, filename: str) -> str:
     return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/{filename}"
 
 
-def zarr_store_url(version_path: str) -> str:
-    """Default URL of the zarr store for *version_path* (e.g. ``"v1"``)."""
-    return f"{TESSERA_MIRROR_URL}/zarr/{version_path}"
+def zarr_store_url(version: str) -> str:
+    """Default URL of the zarr store for *version*.
+
+    Accepts a version name (``"v1"``, ``"v2"``), resolved through the
+    version's default variant, or an explicit store path such as
+    ``"v2-2B-L~beta1"``.
+    """
+    _, norm = _parse_dataset_version(version)
+    if norm in VERSION_DEFAULT_VARIANTS:
+        version = dataset_path(norm, default_variant(norm))
+    return f"{TESSERA_MIRROR_URL}/zarr/{version}"
 
 
 def format_bytes(num_bytes: float) -> str:

@@ -71,6 +71,10 @@ There are several new variants availabile, see `geotessera info`:
 
 ### New Features
 
+- `zarr_store_url` accepts version names: `zarr_store_url("v2")` resolves
+  to the v2 default variant's store, and explicit store paths still pass
+  through. (@avsm)
+
 - Zarr reads from `http(s)` stores go through `obstore`, which retries
   each request with exponential backoff and jitter — one dropped response
   from a busy data server costs a chunk, not the whole read.  `obstore`
