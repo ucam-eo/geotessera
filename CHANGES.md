@@ -54,6 +54,16 @@ There are several new variants availabile, see `geotessera info`:
 
 ### New Features
 
+- Zarr reads from `http(s)` stores go through `obstore`, which retries
+  each request with exponential backoff and jitter — one dropped response
+  from a busy data server costs a chunk, not the whole read.  `obstore`
+  is a new dependency. (@avsm)
+
+- A new `iter_region(bbox, year, strip_rows=...)` on `GeoTesseraZarr` and
+  the `.tessera` accessor streams a region as row strips of dequantised
+  pixels with their transforms, downloading the next strip while the
+  caller works on the current one. (@avsm)
+
 - A new `GeoTesseraZarr.read_patch(lon, lat, year, size_px)` returns a
   `(size_px, size_px, 128)` patch centred on a point.  A patch within one
   UTM zone is sliced from the native grid unresampled; one crossing a zone
@@ -141,10 +151,22 @@ There are several new variants availabile, see `geotessera info`:
 
 ### Performance
 
+- `sample_points` reads all points through zarr's own concurrent
+  pipeline, one coordinate-indexed read per UTM zone instead of one
+  request per point — about 19x faster on scattered points, more when
+  clustered.  Only unwritten pixels and seam points retry per point.
+  (@avsm)
+
 - Point sampling no longer rebuilds a pyproj transformer for every point.
   (@avsm)
 
 ### Bug Fixes
+
+- `read_region` and `iter_region` size their window from all four corners
+  of the lon/lat bbox.  Northing extremes sit on different corners as the
+  UTM grid curves away from the central meridian, so the old two-corner
+  window silently cropped a wide box by up to a couple of kilometres at
+  the top and bottom. (@avsm)
 
 - `coverage` renders a single-source dataset in the website's multi-colour
   year palette again, keeping per-source tints for maps that overlay

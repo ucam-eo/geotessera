@@ -563,6 +563,8 @@ front, rather than per call.
   mosaic on the zone's native UTM grid, with its transform and CRS
 - **Patch reading**: ``read_patch()`` returns a fixed-size square centred
   on a point, merged across UTM zones when the patch crosses a boundary
+- **Streaming**: ``iter_region()`` yields a region as row strips, for
+  inference over regions larger than memory
 - **Zone access**: ``open_zone()`` returns an xarray Dataset with a
   ``.tessera`` accessor for direct manipulation
 - **Diagnostics**: ``probe()`` returns ``(embedding, status)``, the status
