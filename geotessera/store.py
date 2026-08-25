@@ -46,7 +46,7 @@ import logging
 import math
 from datetime import timedelta
 from functools import lru_cache
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import rasterio.transform
@@ -56,6 +56,7 @@ from obstore.store import HTTPStore
 from pyproj import Transformer
 from rasterio.warp import Resampling, reproject
 from rich.progress import track
+from zarr.abc.store import Store as ZarrStore
 from zarr.storage import ObjectStore
 
 from .registry import zarr_store_url
@@ -87,14 +88,46 @@ CLIENT_OPTIONS = {"timeout": timedelta(seconds=120)}
 POINT_CONCURRENCY = 32
 
 
-def _zarr_location(url: str):
-    """Where zarr should read *url* from: a retrying store for http(s)."""
-    if url.startswith(("http://", "https://")):
+def zarr_store(location) -> ZarrStore:
+    """Open *location* as a ``zarr.abc.store.Store``.
+
+    *location* may be the URL of a Tessera zarr store, a local path, or
+    an existing ``Store``, which is returned unchanged.  Stores opened
+    from an http(s) URL retry failed requests with exponential backoff,
+    because a region read issues hundreds of requests and public data
+    servers drop some under load.  ``s3://`` and other URL schemes open
+    through fsspec.
+
+    :class:`GeoTesseraZarr` applies this function to the location it is
+    given, so calling it directly is only needed to customise the store
+    first.  For example, zarr's experimental ``CacheStore`` adds a local
+    cache::
+
+        store = CacheStore(
+            zarr_store(DEFAULT_STORE),
+            cache_store=LocalStore("tessera-cache"),
+            max_size=256 * 1024 * 1024,
+        )
+        gt = GeoTesseraZarr(store)
+
+    ``CacheStore`` persists whole-object reads and keeps byte-range
+    reads in memory, so chunk data is cached for the session and
+    metadata across runs.
+    """
+    if isinstance(location, ZarrStore):
+        return location
+    if location.startswith(("http://", "https://")):
         http = HTTPStore.from_url(
-            url, retry_config=RETRY_CONFIG, client_options=CLIENT_OPTIONS
+            location, retry_config=RETRY_CONFIG, client_options=CLIENT_OPTIONS
         )
         return ObjectStore(http, read_only=True)
-    return url
+    if "://" in location:
+        from zarr.storage import FsspecStore
+
+        return FsspecStore.from_url(location)
+    from zarr.storage import LocalStore
+
+    return LocalStore(location)
 
 
 def enable_http_logging(level: int = logging.DEBUG) -> None:
@@ -354,7 +387,7 @@ def open_zone(
     UTM zone.  Returns a Dataset with the ``.tessera`` accessor.
 
     Args:
-        store_url: Zarr store URL or local path.
+        store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``.
         zone: UTM zone number (1-60).
         lon: A longitude — zone is derived automatically.
         bbox: (min_lon, min_lat, max_lon, max_lat) — zone from centre.
@@ -370,7 +403,7 @@ def open_zone(
 
     log.debug("open_zone: utm%02d from %s", z, store_url)
     ds = xr.open_zarr(
-        _zarr_location(store_url),
+        zarr_store(store_url),
         group=f"utm{z:02d}",
         zarr_format=3,
         consolidated=True,
@@ -688,8 +721,10 @@ class GeoTesseraZarr:
     For single-zone work, use :func:`open_zone` directly.
 
     Args:
-        store_url: Zarr store URL or local path.  Defaults to the public
-            TESSERA store at ``data.source.coop/tessera/tessera/zarr``.
+        store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``
+            such as a cache-wrapped store from :func:`zarr_store`.
+            Defaults to the public TESSERA store at
+            ``data.source.coop/tessera/tessera/zarr``.
 
     Example::
 
@@ -707,9 +742,12 @@ class GeoTesseraZarr:
         )
     """
 
-    def __init__(self, store_url: str = DEFAULT_STORE):
-        self.url = store_url.rstrip("/")
-        root = zarr.open_group(_zarr_location(self.url), mode="r")
+    def __init__(self, store_url: Union[str, ZarrStore] = DEFAULT_STORE):
+        if isinstance(store_url, str):
+            store_url = store_url.rstrip("/")
+        self.url = str(store_url)
+        self._store = zarr_store(store_url)
+        root = zarr.open_group(self._store, mode="r")
         self._root = root
         root_attrs = dict(root.attrs)
         self.model_version: str = root_attrs.get("geoemb:model", "")
@@ -758,7 +796,7 @@ class GeoTesseraZarr:
         """
         z = _resolve_zone(zone, lon, bbox)
         if z not in self._cache:
-            ds = open_zone(self.url, zone=z)
+            ds = open_zone(self._store, zone=z)
             self._cache[z] = ds
         return self._cache[z]
 
