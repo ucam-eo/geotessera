@@ -30,6 +30,13 @@ representation maps at 10m resolution. These embeddings compress a full year of
 temporal-spectral features into dense representations optimized for downstream
 geospatial analysis tasks. Read more details about [the model](https://github.com/ucam-eo/tessera).
 
+The library offers two access paths. The [zarr backend](#cloud-native-zarr-access)
+streams embeddings directly from the public cloud store — no downloads, queries
+routed to the correct UTM zone, values returned dequantised on their native 10m
+grid — and is the recommended interface for analysis. The
+[tile download interface](#python-api) fetches embeddings as NPY or GeoTIFF
+files for offline work and GIS export.
+
 ![Coverage map](https://github.com/ucam-eo/tessera-coverage-map/blob/main/map.png)
 
 ### Request missing embeddings
@@ -54,12 +61,11 @@ Please note that if the artifacts you observe are slanted, this is not a bug in 
 ## Table of Contents
 
 - [Installation](#installation)
+- [Cloud-Native Zarr Access](#cloud-native-zarr-access)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Python API](#python-api)
-- [Cloud-Native Zarr Access](#cloud-native-zarr-access)
 - [CLI Reference](#cli-reference)
-- [Complete Workflows](#complete-workflows)
 - [Registry System](#registry-system)
 - [Data Organization](#data-organization)
 - [Contributing](#contributing)
@@ -82,11 +88,95 @@ uv sync --all-extras --dev   # or: pip install -e ".[docs]"
 Sphinx lives in the `docs` extra and the test harness in the `dev` group, so a
 plain `pip install geotessera` pulls in neither.
 
+## Cloud-Native Zarr Access
+
+The zarr backend streams embeddings directly from the public store. Nothing is
+downloaded up front: each query is routed to the UTM zone that holds it, and
+the values return dequantised as float32 on their native 10m UTM grid, never
+resampled. This is the recommended interface for analysis.
+
+```python
+from geotessera import GeoTesseraZarr
+
+gt = GeoTesseraZarr()
+print(gt.years)  # [2017, ..., 2025]
+
+# One embedding, with a status explaining any missing value
+vec, status = gt.probe(0.12, 52.20, year=2024)
+print(status)  # 'valid', 'water', 'nodata', or 'outside'
+
+# Many points, one bulk read per UTM zone
+X = gt.sample_points([(0.12, 52.20), (-2.97, 53.44)], year=2024)  # (2, 128)
+
+# A lon/lat bounding box as a mosaic on the native UTM grid
+bbox = (0.05, 52.15, 0.20, 52.25)
+mosaic, transform, crs = gt.read_region(bbox, year=2024)
+
+# A fixed-size patch centred on a point, merged across UTM zones when needed
+patch, transform, crs = gt.read_patch(0.12, 52.20, year=2024, size_px=256)
+
+# Stream a large region in row strips rather than holding it in memory
+for block, transform, crs in gt.iter_region(bbox, year=2024, strip_rows=512):
+    predictions = model.predict(block.reshape(-1, 128))
+```
+
+Other dataset versions are selected by store URL. v2 stores also publish
+matryoshka prefixes of each embedding, so `depth=16` reads the first 16
+dimensions for an eighth of the bytes:
+
+```python
+from geotessera.registry import zarr_store_url
+
+gt = GeoTesseraZarr(zarr_store_url("v2"))
+X16 = gt.sample_points(coords, year=2024, depth=16)  # (N, 16)
+```
+
+HTTP reads retry with exponential backoff, so a transient server error costs
+one chunk rather than the whole read. The constructor also accepts any
+`zarr.abc.store.Store`, so the store can be wrapped — for example in zarr's
+experimental `CacheStore`, which keeps fetched chunks for reuse across
+queries:
+
+```python
+from zarr.experimental.cache_store import CacheStore
+from zarr.storage import MemoryStore
+from geotessera.store import DEFAULT_STORE, zarr_store
+
+store = CacheStore(zarr_store(DEFAULT_STORE), cache_store=MemoryStore(),
+                   max_size=2 * 1024**3)
+gt = GeoTesseraZarr(store)
+```
+
+For direct access to one UTM zone, `gt.open_zone(lon=0.15)` returns an xarray
+dataset with a `.tessera` accessor that works in that zone's own eastings and
+northings. The store layout follows the `geoemb:` convention for geospatial
+embedding data; the
+[zarr quickstart](https://geotessera.readthedocs.io/en/latest/zarr_quickstart.html)
+and the [examples repository](https://github.com/ucam-eo/geotessera-examples)
+walk through complete workflows.
+
+### Agent Skill
+
+The repository ships an [Agent Skill](https://agentskills.io) that teaches
+coding agents the zarr interface. Claude Code users can install it as a
+plugin:
+
+```
+/plugin marketplace add ucam-eo/geotessera
+/plugin install geotessera@ucam-eo
+```
+
+The skill itself is [`skills/geotessera/SKILL.md`](skills/geotessera/SKILL.md),
+in the open Agent Skills format, so it also works with other
+SKILL.md-compatible agents when copied into their skills directory.
+
 ## Architecture
 
 ### Core Concepts
 
-GeoTessera is built around a simple two-step workflow:
+This section describes the tile download interface; the
+[zarr backend](#cloud-native-zarr-access) above streams the same embeddings
+without downloading files. The tile workflow has two steps:
 
 1. **Retrieve embeddings**: Fetch raw numpy arrays for a geographic bounding box
 2. **Export to desired format**: Save as raw numpy arrays or convert to georeferenced GeoTIFF files
@@ -230,7 +320,9 @@ geotessera serve ./london_web --open
 
 ### Core Methods
 
-The library provides two main methods for retrieving embeddings:
+The `GeoTessera` class downloads embedding tiles as files; for streaming
+access use the [zarr backend](#cloud-native-zarr-access). The tile interface
+provides two main methods for retrieving embeddings:
 
 ```python
 from geotessera import GeoTessera
@@ -335,39 +427,6 @@ visualize_global_coverage(
     tile_alpha=0.6
 )
 ```
-
-## Cloud-Native Zarr Access
-
-For interactive or large-scale analysis without downloading files, use the Zarr store.
-This streams data directly from the cloud:
-
-```python
-from geotessera.store import GeoTesseraZarr
-
-gt = GeoTesseraZarr()
-print(gt.years)  # [2017, 2018, ..., 2025]
-
-# Sample embeddings at specific points (no download needed)
-X = gt.sample_points([(-2.97, 53.44), (0.15, 52.05)], year=2025)
-print(f"Shape: {X.shape}")  # (2, 128)
-
-# Read a full region as a mosaic
-mosaic, transform, crs = gt.read_region(
-    (-3.0, 53.4, -2.9, 53.5), year=2025,
-)
-print(f"Mosaic shape: {mosaic.shape}")
-
-# Read a fixed-size patch centred on a point, whatever zones it spans
-patch, transform, crs = gt.read_patch(0.0, 52.2, year=2025, size_px=512)
-print(f"Patch shape: {patch.shape}")  # (512, 512, 128)
-
-# Work with individual UTM zones via xarray
-ds = gt.open_zone(lon=0.15)
-print(ds)
-```
-
-The Zarr store implements the `geoemb:` convention for geospatial embedding data
-and automatically routes queries to the correct UTM zone.
 
 ## CLI Reference
 
@@ -653,8 +712,10 @@ Remote Server (https://data.source.coop/tessera/tessera)
 │   └── v2/
 │       ├── landmasks.parquet
 │       └── grid_0.15_52.05.tiff
-└── zarr/                                      # Cloud-native zarr store
-    └── v1/                                    # 60 UTM zone groups + RGB pyramid
+└── zarr/                                      # Cloud-native zarr stores
+    ├── v1/                                    # 60 UTM zone groups + RGB pyramid
+    ├── v2-2B-L~beta1/                         # v2 stores add matryoshka
+    └── v2-2B-L~beta2/                         # prefix arrays (d4, d16)
 ```
 
 ### Local Cache Structure

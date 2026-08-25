@@ -1,0 +1,12 @@
+{
+  "name": "ucam-eo",
+  "owner": { "name": "Anil Madhavapeddy" },
+  "plugins": [
+    {
+      "name": "geotessera",
+      "source": "./",
+      "description": "Teach coding agents to read Tessera satellite embeddings via the geotessera zarr interface",
+      "version": "0.10.0"
+    }
+  ]
+}
