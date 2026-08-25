@@ -13,8 +13,8 @@ representations optimized for downstream geospatial analysis tasks.
    model wherever it's available; it's a strict improvement over the legacy
    1.0 line. The 1.1 currently runs in a ``cambridge`` variant — test
    embeddings produced by the Cambridge team while the model is being rolled
-   out (a complete global ``dclimate`` run is coming soon). A **TESSERA v2**
-   beta (variant ``2B-L~beta1``) is also appearing in the repository. The
+   out (a complete global ``dclimate`` run is coming soon). **TESSERA v2**
+   betas (``2B-L~beta1``, ``2B-L~beta2``) are also in the repository. The
    legacy 1.0 line is frozen (no new years will be added) but remains the
    default, as the only version with full global coverage. **Never mix
    embeddings from different versions or variants in the same downstream
@@ -26,10 +26,17 @@ representations optimized for downstream geospatial analysis tasks.
 Overview
 --------
 
-GeoTessera is built around a two-step workflow:
+GeoTessera offers two ways in:
 
-1. **Retrieve embeddings**: Fetch raw numpy arrays with CRS/transform information for a geographic bounding box
-2. **Export to desired format**: Save as raw numpy arrays or convert to georeferenced GeoTIFF files with preserved projections
+1. **Stream from the zarr store** (:class:`~geotessera.store.GeoTesseraZarr`):
+   read points, regions, and patches straight from the public cloud store,
+   dequantised on their native UTM grid, with nothing downloaded up front.
+   This is the recommended interface for most work — see the
+   :doc:`zarr_quickstart`.
+2. **Download tiles** (:class:`~geotessera.GeoTessera`): fetch 0.1-degree
+   tiles to disk and export them as numpy arrays or georeferenced GeoTIFF
+   files, for offline reuse and GIS integration — see the
+   :doc:`quickstart`.
 
 Key Features
 ------------
@@ -61,6 +68,17 @@ For development installation::
 
 Quick Start
 -----------
+
+Stream one embedding from the zarr store::
+
+    from geotessera import GeoTesseraZarr
+
+    gt = GeoTesseraZarr()
+    vec, status = gt.probe(0.12, 52.20, year=2024)   # (128,) float32, 'valid'
+
+The :doc:`zarr_quickstart` continues from here to regions, streams,
+patches, and matryoshka depths. The rest of this section covers the
+tile-download interface.
 
 Check data availability first::
 
@@ -289,6 +307,8 @@ variant as a suffix. Known datasets on ``data.source.coop/tessera/tessera``
 | ``2.0``     | ``2B-L~beta1``      | ``v2-2B-L~beta1/`` | 2017–2025      | TESSERA v2 beta (2B parameters, L size). Experimental.         |
 |             | (default)           |                    |                |                                                                |
 +-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
+| ``2.0``     | ``2B-L~beta2``      | ``v2-2B-L~beta2/`` | 2017–2025      | Second v2 beta run. Experimental.                              |
++-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
 
 The library defaults remain ``dataset_version="v1"`` and ``year=2024`` —
 the only combination with full global coverage today.
@@ -410,8 +430,9 @@ Data Organization
     │   └── v2/
     │       ├── landmasks.parquet
     │       └── grid_0.15_52.05.tiff
-    └── zarr/                                        # Cloud-native zarr store
-        └── v1/                                      # 60 UTM zone groups + RGB pyramid
+    └── zarr/                                        # Cloud-native zarr stores
+        ├── v1/                                      # 60 UTM zone groups + RGB pyramid
+        └── v2-2B-L~beta1/                           # v2 beta, with embeddings_d4/d16
 
 Each ``manifest.parquet`` is scoped to one dataset — the npy/ directory
 name encodes the ``(version, variant)`` pair (a future ``v1.1-dclimate``
@@ -492,6 +513,7 @@ Documentation Sections
    :maxdepth: 2
    :caption: User Guide:
    
+   zarr_quickstart
    quickstart
    architecture
    tutorials

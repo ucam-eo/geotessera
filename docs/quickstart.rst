@@ -1,14 +1,16 @@
 Quick Start Guide
 =================
 
-This guide will get you up and running with GeoTessera quickly.
+This guide covers the tile-download interface: fetching embeddings to
+disk and exporting them for GIS use. To stream embeddings without
+downloading files, start with the :doc:`zarr_quickstart` instead.
 
 .. tip::
 
-   **Pick your Tessera version first.** GeoTessera publishes two model
-   versions on the Source Cooperative repository: the ``1.0``
-   (frozen) and the newer ``1.1`` variant, plus an experimental ``2.0``
-   beta. List every available dataset (and each version's default variant)
+   **Pick your Tessera version first.** Several model versions are
+   published on the Source Cooperative repository: the frozen ``1.0``
+   default, the newer ``1.1``, and experimental ``2.0`` betas. List
+   every available dataset (and each version's default variant)
    with ``geotessera info``.
    Add ``--dataset-version v1.1 --dataset-variant cambridge`` to every
    command in this guide if that's the line you want. Never mix versions or
@@ -45,7 +47,8 @@ This creates a world map showing all available embedding tiles. By default, it u
 - **Blue**: Only the latest year available for this tile
 - **Orange**: Partial years coverage (some combination of years)
 
-**✨ Boundary Visualization**: When you specify a country or region file, the precise boundaries are outlined on the map for better clarity.
+When you specify a country or region file, its boundary is outlined on
+the map.
 
 For a specific region (recommended)::
 
@@ -58,9 +61,6 @@ For a specific region (recommended)::
     # Or check coverage for a specific country (with precise boundary outline):
     geotessera coverage --country "United Kingdom"
     # Next step: geotessera download --country "United Kingdom" --output tiles/
-    
-    # Works great for countries with complex coastlines:
-    geotessera coverage --country "Greece"  # Shows all islands and coastline details
 
 For a specific year::
 
@@ -441,34 +441,17 @@ Use both numpy and GeoTIFF formats in the same workflow::
 Cloud-Native Zarr Access
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For interactive or large-scale analysis without downloading files, use the Zarr
-store. This streams data directly from the cloud::
+For analysis without downloading files, stream from the zarr store::
 
-    from geotessera.store import GeoTesseraZarr
+    from geotessera import GeoTesseraZarr
 
     gt = GeoTesseraZarr()
-    print(gt.years)  # [2017, 2018, ..., 2025]
+    X = gt.sample_points([(-2.97, 53.44), (0.15, 52.05)], year=2025)   # (2, 128)
+    mosaic, transform, crs = gt.read_region((-3.0, 53.4, -2.9, 53.5), year=2025)
 
-    # Sample embeddings at specific points (no download needed)
-    X = gt.sample_points([(-2.97, 53.44), (0.15, 52.05)], year=2025)
-    print(f"Shape: {X.shape}")  # (2, 128)
-
-    # Read a full region as a mosaic
-    mosaic, transform, crs = gt.read_region(
-        (-3.0, 53.4, -2.9, 53.5), year=2025,
-    )
-    print(f"Mosaic shape: {mosaic.shape}")
-
-    # Read a fixed-size patch centred on a point, whatever zones it spans
-    patch, transform, crs = gt.read_patch(0.0, 52.2, year=2025, size_px=512)
-    print(f"Patch shape: {patch.shape}")  # (512, 512, 128)
-
-    # Work with individual UTM zones via xarray
-    ds = gt.open_zone(lon=0.15)
-    print(ds)
-
-The Zarr store implements the ``geoemb:`` convention for geospatial embedding
-data and automatically routes queries to the correct UTM zone.
+The :doc:`zarr_quickstart` covers this interface in full: points,
+regions, streamed strips, fixed-size patches, matryoshka depths, and
+caching.
 
 Next Steps
 ----------
