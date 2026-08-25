@@ -1,4 +1,4 @@
-## v0.10.0 (2026-08-24)
+## v0.10.0 (2026-08-25)
 
 This release moves all data hosting to the Source Cooperative and makes the
 Zarr pipeline work end to end against remote object stores. Every zarr
@@ -28,13 +28,14 @@ There are several new variants availabile, see `geotessera info`:
 - All NPY downloads now come from the Source Cooperative, fronted by CloudFlare.
   Embeddings, landmasks and manifests are served from the public
   `https://data.source.coop/tessera/tessera` repository over HTTPS,
-  replacing the retired `tessera-embeddings` AWS S3 bucket. (@avsm)
+  replacing the retired `tessera-embeddings` AWS S3 bucket. Note that we
+  will deprecate and shut down older hosting soon as we need the storage
+  capacity back, so please upgrade to this new library soon. (@avsm)
 
 - `botocore` and `awscrt` are no longer required dependencies as `urllib3`
   is a new direct dependency. `s3://` locations need the new optional `s3`
   extra (`pip install 'geotessera[s3]'`), which pulls in `s3fs` and
-  `botocore`; the core install stays free of both, and `https://` sources
-  work without it. (@avsm)
+  `botocore` (@avsm).
 
 - Convention metadata now comes from `zarr-cm`, replacing `geozarr-toolkit`.
   Stores stamp `spatial:`/`proj:` at revision r3 and `multiscales` at r2. (@avsm)
@@ -46,8 +47,7 @@ There are several new variants availabile, see `geotessera info`:
 - The Zarr read API drops `crs=`. The store is UTM-native, so
   `GeoTesseraZarr` takes lon/lat and routes to the `utm{NN}` group holding
   the point, and the `.tessera` accessor takes eastings and northings in
-  that zone's own CRS. Project to lon/lat once up front, rather than per call.
-  (@avsm)
+  that zone's own CRS.  (@avsm)
 
 - The unused `TesseraTileTransform` class and its `geotessera.tile_transform`
   module are removed; `GeoTesseraZarr` datasets carry plain coordinate
