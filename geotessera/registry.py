@@ -856,6 +856,10 @@ class Registry:
             Path(landmasks_registry_path) if landmasks_registry_path else None
         )
 
+        # Memoizes validate_embeddings_dir() so per-tile fetches don't
+        # re-read the sidecar.
+        self._embeddings_dir_validated = False
+
         # Load registries
         self._load_registry()
         self._load_landmasks_registry()
@@ -1256,6 +1260,51 @@ class Registry:
             for year, lon_i, lat_i in unique_idx
         ]
 
+    def _sidecar_dataset_path(self) -> Optional[str]:
+        """Dataset directory recorded in the embeddings_dir sidecar, if any."""
+        import json
+
+        sidecar = self._embeddings_dir / TESSERA_METADATA_FILENAME
+        try:
+            data = json.loads(sidecar.read_text())
+            version = data.get("dataset_version_path") or data.get("dataset_version")
+            variant = data.get("dataset_variant")
+            if not (version and variant):
+                return None
+            return dataset_path(_parse_dataset_version(str(version))[1], str(variant))
+        except (OSError, ValueError):
+            return None
+
+    def validate_embeddings_dir(self) -> None:
+        """Raise ``ValueError`` if embeddings_dir holds a different dataset.
+
+        Every dataset uses the same local file layout; the
+        ``tessera_metadata.json`` sidecar records which one populated the
+        directory.
+        """
+        if self._embeddings_dir_validated:
+            return
+        recorded = self._sidecar_dataset_path()
+        if recorded is not None and recorded != self._dataset_path:
+            raise ValueError(
+                f"{self._embeddings_dir} holds tiles from dataset "
+                f"'{recorded}', but '{self._dataset_path}' was requested. "
+                f"Datasets share one local layout, so mixing them returns "
+                f"wrong embeddings; use a separate embeddings_dir per dataset."
+            )
+        self._embeddings_dir_validated = True
+
+    def _record_embeddings_dir_dataset(self) -> None:
+        """Write the provenance sidecar after downloading into embeddings_dir."""
+        if (self._embeddings_dir / TESSERA_METADATA_FILENAME).exists():
+            return
+        try:
+            write_tessera_metadata(
+                self._embeddings_dir, self._version_path, self._variant
+            )
+        except OSError as e:
+            self.logger.warning(f"Could not write {TESSERA_METADATA_FILENAME}: {e}")
+
     def fetch(
         self,
         path: Optional[str] = None,
@@ -1291,9 +1340,11 @@ class Registry:
             path = scales_path if is_scales else embedding_path
 
         # Local layout always uses the bare ``global_0.1_degree_representation``
-        # subdir regardless of variant; variant/version provenance lives in the
-        # ``tessera_metadata.json`` sidecar written by the CLI download flow.
+        # subdir regardless of variant; variant/version provenance lives in
+        # the ``tessera_metadata.json`` sidecar.
         local_path = self._embeddings_dir / EMBEDDINGS_DIR_NAME / path
+
+        self.validate_embeddings_dir()
 
         # Check if file exists locally and not refreshing
         if local_path.exists() and not refresh:
@@ -1304,11 +1355,13 @@ class Registry:
         # slashes on Windows.
         path_str = path.as_posix() if isinstance(path, Path) else path
         url = embedding_url(self._dataset_path, path_str)
-        return download_file_to_temp(
+        result = download_file_to_temp(
             url,
             progress_callback=progress_callback,
             cache_path=local_path,
         )
+        self._record_embeddings_dir_dataset()
+        return result
 
     def fetch_landmask(
         self,
@@ -1340,6 +1393,8 @@ class Registry:
         # Determine local file path
         local_path = self._embeddings_dir / LANDMASKS_DIR_NAME / filename
 
+        self.validate_embeddings_dir()
+
         # Check if file exists locally and not refreshing
         if local_path.exists() and not refresh:
             # Use existing local file
@@ -1347,11 +1402,13 @@ class Registry:
 
         # Download to embeddings_dir.
         url = landmask_url(self._version_path, filename)
-        return download_file_to_temp(
+        result = download_file_to_temp(
             url,
             progress_callback=progress_callback,
             cache_path=local_path,
         )
+        self._record_embeddings_dir_dataset()
+        return result
 
     @property
     def available_embeddings(self) -> List[Tuple[int, float, float]]:

@@ -115,21 +115,23 @@ Caching and store wrapping
 --------------------------
 
 Reads retry failed requests with exponential backoff, so a dropped
-response from a busy server costs one chunk rather than the read. To
-layer more behaviour over the transport, wrap the default store and
-pass it in. For example, zarr's experimental ``CacheStore`` reuses
-chunks when a region is read twice in one session::
+response from a busy server costs one chunk rather than the read.
+Pass ``cache_dir`` to persist reads locally.  Each store caches under
+its own subdirectory (``tessera-cache/v1/``,
+``tessera-cache/v2-2B-L_beta1/``), so dataset versions never mix::
 
-    from zarr.experimental.cache_store import CacheStore
-    from zarr.storage import MemoryStore
+    gt = GeoTesseraZarr(cache_dir="tessera-cache")
+
+    # or with an explicit store and a size bound:
     from geotessera.store import DEFAULT_STORE, zarr_store
 
-    store = CacheStore(
-        zarr_store(DEFAULT_STORE),
-        cache_store=MemoryStore(),
-        max_size=2 * 1024**3,
+    store = zarr_store(
+        DEFAULT_STORE, cache_dir="tessera-cache", cache_max_size=2 * 1024**3
     )
     gt = GeoTesseraZarr(store)
+
+To layer other behaviour over the transport, wrap the store from
+:func:`~geotessera.store.zarr_store` and pass it in.
 
 Under the hood
 --------------

@@ -578,6 +578,9 @@ class GeoTessera:
         """
         from geotessera.tiles import discover_tiles
 
+        # Local tiles carry no dataset identity in their paths.
+        self.registry.validate_embeddings_dir()
+
         # Discover local tiles and build map for this year
         local_tiles = discover_tiles(self.embeddings_dir)
         local_tile_map = {(t.lon, t.lat): t for t in local_tiles if t.year == year}

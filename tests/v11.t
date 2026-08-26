@@ -260,3 +260,65 @@ the tiles (since the local dir layout is variant-agnostic):
   year: 2024
   tile_count: 1
   filename: tessera_metadata.json
+
+Test: Dataset Mismatch In An Embeddings Directory Is Refused
+------------------------------------------------------------
+
+Local NPY tiles use the same file layout regardless of dataset, so a
+directory populated from one dataset must not silently satisfy requests
+for another (previously a v2 request in a v1 directory returned the v1
+embeddings). ``Registry.validate_embeddings_dir`` compares the requested
+dataset against the ``tessera_metadata.json`` sidecar and raises on a
+mismatch; the same dataset (or an empty directory) is accepted:
+
+  $ uv run python -c "
+  > import logging, tempfile
+  > from pathlib import Path
+  > from geotessera.registry import Registry, write_tessera_metadata
+  > def registry_for(d, dataset_path, version_path, variant):
+  >     r = Registry.__new__(Registry)
+  >     r._embeddings_dir = Path(d)
+  >     r._dataset_path = dataset_path
+  >     r._version_path = version_path
+  >     r._variant = variant
+  >     r._embeddings_dir_validated = False
+  >     r.logger = logging.getLogger('test')
+  >     return r
+  > with tempfile.TemporaryDirectory() as d:
+  >     registry_for(d, 'v1', 'v1', 'vultr').validate_embeddings_dir()
+  >     print('empty dir: accepted')
+  >     write_tessera_metadata(d, 'v1', 'vultr')
+  >     registry_for(d, 'v1', 'v1', 'vultr').validate_embeddings_dir()
+  >     print('same dataset: accepted')
+  >     try:
+  >         registry_for(d, 'v2-2B-L~beta1', 'v2', '2B-L~beta1').validate_embeddings_dir()
+  >         print('mismatch: NOT refused')
+  >     except ValueError as e:
+  >         print('mismatch: refused')
+  >         print(str(e).split('.')[0].replace(d, 'DIR'))
+  > "
+  empty dir: accepted
+  same dataset: accepted
+  mismatch: refused
+  DIR holds tiles from dataset 'v1', but 'v2-2B-L~beta1' was requested
+
+The Python API download path now records the sidecar too (previously only
+the CLI download flow wrote it, so API-populated directories carried no
+provenance for this check):
+
+  $ uv run python -c "
+  > import json, logging, tempfile
+  > from pathlib import Path
+  > from geotessera.registry import Registry, TESSERA_METADATA_FILENAME
+  > with tempfile.TemporaryDirectory() as d:
+  >     r = Registry.__new__(Registry)
+  >     r._embeddings_dir = Path(d)
+  >     r._dataset_path = 'v1.1-cam'
+  >     r._version_path = 'v1.1'
+  >     r._variant = 'cambridge'
+  >     r.logger = logging.getLogger('test')
+  >     r._record_embeddings_dir_dataset()
+  >     payload = json.loads((Path(d) / TESSERA_METADATA_FILENAME).read_text())
+  >     print('dataset_path:', payload['dataset_path'])
+  > "
+  dataset_path: v1.1-cam

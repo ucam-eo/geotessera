@@ -46,6 +46,7 @@ import logging
 import math
 from datetime import timedelta
 from functools import lru_cache
+from pathlib import Path
 from typing import Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -88,7 +89,36 @@ CLIENT_OPTIONS = {"timeout": timedelta(seconds=120)}
 POINT_CONCURRENCY = 32
 
 
-def zarr_store(location) -> ZarrStore:
+def _store_cache_key(location: str) -> str:
+    """Per-store cache subdirectory name for *location*.
+
+    Cache entries are keyed by store-relative paths, so each store must
+    cache in its own subdirectory.  A public store URL keys by its
+    dataset path (``v1``, ``v2-2B-L_beta1``); any other location keys
+    by a slug of the location plus a digest, since the same dataset
+    name at two locations can hold different bytes.
+    """
+    import hashlib
+    import re
+
+    from .registry import TESSERA_MIRROR_URL
+
+    location = location.rstrip("/")
+    canonical_prefix = f"{TESSERA_MIRROR_URL}/zarr/"
+    if location.startswith(canonical_prefix):
+        dataset = location[len(canonical_prefix) :]
+        if dataset and "/" not in dataset:
+            return re.sub(r"[^A-Za-z0-9._-]+", "_", dataset)
+    digest = hashlib.sha256(location.encode()).hexdigest()[:12]
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", location.split("://")[-1]).strip("_")
+    return f"{slug[-80:]}-{digest}"
+
+
+def zarr_store(
+    location,
+    cache_dir: Optional[Union[str, Path]] = None,
+    cache_max_size: Optional[int] = None,
+) -> ZarrStore:
     """Open *location* as a ``zarr.abc.store.Store``.
 
     *location* may be the URL of a Tessera zarr store, a local path, or
@@ -98,36 +128,50 @@ def zarr_store(location) -> ZarrStore:
     servers drop some under load.  ``s3://`` and other URL schemes open
     through fsspec.
 
-    :class:`GeoTesseraZarr` applies this function to the location it is
-    given, so calling it directly is only needed to customise the store
-    first.  For example, zarr's experimental ``CacheStore`` adds a local
-    cache::
+    Pass *cache_dir* to persist reads locally through zarr's
+    experimental ``CacheStore`` (requires ``zarr>=3.3``)::
 
-        store = CacheStore(
-            zarr_store(DEFAULT_STORE),
-            cache_store=LocalStore("tessera-cache"),
-            max_size=256 * 1024 * 1024,
-        )
-        gt = GeoTesseraZarr(store)
+        store = zarr_store(DEFAULT_STORE, cache_dir="tessera-cache")
 
-    ``CacheStore`` persists whole-object reads and keeps byte-range
-    reads in memory, so chunk data is cached for the session and
-    metadata across runs.
+    Each store location caches under its own subdirectory of
+    *cache_dir*, so stores never share objects.  Metadata persists
+    across runs and chunk data for the session.  *cache_max_size*
+    bounds the cache in bytes (default unbounded).  *cache_dir*
+    requires a URL or path location; wrap an existing ``Store`` in
+    ``CacheStore`` yourself.
     """
     if isinstance(location, ZarrStore):
+        if cache_dir is not None:
+            raise ValueError(
+                "cache_dir requires a URL or path location; wrap an "
+                "existing Store in zarr's CacheStore yourself"
+            )
         return location
+    location = location.rstrip("/")
     if location.startswith(("http://", "https://")):
         http = HTTPStore.from_url(
             location, retry_config=RETRY_CONFIG, client_options=CLIENT_OPTIONS
         )
-        return ObjectStore(http, read_only=True)
-    if "://" in location:
+        store = ObjectStore(http, read_only=True)
+    elif "://" in location:
         from zarr.storage import FsspecStore
 
-        return FsspecStore.from_url(location)
-    from zarr.storage import LocalStore
+        store = FsspecStore.from_url(location)
+    else:
+        from zarr.storage import LocalStore
 
-    return LocalStore(location)
+        store = LocalStore(location)
+
+    if cache_dir is not None:
+        from zarr.experimental.cache_store import CacheStore
+        from zarr.storage import LocalStore
+
+        keyed = Path(cache_dir) / _store_cache_key(location)
+        keyed.mkdir(parents=True, exist_ok=True)
+        store = CacheStore(
+            store, cache_store=LocalStore(keyed), max_size=cache_max_size
+        )
+    return store
 
 
 def enable_http_logging(level: int = logging.DEBUG) -> None:
@@ -725,6 +769,9 @@ class GeoTesseraZarr:
             such as a cache-wrapped store from :func:`zarr_store`.
             Defaults to the public TESSERA store at
             ``data.source.coop/tessera/tessera/zarr``.
+        cache_dir: Persist reads under this directory, keyed per store
+            location (see :func:`zarr_store`). Requires a URL or path
+            ``store_url``, not a ``Store`` object.
 
     Example::
 
@@ -742,11 +789,15 @@ class GeoTesseraZarr:
         )
     """
 
-    def __init__(self, store_url: Union[str, ZarrStore] = DEFAULT_STORE):
+    def __init__(
+        self,
+        store_url: Union[str, ZarrStore] = DEFAULT_STORE,
+        cache_dir: Optional[Union[str, Path]] = None,
+    ):
         if isinstance(store_url, str):
             store_url = store_url.rstrip("/")
         self.url = str(store_url)
-        self._store = zarr_store(store_url)
+        self._store = zarr_store(store_url, cache_dir=cache_dir)
         root = zarr.open_group(self._store, mode="r")
         self._root = root
         root_attrs = dict(root.attrs)

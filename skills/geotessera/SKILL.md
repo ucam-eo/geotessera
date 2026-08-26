@@ -72,20 +72,15 @@ proportionally fewer bytes. `gt.depths` lists what a store offers.
 ## Caching and retries
 
 HTTP retries with exponential backoff are built in; do not add a retry
-layer. The constructor accepts any `zarr.abc.store.Store`, so when a
-workflow reads the same chunks twice (for example sampling points and
-then streaming the region that contains them), wrap the store in zarr's
-`CacheStore` (requires `zarr>=3.3`; 3.1 corrupts cached range reads):
+layer. Pass `cache_dir` to persist reads locally (requires `zarr>=3.3`;
+3.1 corrupts cached range reads):
 
 ```python
-from zarr.experimental.cache_store import CacheStore
-from zarr.storage import MemoryStore
-from geotessera.store import DEFAULT_STORE, zarr_store
-
-store = CacheStore(zarr_store(DEFAULT_STORE), cache_store=MemoryStore(),
-                   max_size=2 * 1024**3)
-gt = GeoTesseraZarr(store)
+gt = GeoTesseraZarr(cache_dir="tessera-cache")
 ```
+
+The cache is keyed per store under `cache_dir`; never share one
+hand-rolled `CacheStore` directory between stores.
 
 ## Zone-level access
 
