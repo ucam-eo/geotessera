@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -56,7 +57,6 @@ import zarr
 from obstore.store import HTTPStore
 from pyproj import Transformer
 from rasterio.warp import Resampling, reproject
-from rich.progress import track
 from zarr.abc.store import Store as ZarrStore
 from zarr.storage import ObjectStore
 
@@ -249,12 +249,36 @@ def _prefetched(load, tops):
             yield ready
 
 
-def _sample_each(sample_at, coords, progress: bool) -> np.ndarray:
-    """Apply a per-point ``sample_at(x, y)`` across *coords*, giving ``(N, B)``."""
-    it = coords
-    if progress:
-        it = track(coords, description="Sampling points...", transient=True)
-    return np.array([sample_at(x, y) for x, y in it])
+def _progress_iter(items, label: str, total: Optional[int] = None):
+    """Yield *items*, logging progress at INFO every few seconds.
+
+    Short runs stay silent.  Pass ``total`` when *items* is lazy and must
+    not be materialised.
+    """
+    if total is None:
+        items = list(items)
+        total = len(items)
+    if total == 0:
+        yield from items
+        return
+    started = time.monotonic()
+    next_report = started + 10.0
+    reported = False
+    for i, item in enumerate(items, 1):
+        yield item
+        now = time.monotonic()
+        if now >= next_report or (reported and i == total):
+            reported = True
+            next_report = now + 10.0
+            elapsed = now - started
+            log.info(
+                "%s: %d/%d (%.0f%%, %.1f/s)",
+                label,
+                i,
+                total,
+                100.0 * i / total,
+                i / elapsed if elapsed > 0 else 0.0,
+            )
 
 
 # Causes a bulk read can assign to a point; only some deserve a retry
@@ -615,7 +639,10 @@ class TesseraAccessor:
 
         Returns ``(N, B)`` float32, NaN for water and points beyond the
         grid.  Unwritten pixels retry through :meth:`sample_at`.
+        ``progress`` is deprecated and ignored: progress is logged
+        through the ``geotessera.store`` logger at INFO.
         """
+        del progress
         coords = list(coords)
         if not coords:
             return np.empty((0, self.n_bands), np.float32)
@@ -623,18 +650,13 @@ class TesseraAccessor:
         ns = np.array([c[1] for c in coords], dtype=float)
         values, cause = _bulk_sample(self._ds, es, ns, year)
         holes = np.flatnonzero(cause == _HOLE)
-        it = (
-            track(holes, description="Repairing pixels...", transient=True)
-            if progress and len(holes)
-            else holes
-        )
-        for i in it:
+        for i in _progress_iter(holes, "Repairing pixels"):
             values[i] = self.sample_at(es[i], ns[i], year)
         return values
 
     # -- Region reading -----------------------------------------------------
 
-    def _window(self, bbox, year, array, progress):
+    def _window(self, bbox, year, array):
         """Load a bbox window: ``(emb int8 (B, H, W), scales, transform)``."""
         e_min, e_max = min(bbox[0], bbox[2]), max(bbox[0], bbox[2])
         n_min, n_max = min(bbox[1], bbox[3]), max(bbox[1], bbox[3])
@@ -650,15 +672,10 @@ class TesseraAccessor:
             self._px,
         )
 
-        if progress:
-            from dask.diagnostics import ProgressBar
-
-            with ProgressBar():
-                scales = sub["scales"].values
-                emb_int8 = sub[array].values
-        else:
-            scales = sub["scales"].values
-            emb_int8 = sub[array].values
+        started = time.monotonic()
+        scales = sub["scales"].values
+        emb_int8 = sub[array].values
+        log.info("read_region: loaded in %.1fs", time.monotonic() - started)
 
         # Build affine from the selected window's coordinate values
         x0 = float(sub["x"].values[0]) - 0.5 * self._px  # pixel centre → corner
@@ -685,7 +702,8 @@ class TesseraAccessor:
         float32 and transform is a rasterio Affine for the window.  Both are
         in this zone's UTM — nothing is resampled on the way out.
         """
-        emb_int8, scales, transform = self._window(bbox, year, array, progress)
+        del progress  # deprecated and ignored; progress is always logged
+        emb_int8, scales, transform = self._window(bbox, year, array)
         return self.dequantise(emb_int8, scales), transform
 
     def read_region_quantized(
@@ -704,7 +722,8 @@ class TesseraAccessor:
         rows on demand with
         ``dequantise(emb[rows].transpose(2, 0, 1), scales[rows])``.
         """
-        emb_int8, scales, transform = self._window(bbox, year, array, progress)
+        del progress  # deprecated and ignored; progress is always logged
+        emb_int8, scales, transform = self._window(bbox, year, array)
         return emb_int8.transpose(1, 2, 0), scales, transform
 
     def iter_region(
@@ -729,6 +748,7 @@ class TesseraAccessor:
             array: Embeddings array to read.
             strip_rows: Rows per yielded block.
         """
+        del progress  # deprecated and ignored; progress is always logged
         e_min, e_max = min(bbox[0], bbox[2]), max(bbox[0], bbox[2])
         n_min, n_max = min(bbox[1], bbox[3]), max(bbox[1], bbox[3])
         sub = self._ds.sel(time=year, x=slice(e_min, e_max), y=slice(n_max, n_min))
@@ -747,10 +767,10 @@ class TesseraAccessor:
                 self._px, 0, x0, 0, -self._px, y0
             )
 
-        tops = range(0, height, strip_rows)
-        if progress:
-            tops = track(list(tops), description="Reading strips...", transient=True)
-        yield from _prefetched(load, tops)
+        tops = list(range(0, height, strip_rows))
+        yield from _progress_iter(
+            _prefetched(load, tops), "Reading strips", total=len(tops)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +969,10 @@ class GeoTesseraZarr:
         Returns ``(N, B)`` float32, one bulk read per UTM zone, NaN rows
         for points without an embedding.  Unwritten pixels and points
         near a zone seam retry through :meth:`sample_at`.
+        ``progress`` is deprecated and ignored: progress is logged
+        through the ``geotessera.store`` logger at INFO.
         """
+        del progress
         array, n_bands = self._embeddings_array(depth)
         coords = list(coords)
         if not coords:
@@ -980,12 +1003,7 @@ class GeoTesseraZarr:
             (cause != _OK) & near_seam & cross_zone
         )
         retry_idx = np.flatnonzero(retry)
-        it = (
-            track(retry_idx, description="Repairing points...", transient=True)
-            if progress and len(retry_idx)
-            else retry_idx
-        )
-        for i in it:
+        for i in _progress_iter(retry_idx, "Repairing points"):
             # Depth arrays are prefixes of the full embedding, so the
             # per-point path reads the full vector and slices it.
             values[i] = self.sample_at(
@@ -1046,6 +1064,7 @@ class GeoTesseraZarr:
         A bbox crossing a zone boundary is served from the centre zone
         alone; :meth:`read_patch` merges across zones.
         """
+        del progress  # deprecated and ignored; progress is always logged
         array, _ = self._embeddings_array(depth)
         z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
         edge_zones = _zones_spanned([bbox[0], bbox[2]], (bbox[0] + bbox[2]) / 2)
@@ -1060,9 +1079,7 @@ class GeoTesseraZarr:
         zone_crs = ds.tessera.crs
 
         utm_bbox = _utm_envelope(bbox, zone_crs)
-        mosaic, transform = ds.tessera.read_region(
-            utm_bbox, year, array=array, progress=progress
-        )
+        mosaic, transform = ds.tessera.read_region(utm_bbox, year, array=array)
         return mosaic, transform, zone_crs
 
     def read_region_quantized(
@@ -1081,13 +1098,14 @@ class GeoTesseraZarr:
         blocks of rows on demand with
         ``dequantise(emb[rows].transpose(2, 0, 1), scales[rows])``.
         """
+        del progress  # deprecated and ignored; progress is always logged
         array, _ = self._embeddings_array(depth)
         z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
         ds = self.open_zone(zone=z)
         zone_crs = ds.tessera.crs
         utm_bbox = _utm_envelope(bbox, zone_crs)
         emb, scales, transform = ds.tessera.read_region_quantized(
-            utm_bbox, year, array=array, progress=progress
+            utm_bbox, year, array=array
         )
         return emb, scales, transform, zone_crs
 
@@ -1106,6 +1124,7 @@ class GeoTesseraZarr:
         :meth:`TesseraAccessor.iter_region`.  Routed like
         :meth:`read_region`, to the zone holding the bbox centre.
         """
+        del progress  # deprecated and ignored; progress is always logged
         array, _ = self._embeddings_array(depth)
         z = _zone_for_lon((bbox[0] + bbox[2]) / 2)
         ds = self.open_zone(zone=z)
@@ -1133,10 +1152,10 @@ class GeoTesseraZarr:
             )
             return acc.dequantise(emb, scales), transform
 
-        tops = range(y0, y1, strip_rows)
-        if progress:
-            tops = track(list(tops), description="Reading strips...", transient=True)
-        for block, transform in _prefetched(load, tops):
+        tops = list(range(y0, y1, strip_rows))
+        for block, transform in _progress_iter(
+            _prefetched(load, tops), "Reading strips", total=len(tops)
+        ):
             yield block, transform, zone_crs
 
     # -- Patch reading (cross-zone) ------------------------------------------
@@ -1175,8 +1194,10 @@ class GeoTesseraZarr:
                 one CRS; forces the merge path even within one zone.
             resampling: rasterio resampling name for the merge path.
                 Only the ``"nearest"`` default leaves vectors unblended.
-            progress: Show a progress bar while downloading.
+            progress: Deprecated and ignored; progress is logged
+                through the ``geotessera.store`` logger at INFO.
         """
+        del progress
         if size_px <= 0:
             raise ValueError(f"size_px must be positive, got {size_px}")
         array, n_bands = self._embeddings_array(depth)
@@ -1196,13 +1217,13 @@ class GeoTesseraZarr:
 
         if dst_crs is None and len(zones) == 1:
             return self._read_patch_native(
-                centre_ds, ce, cn, year, size_px, array, progress
+                centre_ds, ce, cn, year, size_px, array
             )
 
         target_crs = dst_crs or _patch_crs(lon, lat)
         return self._read_patch_merged(
             zones, target_crs, lon, lat, year, size_px, px,
-            array, n_bands, resampling, progress,
+            array, n_bands, resampling,
         )
 
     def _read_patch_native(
@@ -1213,7 +1234,6 @@ class GeoTesseraZarr:
         year: int,
         size_px: int,
         array: str,
-        progress: bool,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Slice a patch straight off one zone's grid, NaN-padded at edges.
 
@@ -1258,7 +1278,6 @@ class GeoTesseraZarr:
         array: str,
         n_bands: int,
         resampling: str,
-        progress: bool,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Merge each zone's native pixels onto one patch-centred grid."""
         ce, cn = _project(lon, lat, "EPSG:4326", target_crs)
@@ -1303,7 +1322,6 @@ class GeoTesseraZarr:
                     (min(es) - pad, min(ns) - pad, max(es) + pad, max(ns) + pad),
                     year,
                     array=array,
-                    progress=progress,
                 )
             except IndexError:
                 continue  # the window misses everything this zone holds

@@ -69,6 +69,24 @@ v2 stores publish matryoshka prefixes of each embedding. Passing
 `read_patch`, or `iter_region` reads only the first N dimensions for
 proportionally fewer bytes. `gt.depths` lists what a store offers.
 
+## Logging and progress
+
+The library never draws progress bars. Long reads log progress through
+the standard `logging` module — `geotessera.*` loggers at INFO with
+counts and rates; short reads stay silent. Scripts that stream regions
+or sample many points should surface those lines:
+
+```python
+import logging
+
+logging.basicConfig(format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+logging.getLogger("geotessera").setLevel(logging.INFO)
+```
+
+The `progress=` parameters on `sample_points`/`read_region`/
+`iter_region`/`read_patch` are deprecated and ignored; do not pass
+them, and do not add tqdm or other progress wrappers around reads.
+
 ## Caching and retries
 
 HTTP retries with exponential backoff are built in; do not add a retry
