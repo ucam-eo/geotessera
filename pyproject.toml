@@ -1,6 +1,6 @@
 [project]
 name = "geotessera"
-version = "0.10.0"
+version = "0.10.1"
 description = "Python library interface to the Tessera geofoundation model embeddings"
 readme = "README.md"
 license = {file = "LICENSE.md"}

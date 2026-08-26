@@ -26,7 +26,7 @@ Test: Version Command
 The version command should print the version number.
 
   $ geotessera version
-  0.10.0
+  0.10.1
 
 Test: Info Command (Library Info)
 ----------------------------------
