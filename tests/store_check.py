@@ -533,6 +533,57 @@ check(
     and zarr_store_url("v2-2B-L~beta1").endswith("/zarr/v2-2B-L~beta1"),
 )
 
+# ---------------------------------------------------------------------------
+# Persistent cache keying (zarr_store cache_dir)
+# ---------------------------------------------------------------------------
+# Cache entries are named by store-relative paths, so each store location
+# must get its own cache subdirectory — a shared one would serve one
+# dataset version's objects to another's reads.
+
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from geotessera.store import _store_cache_key  # noqa: E402
+
+check(
+    "canonical store urls key by their dataset path",
+    _store_cache_key(zarr_store_url("v1")) == "v1"
+    and _store_cache_key(zarr_store_url("v2")) == "v2-2B-L_beta1"
+    and _store_cache_key(zarr_store_url("v1") + "/") == "v1",
+)
+check(
+    "non-canonical locations key by slug plus digest",
+    _store_cache_key("https://mirror.example.org/zarr/v1")
+    != _store_cache_key(zarr_store_url("v1"))
+    and _store_cache_key("/data/local-v1-copy")
+    != _store_cache_key(zarr_store_url("v1")),
+)
+
+with tempfile.TemporaryDirectory() as _d:
+    _d = Path(_d)
+    for _name, _model in (("s1", "1.0"), ("s2", "2.0")):
+        _grp = zarr.open_group(str(_d / _name), mode="w")
+        _grp.attrs["geoemb:model"] = _model
+        _arr = _grp.create_array("data", shape=(4,), dtype="f4")
+        _arr[:] = float(_model[0])
+    _cache = _d / "cache"
+    _g1 = zarr.open_group(zarr_store(str(_d / "s1"), cache_dir=_cache), mode="r")
+    _g2 = zarr.open_group(zarr_store(str(_d / "s2"), cache_dir=_cache), mode="r")
+    check(
+        "a shared cache_dir keeps each store's objects separate",
+        _g1.attrs["geoemb:model"] == "1.0"
+        and _g2.attrs["geoemb:model"] == "2.0"
+        and float(_g1["data"][0]) == 1.0
+        and float(_g2["data"][0]) == 2.0
+        and len(list(_cache.iterdir())) == 2,
+    )
+    try:
+        zarr_store(zarr_store(str(_d / "s1")), cache_dir=_cache)
+        _refused = False
+    except ValueError:
+        _refused = True
+    check("cache_dir with a Store object is refused", _refused)
+
 
 if FAILED:
     print(f"{len(FAILED)} check(s) failed", file=sys.stderr)
