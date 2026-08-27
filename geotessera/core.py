@@ -15,6 +15,7 @@ import geopandas as gpd
 from .registry import (
     Registry,
     EMBEDDINGS_DIR_NAME,
+    UnwritableDestination,
     tile_to_geotiff_path,
     tile_from_world,
 )
@@ -550,7 +551,6 @@ class GeoTessera:
         progress_callback: Optional[callable] = None,
         progress_offset: int = 0,
         progress_total: Optional[int] = None,
-        require_landmask: bool = True,
     ) -> dict:
         """Ensure required tiles are available locally, downloading if needed.
 
@@ -568,29 +568,28 @@ class GeoTessera:
             progress_callback: Optional callback(current, total, status) for progress tracking
             progress_offset: Offset to add to progress current value
             progress_total: Total to use in progress callbacks (defaults to len(required_coords))
-            require_landmask: Whether to require landmask file in addition to embedding (default: True)
 
         Returns:
             Dictionary mapping (lon, lat) -> Tile object for the requested year
 
         Raises:
             FileNotFoundError: If auto_download=False and required tiles are missing
+            UnwritableDestination: If tiles must be downloaded but
+                embeddings_dir cannot be written
         """
-        from geotessera.tiles import discover_tiles
+        from geotessera.tiles import tiles_for_coords
 
         # Local tiles carry no dataset identity in their paths.
         self.registry.validate_embeddings_dir()
 
-        # Discover local tiles and build map for this year
-        local_tiles = discover_tiles(self.embeddings_dir)
-        local_tile_map = {(t.lon, t.lat): t for t in local_tiles if t.year == year}
+        # Resolve only the coordinates asked for: scanning embeddings_dir
+        # costs a rasterio open per tile on disk, however few are wanted.
+        local_tile_map = tiles_for_coords(self.embeddings_dir, required_coords, year)
 
         # Find missing tiles
-        missing_tiles = []
-        for tile_lon, tile_lat in required_coords:
-            tile = local_tile_map.get((tile_lon, tile_lat))
-            if tile is None or not tile.is_available(require_landmask=require_landmask):
-                missing_tiles.append((tile_lon, tile_lat))
+        missing_tiles = [
+            coord for coord in required_coords if coord not in local_tile_map
+        ]
 
         # Handle missing tiles
         if missing_tiles:
@@ -612,15 +611,24 @@ class GeoTessera:
                             f"Downloading {grid_name} ({idx + 1}/{len(missing_tiles)})",
                         )
 
-                    success = self.download_tile(tile_lon, tile_lat, year)
+                    try:
+                        success = self.download_tile(tile_lon, tile_lat, year)
+                    except UnwritableDestination as e:
+                        # Every remaining tile would fail the same way.
+                        raise UnwritableDestination(
+                            e.errno,
+                            f"{e.strerror}. {len(missing_tiles)} tiles are "
+                            f"missing from {self.embeddings_dir}; populate it "
+                            f"with 'geotessera download --year {year}' before "
+                            f"sampling.",
+                        ) from e
                     if not success:
                         self.logger.warning(f"Failed to download {grid_name}")
 
-                # Re-discover tiles after downloading
-                local_tiles = discover_tiles(self.embeddings_dir)
-                local_tile_map = {
-                    (t.lon, t.lat): t for t in local_tiles if t.year == year
-                }
+                # Pick up whatever downloaded; a tile that failed stays absent.
+                local_tile_map.update(
+                    tiles_for_coords(self.embeddings_dir, missing_tiles, year)
+                )
             else:
                 # In offline mode, raise error with helpful message
                 missing_names = [
@@ -1311,6 +1319,10 @@ class GeoTessera:
 
             return True
 
+        except UnwritableDestination:
+            # embeddings_dir itself is at fault, not this tile: let it out
+            # so the caller can stop rather than retry every other tile.
+            raise
         except Exception as e:
             self.logger.error(f"Failed to download tile ({lon:.2f}, {lat:.2f}): {e}")
             return False

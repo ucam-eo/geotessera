@@ -1,10 +1,15 @@
 """Tile abstraction for format-agnostic embedding access."""
 
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import re
-from .registry import EMBEDDINGS_DIR_NAME, LANDMASKS_DIR_NAME, tile_to_landmask_filename
+from .registry import (
+    EMBEDDINGS_DIR_NAME,
+    LANDMASKS_DIR_NAME,
+    tile_to_embedding_paths,
+    tile_to_landmask_filename,
+)
 
 
 class Tile:
@@ -302,6 +307,68 @@ def discover_tiles(directory: Path) -> List[Tile]:
         return tiff_files
 
     return []
+
+
+def tile_for_coord(base_dir: Path, lon: float, lat: float, year: int) -> Optional[Tile]:
+    """Resolve a single tile from its coordinates, without listing the directory.
+
+    A tile's location under *base_dir* follows from ``(lon, lat, year)``
+    alone, so a caller that already knows which tile it wants can go
+    straight to it. Prefer this to :func:`discover_tiles`, which reads
+    every tile in *base_dir* and is correspondingly slow on a large or
+    network-mounted mirror.
+
+    Args:
+        base_dir: Directory holding the embeddings and landmasks subdirs.
+        lon: Tile centre longitude, on the 0.05 grid.
+        lat: Tile centre latitude, on the 0.05 grid.
+        year: Year of embeddings.
+
+    Returns:
+        The tile, or None if it is absent or unreadable. A tile counts as
+        absent unless its embedding, scales and landmask are all present.
+    """
+    import logging
+
+    base_dir = Path(base_dir)
+    embedding_rel, scales_rel = tile_to_embedding_paths(lon, lat, year)
+    embeddings_root = base_dir / EMBEDDINGS_DIR_NAME
+    embedding_path = embeddings_root / embedding_rel
+    landmask_path = base_dir / LANDMASKS_DIR_NAME / tile_to_landmask_filename(lon, lat)
+
+    if not (
+        embedding_path.exists()
+        and (embeddings_root / scales_rel).exists()
+        and landmask_path.exists()
+    ):
+        return None
+
+    try:
+        return Tile.from_npy(embedding_path, base_dir)
+    except Exception as e:
+        logging.warning(f"Failed to load tile {embedding_path}: {e}")
+        return None
+
+
+def tiles_for_coords(
+    base_dir: Path, coords: Iterable[Tuple[float, float]], year: int
+) -> Dict[Tuple[float, float], Tile]:
+    """Resolve the tiles for *coords*, omitting any that are absent.
+
+    Args:
+        base_dir: Directory holding the embeddings and landmasks subdirs.
+        coords: Tile centres as ``(lon, lat)`` pairs.
+        year: Year of embeddings.
+
+    Returns:
+        The tiles that were found, keyed by ``(lon, lat)``.
+    """
+    found = {}
+    for lon, lat in coords:
+        tile = tile_for_coord(base_dir, lon, lat, year)
+        if tile is not None:
+            found[(lon, lat)] = tile
+    return found
 
 
 def discover_npy_tiles(base_dir: Path) -> List[Tile]:

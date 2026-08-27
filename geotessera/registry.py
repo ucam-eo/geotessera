@@ -12,6 +12,7 @@ from typing import Optional, Union, List, Tuple, Dict, Iterator, Callable
 import os
 import math
 import re
+import errno
 import hashlib
 import logging
 import numpy as np
@@ -522,6 +523,61 @@ def format_bytes(num_bytes: float) -> str:
     return f"{num_bytes:.1f} TB"
 
 
+# Write failures that say the destination itself is at fault, so that no
+# number of retries will help.
+_PERMANENT_WRITE_ERRNOS = frozenset(
+    {
+        errno.EROFS,  # read-only file system
+        errno.EACCES,  # permission denied
+        errno.EPERM,  # operation not permitted
+        errno.ENOSPC,  # no space left on device
+        errno.EDQUOT,  # disk quota exceeded
+    }
+)
+
+
+class UnwritableDestination(OSError):
+    """A download destination that cannot be written, and will stay so.
+
+    Distinguishes an ``embeddings_dir`` that is read-only, unwritable or
+    full from a transfer that merely failed this time, so that callers can
+    abandon a whole batch of downloads rather than retry each in turn.
+    """
+
+
+def _unwritable(exc: OSError) -> bool:
+    """Report whether *exc* is a write failure that no retry can fix."""
+    return exc.errno in _PERMANENT_WRITE_ERRNOS
+
+
+def _preflight_destination(cache_path: Path) -> None:
+    """Check that *cache_path* can be written, before any request is made.
+
+    Nothing is written until the response is already streaming, so an
+    unwritable destination otherwise costs a full transfer to discover,
+    once per file.
+
+    Raises:
+        UnwritableDestination: If the parent directory cannot be created,
+            or is not writable.
+    """
+    parent = Path(cache_path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        if _unwritable(e):
+            raise UnwritableDestination(
+                e.errno, f"Cannot create {parent}: {e.strerror}"
+            ) from e
+        raise
+    # Advisory: an existing but read-only directory survives the mkdir
+    # above. The retry loop still classifies whatever the write raises.
+    if not os.access(parent, os.W_OK):
+        raise UnwritableDestination(
+            errno.EACCES, f"Cannot write to {parent}: Permission denied"
+        )
+
+
 class HTTPStatusError(OSError):
     """A non-retryable HTTP status, such as 403 or 404.
 
@@ -593,10 +649,15 @@ def download_file_to_temp(
 
     Raises:
         HTTPStatusError: On a non-retryable HTTP status (e.g. 404).
+        UnwritableDestination: If *cache_path* cannot be written.
         urllib3.exceptions.MaxRetryError: When retryable failures persist.
         OSError: On a corrupted download (after retries).
     """
     import urllib3
+
+    # Check the destination before spending a request on it.
+    if cache_path is not None:
+        _preflight_destination(cache_path)
 
     # The pool already retries the request itself. This loop covers only
     # failures that strike after the headers, where nothing short of
@@ -605,9 +666,20 @@ def download_file_to_temp(
     for attempt in range(attempts):
         try:
             return _download_once(url, progress_callback, cache_path)
-        except (HTTPStatusError, urllib3.exceptions.MaxRetryError):
+        except (
+            HTTPStatusError,
+            UnwritableDestination,
+            urllib3.exceptions.MaxRetryError,
+        ):
             raise
-        except (urllib3.exceptions.HTTPError, OSError):
+        except OSError as e:
+            if _unwritable(e):
+                raise UnwritableDestination(
+                    e.errno, f"Cannot write {cache_path or 'download'}: {e.strerror}"
+                ) from e
+            if attempt == attempts - 1:
+                raise
+        except urllib3.exceptions.HTTPError:
             if attempt == attempts - 1:
                 raise
         time.sleep(2**attempt)

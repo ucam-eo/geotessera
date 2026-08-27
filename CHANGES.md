@@ -1,12 +1,17 @@
-## dev
+## v0.10.1 (2026-08-27)
+
+- Sampling npy points or regions from a local `embeddings_dir` no longer
+  reads the whole directory firsts. (#384 @avsm @mdales)
+
+- Downloading into an `embeddings_dir` that cannot be written now fails
+  at once. The error names the number of missing tiles and the
+  CLI command that would populate them. (#384 @avsm @mdales)
 
 - Guard local caches against mixing dataset versions via a better
   cache key. `zarr_store` and `GeoTesseraZarr` now take `cache_dir=`
   and `cache_max_size=` to persist reads through zarr's `CacheStore`,
   keyed per store location so two datasets never share cached objects.
-  The `zarr` dependency floor rises to 3.3, the first release whose
-  `CacheStore` serves cached range reads correctly.
-  NPY downloads into an `embeddings_dir` are checked against a
+  NPY downloads into an `embeddings_dir` are also checked against a
   `tessera_metadata.json` sidecar and raise if the directory was
   populated from a different dataset. (@sadiqj @avsm)
 
