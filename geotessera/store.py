@@ -792,6 +792,8 @@ class GeoTesseraZarr:
         cache_dir: Persist reads under this directory, keyed per store
             location (see :func:`zarr_store`). Requires a URL or path
             ``store_url``, not a ``Store`` object.
+        cache_max_size: Bound the *cache_dir* cache in bytes (default
+            unbounded).
 
     Example::
 
@@ -813,11 +815,14 @@ class GeoTesseraZarr:
         self,
         store_url: Union[str, ZarrStore] = DEFAULT_STORE,
         cache_dir: Optional[Union[str, Path]] = None,
+        cache_max_size: Optional[int] = None,
     ):
         if isinstance(store_url, str):
             store_url = store_url.rstrip("/")
         self.url = str(store_url)
-        self._store = zarr_store(store_url, cache_dir=cache_dir)
+        self._store = zarr_store(
+            store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
+        )
         root = zarr.open_group(self._store, mode="r")
         self._root = root
         root_attrs = dict(root.attrs)

@@ -785,7 +785,7 @@ requires-dist = [
     { name = "typer" },
     { name = "urllib3", specifier = ">=2" },
     { name = "xarray" },
-    { name = "zarr" },
+    { name = "zarr", specifier = ">=3.3" },
     { name = "zarr-cm", specifier = ">=0.4.1" },
 ]
 provides-extras = ["docs", "s3"]

@@ -90,8 +90,8 @@ them, and do not add tqdm or other progress wrappers around reads.
 ## Caching and retries
 
 HTTP retries with exponential backoff are built in; do not add a retry
-layer. Pass `cache_dir` to persist reads locally (requires `zarr>=3.3`;
-3.1 corrupts cached range reads):
+layer. Pass `cache_dir` to cache reads locally — store metadata
+persists across runs, chunk data for the session:
 
 ```python
 gt = GeoTesseraZarr(cache_dir="tessera-cache")

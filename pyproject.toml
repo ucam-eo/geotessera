@@ -34,7 +34,7 @@ dependencies = [
     "urllib3>=2",
     "xarray",
     "rioxarray",
-    "zarr",
+    "zarr>=3.3",
     "obstore",
     "dask",
     "fsspec",
