@@ -1,12 +1,10 @@
-## dev
+## v0.10.1 (2026-08-27)
 
 - Guard local caches against mixing dataset versions via a better
   cache key. `zarr_store` and `GeoTesseraZarr` now take `cache_dir=`
   and `cache_max_size=` to persist reads through zarr's `CacheStore`,
   keyed per store location so two datasets never share cached objects.
-  The `zarr` dependency floor rises to 3.3, the first release whose
-  `CacheStore` serves cached range reads correctly.
-  NPY downloads into an `embeddings_dir` are checked against a
+  NPY downloads into an `embeddings_dir` are also checked against a
   `tessera_metadata.json` sidecar and raise if the directory was
   populated from a different dataset. (@sadiqj @avsm)
 
