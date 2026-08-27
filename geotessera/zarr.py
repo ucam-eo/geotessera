@@ -709,20 +709,58 @@ def gather_tile_infos(
 # ---------------------------------------------------------------------------
 
 
-def _run_parallel(
-    fn, items, workers, console=None, label="Processing", progress_callback=None
-):
-    """Run fn(item) in a ThreadPoolExecutor, with optional Rich progress.
+def _fmt_duration(seconds: float) -> str:
+    """``95`` -> ``1m35s``, ``4000`` -> ``1h06m``."""
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds}s"
+
+
+class _ProgressLog:
+    """Report batch progress through the module logger.
+
+    Logs done/total, rate and ETA at INFO every ``interval`` seconds, and
+    once on completion.  Log lines survive redirection and concurrent
+    worker output, which a live bar does not.
+    """
+
+    def __init__(self, label: str, total: int, interval: float = 10.0):
+        self.label = label
+        self.total = total
+        self.interval = interval
+        self.done = 0
+        self._started = time.monotonic()
+        self._next_report = self._started + interval
+
+    def advance(self, n: int = 1) -> None:
+        self.done += n
+        now = time.monotonic()
+        if now < self._next_report and self.done < self.total:
+            return
+        self._next_report = now + self.interval
+        elapsed = now - self._started
+        rate = self.done / elapsed if elapsed > 0 else 0.0
+        pct = 100.0 * self.done / self.total if self.total else 100.0
+        eta = ""
+        if 0 < self.done < self.total and rate > 0:
+            eta = f", eta {_fmt_duration((self.total - self.done) / rate)}"
+        logger.info(
+            f"{self.label}: {self.done:,}/{self.total:,} "
+            f"({pct:.0f}%, {rate:.1f}/s, {_fmt_duration(elapsed)} elapsed{eta})"
+        )
+
+
+def _run_parallel(fn, items, workers, label="Processing"):
+    """Run fn(item) in a ThreadPoolExecutor, logging progress periodically.
 
     Args:
         fn: Callable that takes one item and returns a result.
         items: Iterable of items to process.
         workers: Number of threads.
-        console: Optional Rich Console for progress display.
-        label: Description for the progress bar.
-        progress_callback: Optional callable(completed, total) called after
-            each item completes.  Used for cross-process progress reporting
-            when ``console`` is not available.
+        label: Description for the progress log lines.
 
     Returns:
         List of (item, result) tuples for successful calls.
@@ -732,10 +770,9 @@ def _run_parallel(
 
     items = list(items)
     results = []
-    completed = 0
+    progress = _ProgressLog(label, len(items))
 
-    def _execute(pool):
-        nonlocal completed
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(fn, item): item for item in items}
         for future in as_completed(futures):
             item = futures[future]
@@ -743,35 +780,7 @@ def _run_parallel(
                 results.append((item, future.result()))
             except Exception as e:
                 logger.warning(f"{label} failed for {item}: {e}")
-            completed += 1
-            yield item
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        if console is not None:
-            from rich.progress import (
-                Progress,
-                SpinnerColumn,
-                BarColumn,
-                TextColumn,
-                MofNCompleteColumn,
-                TimeElapsedColumn,
-            )
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(label, total=len(items))
-                for _ in _execute(pool):
-                    progress.advance(task)
-        else:
-            for _ in _execute(pool):
-                if progress_callback is not None:
-                    progress_callback(completed, len(items))
+            progress.advance()
 
     return results
 
@@ -1127,43 +1136,12 @@ def _coarsen_zone_pyramid(
         if not tile_args:
             break
 
-        if console is not None:
-            from rich.progress import (
-                Progress,
-                SpinnerColumn,
-                BarColumn,
-                TextColumn,
-                MofNCompleteColumn,
-                TimeElapsedColumn,
-                TimeRemainingColumn,
-            )
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                ptask = progress.add_task(
-                    f"Pyramid level {lvl}",
-                    total=len(tile_args),
-                )
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(_coarsen_tile, r0, c0): (r0, c0)
-                        for r0, c0 in tile_args
-                    }
-                    for future in as_completed(futures):
-                        future.result()
-                        progress.advance(ptask)
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(_coarsen_tile, r0, c0) for r0, c0 in tile_args]
-                for future in as_completed(futures):
-                    future.result()
+        progress = _ProgressLog(f"Pyramid level {lvl}", len(tile_args))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(_coarsen_tile, r0, c0) for r0, c0 in tile_args]
+            for future in as_completed(futures):
+                future.result()
+                progress.advance()
 
         if cur_chunks is None:
             prev_row_start, prev_row_end = lr_start, lr_end
@@ -3841,32 +3819,8 @@ def _write_shards(
         mp_context=mp_context,
     )
     try:
-        if console:
-            from rich.progress import (
-                Progress,
-                BarColumn,
-                TextColumn,
-                MofNCompleteColumn,
-                TimeElapsedColumn,
-                TimeRemainingColumn,
-                SpinnerColumn,
-            )
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    label, total=len(shard_specs) + len(stats_coords)
-                )
-                _drain(pool, advance=lambda: progress.advance(task))
-        else:
-            _drain(pool)
+        progress = _ProgressLog(label, len(shard_specs) + len(stats_coords))
+        _drain(pool, advance=progress.advance)
     except KeyboardInterrupt:
         pool.shutdown(wait=False, cancel_futures=True)
         raise
@@ -4126,7 +4080,6 @@ def compute_stretch(
         ),
         sample_indices,
         workers,
-        console,
         label=f"Sampling stretch ({n_sample}/{len(all_indices)} shards)",
     )
 
@@ -5833,34 +5786,11 @@ def _reproject_zone(
         return written, failed
 
     for attempt in range(1, CHUNK_RETRY_ATTEMPTS + 1):
-        if attempt == 1 and console:
-            from rich.progress import (
-                Progress,
-                SpinnerColumn,
-                BarColumn,
-                TextColumn,
-                MofNCompleteColumn,
-                TimeElapsedColumn,
-                TimeRemainingColumn,
-            )
-
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                console=console,
-            ) as progress:
-                ptask = progress.add_task(
-                    f"Reprojecting zone {zone_num:02d}", total=len(pending)
-                )
-                written, pending = _run_pass(
-                    pending, advance=lambda: progress.advance(ptask)
-                )
-        else:
-            written, pending = _run_pass(pending)
+        label = f"Reprojecting zone {zone_num:02d}"
+        if attempt > 1:
+            label += f" (retry {attempt - 1})"
+        progress = _ProgressLog(label, len(pending))
+        written, pending = _run_pass(pending, advance=progress.advance)
         chunks_written += written
         if not pending:
             break

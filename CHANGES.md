@@ -1,3 +1,23 @@
+## dev
+
+- Guard local caches against mixing dataset versions via a better
+  cache key. `zarr_store` and `GeoTesseraZarr` now take `cache_dir=`
+  and `cache_max_size=` to persist reads through zarr's `CacheStore`,
+  keyed per store location so two datasets never share cached objects.
+  The `zarr` dependency floor rises to 3.3, the first release whose
+  `CacheStore` serves cached range reads correctly.
+  NPY downloads into an `embeddings_dir` are checked against a
+  `tessera_metadata.json` sidecar and raise if the directory was
+  populated from a different dataset. (@sadiqj @avsm)
+
+- The zarr commands and the Zarr read API log progress through the standard
+  `logging` module now rather than live progress bars, which previously
+  corrupted multi-process output. Long reads always log through the
+  `geotessera.store` logger at INFO (short runs stay silent); the
+  `progress=` parameters on `sample_points`/`read_region`/`iter_region`/
+  `read_patch` are ignored and will be removed in a future release.
+  (@aneeshnaik @avsm)
+
 ## v0.10.0 (2026-08-25)
 
 This release moves all data hosting to the Source Cooperative and makes the

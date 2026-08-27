@@ -122,13 +122,10 @@ its own subdirectory (``tessera-cache/v1/``,
 
     gt = GeoTesseraZarr(cache_dir="tessera-cache")
 
-    # or with an explicit store and a size bound:
-    from geotessera.store import DEFAULT_STORE, zarr_store
-
-    store = zarr_store(
-        DEFAULT_STORE, cache_dir="tessera-cache", cache_max_size=2 * 1024**3
+    # or with a size bound on the cache:
+    gt = GeoTesseraZarr(
+        cache_dir="tessera-cache", cache_max_size=2 * 1024**3
     )
-    gt = GeoTesseraZarr(store)
 
 To layer other behaviour over the transport, wrap the store from
 :func:`~geotessera.store.zarr_store` and pass it in.
