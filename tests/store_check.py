@@ -529,9 +529,23 @@ from geotessera.registry import zarr_store_url  # noqa: E402
 check(
     "version names resolve to their store path",
     zarr_store_url("v1").endswith("/zarr/v1")
+    and zarr_store_url("v1.1").endswith("/zarr/v1.1")
     and zarr_store_url("v2").endswith("/zarr/v2-2B-L~beta1")
     and zarr_store_url("v2-2B-L~beta1").endswith("/zarr/v2-2B-L~beta1"),
 )
+
+# Test invalid store URL
+try:
+    GeoTesseraZarr("https://data.source.coop/tessera/tessera/zarr/v123")
+    check("invalid store URL raises helpful error", False)
+except ValueError as e:
+    msg = str(e)
+    check(
+        "invalid store URL raises helpful error",
+        "Failed to open zarr store" in msg
+        and "Known versions:" in msg
+        and "zarr_store_url()" in msg,
+    )
 
 # ---------------------------------------------------------------------------
 # Persistent cache keying (zarr_store cache_dir)
