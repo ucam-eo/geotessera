@@ -1,3 +1,11 @@
+## v0.10.2 (2026-09-04)
+
+- Fix the Zarr store URL for 1.1, which remaps to 1.1-cam on source.coop
+  until embeddings generation completes for the full store. This workaround
+  lets 'v1.1' work until that happens! (#394 @maawoo @avsm)
+
+- Improve the error message when Zarr store opening fails (#394 @maawoo @avsm)
+
 ## v0.10.1 (2026-08-27)
 
 - Sampling npy points or regions from a local `embeddings_dir` no longer

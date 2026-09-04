@@ -110,7 +110,7 @@ try {
     $versionOutput = Invoke-Geotessera -Arguments @("version")
     $versionOutput = ($versionOutput | Out-String).Trim()
 
-    $expectedVersion = "0.10.1"
+    $expectedVersion = "0.10.2"
     $versionPassed = $versionOutput -eq $expectedVersion
     Write-TestResult -TestName "Version command returns $expectedVersion" -Passed $versionPassed -Details "Got: $versionOutput"
 
