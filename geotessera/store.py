@@ -823,7 +823,20 @@ class GeoTesseraZarr:
         self._store = zarr_store(
             store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
         )
-        root = zarr.open_group(self._store, mode="r")
+        try:
+            root = zarr.open_group(self._store, mode="r")
+        except (zarr.errors.GroupNotFoundError, zarr.errors.ArrayNotFoundError, KeyError) as e:
+            from .registry import KNOWN_DATASETS
+            
+            available = ", ".join(sorted({f"v{v}" for v, _, d in KNOWN_DATASETS if d}))
+            raise ValueError(
+                f"Failed to open zarr store at {self.url!r}. "
+                f"The store may not exist or the URL may be incorrect.\n"
+                f"Known versions: {available}. "
+                f"Use zarr_store_url() to generate correct store URLs, e.g., "
+                f"zarr_store_url('v1') or zarr_store_url('v2')."
+            ) from e
+        
         self._root = root
         root_attrs = dict(root.attrs)
         self.model_version: str = root_attrs.get("geoemb:model", "")

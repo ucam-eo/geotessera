@@ -508,9 +508,13 @@ def zarr_store_url(version: str) -> str:
     version's default variant, or an explicit store path such as
     ``"v2-2B-L~beta1"``.
     """
-    _, norm = _parse_dataset_version(version)
+    version_path, norm = _parse_dataset_version(version)
     if norm in VERSION_DEFAULT_VARIANTS:
-        version = dataset_path(norm, default_variant(norm))
+        variant = default_variant(norm)
+        if norm == "1.1":
+            version = version_path
+        else:
+            version = dataset_path(norm, variant)
     return f"{TESSERA_MIRROR_URL}/zarr/{version}"
 
 
