@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from datetime import timedelta
 from functools import lru_cache
@@ -115,7 +116,7 @@ def _store_cache_key(location: str) -> str:
 
 
 def zarr_store(
-    location,
+    location: Union[str, os.PathLike[str], ZarrStore],
     cache_dir: Optional[Union[str, Path]] = None,
     cache_max_size: Optional[int] = None,
 ) -> ZarrStore:
@@ -147,6 +148,7 @@ def zarr_store(
                 "existing Store in zarr's CacheStore yourself"
             )
         return location
+    location = os.fsdecode(os.fspath(location))
     location = location.rstrip("/")
     if location.startswith(("http://", "https://")):
         http = HTTPStore.from_url(
@@ -426,19 +428,12 @@ def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
 def _utm_envelope(
     bbox: Tuple[float, float, float, float], crs: str
 ) -> Tuple[float, float, float, float]:
-    """The UTM extent enclosing a lon/lat bbox, from all four corners.
+    """The UTM extent enclosing a lon/lat bbox, including curved edges.
 
-    Northing extremes sit on different corners as the grid curves away
-    from the central meridian; two corners under-cover a wide box.
+    Northing extremes can fall between the corners as the grid curves away
+    from the central meridian, so densify the bbox edges during projection.
     """
-    corners = [
-        _project(lon, lat, "EPSG:4326", crs)
-        for lon in (bbox[0], bbox[2])
-        for lat in (bbox[1], bbox[3])
-    ]
-    es = [c[0] for c in corners]
-    ns = [c[1] for c in corners]
-    return min(es), min(ns), max(es), max(ns)
+    return _transformer("EPSG:4326", crs).transform_bounds(*bbox, densify_pts=21)
 
 
 def open_zone(
@@ -813,12 +808,12 @@ class GeoTesseraZarr:
 
     def __init__(
         self,
-        store_url: Union[str, ZarrStore] = DEFAULT_STORE,
+        store_url: Union[str, os.PathLike[str], ZarrStore] = DEFAULT_STORE,
         cache_dir: Optional[Union[str, Path]] = None,
         cache_max_size: Optional[int] = None,
     ):
-        if isinstance(store_url, str):
-            store_url = store_url.rstrip("/")
+        if not isinstance(store_url, ZarrStore):
+            store_url = os.fsdecode(os.fspath(store_url)).rstrip("/")
         self.url = str(store_url)
         self._store = zarr_store(
             store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
