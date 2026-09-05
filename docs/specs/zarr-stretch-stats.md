@@ -28,7 +28,7 @@ Five arrays are added to every zone group `utm{zz}/`. They are ordinary Zarr v3 
 
 | Array | Shape | Dtype | Dimensions | Semantics |
 |---|---|---|---|---|
-| `stretch_stats_count` | `(T,)` | int64 | `time` | N: valid pixels contributed to the sums |
+| `stretch_stats_count` | `(T,)` | int64 | `time` | N: valid pixels contributed to the sums; -1 while invalid or updating |
 | `stretch_stats_sum` | `(T, 128)` | float64 | `time, band` | S: per-band sum of dequantised values |
 | `stretch_stats_prod` | `(T, 128, 128)` | float64 | `time, band, band2` | M: sum of outer products xxᵀ |
 | `stretch_sample` | `(T, K, 128)` | int8 | `time, sample, band` | raw sampled embedding vectors |
@@ -87,7 +87,7 @@ Collection is free in I/O terms: workers already hold every decoded pixel in the
 
 **Cross-zone safety.** Parallel `zarr-fill --zones N` processes touch disjoint zone groups, disjoint locks, and never the root metadata, exactly as today. The stats arrays live inside the zone group, so the existing parallelism contract is unchanged.
 
-**Resumed fills.** A fill that scans the store and skips existing shards contributes stats only for the shards it actually writes, and *adds* them to the stored arrays (read-modify-write under the zone lock). Shards written by a previous crashed run therefore may or may not be represented; see Caveats.
+**Resumed fills.** Complete shards have both embeddings and scales. The coverage mask identifies complete shards whose statistics have not been collected; the fill reads them back as catch-up tasks. A negative `stretch_stats_count` means an update or rewrite was interrupted, so the fill rebuilds that zone/year from complete shards before using its statistics.
 
 ## Aggregation: the `zarr-stretch` fast path
 
@@ -106,13 +106,13 @@ Total runtime: seconds to low minutes, dominated by S3 GETs of small chunks. Thi
 
 ## Caveats and failure modes
 
-**Double-counting under shard rewrites.** `--rewrite-existing-shards` (or a fill re-run after the tile manifest gained tiles) rebuilds shards whose pixels already contributed to (N, S, M), adding them again. Per-shard keying of contributions was considered and **rejected**: it multiplies storage and bookkeeping by the shard count for a second-order benefit. Instead the design **accepts the drift**: a duplicate shard perturbs a 128 × 128 covariance built from ~10⁹ pixels negligibly, and the stored sample provides an independent estimator. `zarr-stretch` therefore always runs a **drift check**. **[as built]** the metric is the relative Frobenius distance between the stats-derived and sample-derived covariances, not per-component |cos|: eigenvector comparison false-alarms whenever eigenvalues are close (the vectors are then arbitrary rotations), which testing surfaced immediately. The alarm limit is `max(--drift-threshold, 3·√(128/n_eff))` — the sample covariance's own noise floor scales as √(d/n), so a small sample must not read as drift. Above the limit it warns and recommends `--from-shards` or a stats backfill (`zarr-fill --backfill-stretch-stats`, below) to rebuild the arrays from the store's actual contents. The sample arrays themselves are *overwritten*, not summed, on rewrite — the reservoir merge replaces slots — so they do not accumulate duplicates the same way, which is what makes them a valid cross-check.
+**Shard rewrites.** Before overwriting shards, the fill sets `stretch_stats_count` to -1. After successful writes it rebuilds the affected zone/year statistics from the store, replacing the old sums, sample, and coverage mask. This costs one additional read of that zone/year but avoids per-shard statistics storage and double-counting. With `--no-stretch-stats`, the count remains negative until a later fill or explicit backfill repairs it; `zarr-stretch` refuses incomplete statistics. The covariance drift check remains an independent check of the resulting aggregates.
 
 **Stores initialised before this feature.** Their zone groups lack the arrays. `zarr-fill` gains `--backfill-stretch-stats`: for the selected zone(s) it creates the five arrays (under the zone lock; a zone-group edit, not a root edit, so it composes with parallel fills of *other* zones) and populates them by scanning that zone's existing shards once — this is the one path that does re-read embeddings, but it is per-zone, opt-in, and runs at full shard-streaming bandwidth. A subsequent `zarr-consolidate` publishes the new arrays.
 
-**Interrupted fills.** If the parent dies before the end-of-year write, the shards are in the store but their stats are not. A resumed fill skips those shards and never accounts for them. The drift check catches gross discrepancies; `--backfill-stretch-stats` repairs them exactly.
+**Interrupted fills.** Updates publish a negative count before changing sums or samples and publish the final count last. If interrupted, the next fill rebuilds the affected zone/year. Shards written before any statistics update are handled by the normal coverage-mask catch-up.
 
-**`zarr-extend`.** Must grow the `time` axis of all five stats arrays in the same metadata-only edit as `embeddings`/`scales`/`time`. An extend that predates awareness of these arrays would desynchronise time axes within a group; the implementation must fail loudly if any of the five arrays is missing or of unexpected length, directing the operator to `--backfill-stretch-stats`.
+**`zarr-extend`.** All seven statistics arrays grow with the data arrays. The zone records intended coordinates in `tessera:pending_years` before resizing; retries finish those coordinates even if a prior time-array write failed. Legacy trailing zero coordinates are reused. The pending attribute is removed after all coordinate writes succeed. Consolidation runs even when every requested year is already present, so retrying also repairs an interrupted final consolidation.
 
 **Preview marker migration.** Older `zarr-global-preview` runs wrote `.zone_{N}_done` markers inside the store. Markers now live at `<state>/preview/{year}/zone_{N}_done`. On startup the command migrates any legacy in-store markers into the state dir and deletes them from the store, restoring the "store contains only Zarr" invariant.
 
@@ -143,7 +143,7 @@ Existing behaviour and flags (`--year`, `--zones`, `--workers`, `--spill-dir`, `
 
 | Flag | Meaning |
 |---|---|
-| `--no-stretch-stats` | Skip collection (escape hatch; leaves arrays untouched) |
+| `--no-stretch-stats` | Skip collection; rewrites invalidate old aggregates until a later fill or backfill |
 | `--backfill-stretch-stats` | Create/rebuild the stats arrays for the selected zones by scanning existing shards; implies no tile ingestion |
 
 ```sh

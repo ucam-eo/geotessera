@@ -69,8 +69,8 @@ is the property worth protecting, because it means:
 
 - one source read fills every depth from the same in-memory buffer;
 - a shard coordinate means the same thing in every array;
-- `_existing_shards` — which lists `embeddings/c/{t}/0/{sr}/{sc}` — keeps
-  working unchanged as the resume oracle;
+- `_existing_shards` checks matching embeddings and scales objects on this
+  grid, including incomplete pairs left by older builds;
 - `stretch_stats_shards` and any future coverage mask stay indexed by one grid.
 
 What varies is the **inner chunk**, sized to hold chunk bytes roughly constant
@@ -111,16 +111,15 @@ For each shard, depths are written **ascending, with the full 128 last**:
 ```
 embeddings_d4  ← emb_buf[:4]
 embeddings_d16 ← emb_buf[:16]
-embeddings     ← emb_buf          (last)
 scales         ← scales_buf
+embeddings     ← emb_buf          (last)
 ```
 
-All are slices of the one buffer already in memory, so there are no extra
-source reads. The ordering makes "the `embeddings` shard object exists" imply
-every shallower depth for that coordinate also exists, which is what lets
-`_existing_shards` remain the single resume oracle with no changes. A crash
-mid-shard leaves shallow depths written and the full depth absent; resume sees
-the full depth missing and rewrites all of them, idempotently.
+All depths are slices of the buffer already in memory. Scales are written
+before the full embedding too. Before a rewrite, the old full-embedding object
+is removed; publishing its replacement last marks completion. A crash leaves
+the full embedding absent and resume rewrites the shard. Resume also requires
+the scales object, repairing incomplete pairs produced by older builds.
 
 Reversing the order would strand shallow depths permanently: resume would see
 `embeddings` present and skip the shard forever.
