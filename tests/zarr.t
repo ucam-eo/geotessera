@@ -10,15 +10,6 @@ Setup
 
   $ export TERM=dumb
 
-Test: Location-transparent I/O and parallel-fill state
-------------------------------------------------------
-
-Everything here runs offline against a temporary directory, using `file://`
-URLs to exercise the same fsspec path an `s3://` store takes:
-
-  $ python "$TESTDIR/zarr_remote_check.py" | tail -1
-  all checks passed
-
 Test: zarr-fill accepts remote locations
 -----------------------------------------
 

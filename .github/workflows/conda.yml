@@ -23,7 +23,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install Local Package
-        run: pip install -e .
+        run: pip install -e . pytest
+
+      - name: Run Python API Tests
+        run: pytest tests -v
 
       - name: Run CLI Tests
         shell: pwsh

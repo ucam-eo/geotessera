@@ -28,7 +28,7 @@ GeoTessera is a Python library for accessing and working with Tessera geospatial
 - **Package Manager**: Uses `uv` for dependency management (preferred) or `pip`
 - **Configuration**: `pyproject.toml` with setuptools backend
 - **Lock File**: `uv.lock` for reproducible builds
-- **Test Framework**: `cram` (shell-based functional testing)
+- **Test Frameworks**: `pytest` for Python APIs and `cram` for CLI behavior
 - **Linting**: `ruff` for code quality
 
 ## Coding Standards
@@ -68,9 +68,10 @@ geotessera/
 
 ## Testing Guidelines
 
-### Test Framework: Cram
+### Test Frameworks
 
-Tests are written in `.t` files using cram (shell-based testing):
+Python API tests are written as pytest modules. CLI behavior is tested in `.t`
+files using cram:
 
 ```bash
 # Example test structure
@@ -89,11 +90,15 @@ Run command and check output:
 - `tests/tile.t` - Single-tile / `--tile` tests
 - `tests/viz.t` - Visualization tests
 - `tests/v11.t` - v1.1 / variant filtering + sidecar tests
+- `tests/test_store.py` - Zarr reader and point/region behavior
+- `tests/test_zarr.py` - Remote-style Zarr I/O and build state
+- `tests/test_tile_lookup.py` - Scoped tile discovery and download failures
 
 ### Running Tests
 
 ```bash
 # Run all tests
+env MPLCONFIGDIR=/tmp/geotessera-mpl uv run pytest tests -v
 env TERM=dumb TTY_INTERACTIVE=0 uv run cram tests -v
 
 # Run specific test file
@@ -128,6 +133,7 @@ pip install -e .
 
 ```bash
 # Run tests
+env MPLCONFIGDIR=/tmp/geotessera-mpl uv run pytest tests -v
 env TERM=dumb TTY_INTERACTIVE=0 uv run cram tests -v
 
 # Run CLI locally
@@ -145,7 +151,7 @@ ruff format .
 - Multi-platform testing: Ubuntu, macOS (Intel & Apple Silicon)
 - Python versions: 3.12, 3.13
 - Dependencies: GDAL must be installed before Python packages
-- Tests run with `uv run cram tests -v`
+- Tests run with both `uv run pytest tests -v` and `uv run cram tests -v`
 
 ## Key Concepts to Remember
 
