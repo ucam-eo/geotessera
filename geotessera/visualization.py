@@ -88,9 +88,9 @@ def analyze_geotiff_coverage(geotiff_paths: List[str]) -> Dict:
                 coverage_info["bounds"]["max_lat"], lat_max
             )
 
-            # Track band counts (get from loaded data shape)
-            data = tile.load_embedding()
-            band_count = data.shape[2]  # (H, W, bands)
+            # Tile construction reads the GeoTIFF header, including its band
+            # count.  Do not load every pixel merely to report that metadata.
+            band_count = tile.band_count
             coverage_info["band_counts"][band_count] = (
                 coverage_info["band_counts"].get(band_count, 0) + 1
             )
