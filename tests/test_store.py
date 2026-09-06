@@ -436,6 +436,14 @@ def test_bulk_point_sampling():
         np.allclose(vals[0], np.array([1, 2, 3, 4]) * 0.05, atol=1e-6)
         and np.allclose(vals[1], np.array([1, 2, 3, 4]) * 0.07, atol=1e-6),
     )
+    # Filtering invalid coordinates must preserve the original row order
+    # when the remaining points are grouped by zone and read through Zarr.
+    mixed = [(np.nan, 52.0), _east_pt, (0.0, np.inf), _west_pt, (-np.inf, 52.0)]
+    invalid_row = np.full(4, np.nan, np.float32)
+    np.testing.assert_array_equal(
+        gt_seam.sample_points(mixed, 2024),
+        np.stack([invalid_row, vals[1], invalid_row, vals[0], invalid_row]),
+    )
     vals = gt_overlap.sample_points([_gap_pt], 2024, progress=False)
     assert_check(
         "a point in the owner's gap is served by the zone next door",

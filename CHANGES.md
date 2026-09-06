@@ -1,3 +1,9 @@
+## Unreleased
+
+- Zarr scalar and batch point sampling now agree at exact pixel midpoints,
+  consistently resolving ties north/west. NaN and infinite query coordinates
+  now return `outside` from `probe()` and NaN embeddings from sampling.
+
 ## v0.10.1 (2026-08-27)
 
 - Sampling npy points or regions from a local `embeddings_dir` no longer
