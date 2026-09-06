@@ -28,14 +28,16 @@ def tiny_store(tmp_path, monkeypatch, request):
     group.create_array(
         "embeddings",
         shape=(1, 128, 4, 8),
-        chunks=(1, 128, 4, 4),
+        chunks=(1, 128, 2, 2),
+        shards=(1, 128, 4, 4),
         dtype="i1",
         fill_value=0,
     )
     group.create_array(
         "scales",
         shape=(1, 4, 8),
-        chunks=(1, 4, 4),
+        chunks=(1, 2, 2),
+        shards=(1, 4, 4),
         dtype="f4",
         fill_value=np.inf,
     )
@@ -116,6 +118,101 @@ def _fail_array_write(monkeypatch, array_name):
         return original(self, selection, value)
 
     monkeypatch.setattr(zarr.Array, "__setitem__", fail)
+
+
+@pytest.fixture
+def nested_store(tiny_store):
+    root = tiny_store.location.open_group(mode="r+")
+    root.attrs["geoemb:depths"] = build.depths_attr_value((4, 16))
+    for depth in (4, 16):
+        tiny_store.group.create_array(
+            build.depth_array_name(depth),
+            shape=(1, depth, 4, 8),
+            chunks=(1, depth, 2, 2),
+            shards=(1, depth, 4, 4),
+            dtype="i1",
+            fill_value=0,
+        )
+    return tiny_store
+
+
+@pytest.mark.parametrize("zero_depth", [4, 16, 128])
+@pytest.mark.parametrize("water", [False, True], ids=["valid", "water"])
+def test_zero_shards_remain_complete(nested_store, zero_depth, water):
+    embeddings = np.ones((4, 8, 128), dtype="i1")
+    embeddings[..., :zero_depth] = 0
+    np.save(nested_store.embeddings, embeddings)
+    if water:
+        np.save(nested_store.scales, np.full((4, 8), np.nan, dtype="f4"))
+
+    assert _fill(nested_store, collect_stretch_stats=False) == 2
+    expected = {(0, 0), (0, 1)}
+    for depth in (4, 16, 128):
+        name = build.depth_array_name(depth)
+        assert build._existing_shards(
+            nested_store.location, "utm31", 0, expected, array_name=name
+        ) == expected
+
+    # Reopen to check persisted contents, including zero prefixes that use
+    # the same finite scales as their nonzero full embedding.
+    group = nested_store.location.open_group(mode="r", path="utm31")
+    for depth in (4, 16, 128):
+        np.testing.assert_array_equal(
+            group[build.depth_array_name(depth)][0],
+            embeddings[..., :depth].transpose(2, 0, 1),
+        )
+    if water:
+        assert np.isnan(group["scales"][:]).all()
+    else:
+        np.testing.assert_array_equal(group["scales"][:], 0.25)
+
+    # Resume must catch up statistics without rewriting, and an explicit
+    # rebuild must count valid zero vectors as real observations.
+    assert _fill(nested_store) == 0
+    expected_count = 0 if water else 32
+    assert int(group["stretch_stats_count"][0]) == expected_count
+    expected_sum = embeddings.reshape(-1, 128).sum(axis=0) * (0 if water else 0.25)
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], expected_sum)
+    assert build.backfill_stretch_stats(nested_store.location, zones=[31]) == 1
+    assert int(group["stretch_stats_count"][0]) == expected_count
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], expected_sum)
+    np.testing.assert_array_equal(group["stretch_stats_shards"][0], 1)
+    assert _fill(nested_store) == 0
+
+
+def test_zero_rewrite_recovers_after_depth_failure(nested_store, monkeypatch):
+    assert _fill(nested_store) == 2
+    np.save(nested_store.embeddings, np.zeros((4, 8, 128), dtype="i1"))
+    with monkeypatch.context() as failure:
+        _fail_array_write(failure, "embeddings_d16")
+        with pytest.raises(RuntimeError, match="2 shard\\(s\\) failed"):
+            _fill(nested_store, skip_existing_shards=False)
+    assert build._existing_shards(
+        nested_store.location, "utm31", 0, {(0, 0), (0, 1)}
+    ) == set()
+    assert _fill(nested_store) == 2
+    assert _fill(nested_store) == 0
+    assert int(nested_store.group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(nested_store.group["stretch_stats_sum"][0], 0)
+
+
+def test_resume_repairs_legacy_zero_shards_with_statistics(tiny_store):
+    np.save(tiny_store.embeddings, np.zeros((4, 8, 128), dtype="i1"))
+    group = tiny_store.group
+    # Older writers let Zarr omit the zero embedding objects, even though
+    # their scales and fill-time statistics were successfully published.
+    group["embeddings"][:] = 0
+    group["scales"][:] = 0.25
+    group["stretch_stats_count"][0] = 32
+    group["stretch_stats_shards"][0] = 1
+    assert build._existing_shards(
+        tiny_store.location, "utm31", 0, {(0, 0), (0, 1)}
+    ) == set()
+
+    assert _fill(tiny_store) == 2
+    assert int(group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 0)
+    assert _fill(tiny_store) == 0
 
 
 @pytest.mark.parametrize("array_name", ["scales", "embeddings"])

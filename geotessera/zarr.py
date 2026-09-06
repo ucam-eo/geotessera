@@ -2609,11 +2609,21 @@ def _fill_and_write_shard(
     # replacement cannot look complete with old embeddings and new scales.
     from zarr.core.sync import sync
 
+    def write_depth(depth):
+        array = store[depth_array_name(depth)]
+        values = emb_buf[:depth]
+        # Zarr normally removes all-zero shards. Keep their completion
+        # objects, while allowing zero inner chunks in nonzero shards to
+        # remain sparse. This runtime setting also covers reopened stores.
+        if not np.any(values):
+            array = array.with_config({"write_empty_chunks": True})
+        array[t, :, r : r + S, c : c + S] = values
+
     sync((store["embeddings"].store_path / f"c/{t}/0/{spec.sr}/{spec.sc}").delete())
     for depth in depths:
-        store[depth_array_name(depth)][t, :, r : r + S, c : c + S] = emb_buf[:depth]
+        write_depth(depth)
     store["scales"][t, r : r + S, c : c + S] = scales_buf
-    store["embeddings"][t, :, r : r + S, c : c + S] = emb_buf
+    write_depth(N_BANDS)
 
     if sample_cap > 0:
         stats = shard_stretch_stats(emb_buf, scales_buf, sample_cap)

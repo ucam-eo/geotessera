@@ -121,6 +121,17 @@ is removed; publishing its replacement last marks completion. A crash leaves
 the full embedding absent and resume rewrites the shard. Resume also requires
 the scales object, repairing incomplete pairs produced by older builds.
 
+Embedding writes use Zarr's runtime `write_empty_chunks=True` setting when
+a depth's entire shard is zero, including at full depth. Otherwise Zarr
+omits such a shard (zero is the array's fill value), breaking the object
+presence check even though reads still return the correct zeros. Scales
+continue to distinguish valid zero vectors from water and unwritten pixels.
+Zero inner chunks in a nonzero shard can still be omitted.
+This setting is applied when writing, so it also covers existing stores.
+For stores built without it, a normal fill repairs absent full-embedding
+objects; use `--rewrite-existing-shards` to also restore absent zero prefixes
+where the full embedding already exists.
+
 Reversing the order would strand shallow depths permanently: resume would see
 `embeddings` present and skip the shard forever.
 
