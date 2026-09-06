@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Global preview initialization now resumes incomplete pyramids and publishes
+  complete metadata in one write, retrying Windows file-sharing conflicts
+  during concurrent initialization. Incompatible local pyramids now raise
+  an error instead of being deleted automatically.
+
 - Zarr shard discovery now handles Windows path separators, allowing local
   fills to resume and statistics rebuilds to include completed shards.
   Opening groups through `StoreLocation` now uses the same URL adapter as

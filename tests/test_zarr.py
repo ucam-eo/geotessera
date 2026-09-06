@@ -942,19 +942,11 @@ def test_global_preview_pyramid(tmp_path: Path):
     race_dest.open_group(mode="a", zarr_format=3)
 
     def _racer(_i):
-        try:
-            _ensure_global_store(race_dest, 3)
-            return None
-        except Exception as exc:  # noqa: BLE001 - the point is to see any failure
-            return f"{type(exc).__name__}: {exc}"
+        _ensure_global_store(race_dest, 3)
 
     with ThreadPoolExecutor(max_workers=8) as _pool:
-        race_errs = [e for e in _pool.map(_racer, range(8)) if e]
+        list(_pool.map(_racer, range(8)))
 
-    assert_check(
-        "concurrent _ensure_global_store calls all succeed",
-        not race_errs,
-    )
     assert_check(
         "the raced pyramid is complete",
         "multiscales" in dict(race_dest.open_group(mode="r", path="global_rgb").attrs)

@@ -5343,37 +5343,31 @@ def _require_array(parent, name: str, **kwargs):
     )
 
 
+def _retry_windows_sharing(write, retries: int = 20, delay: float = 0.5):
+    """Retry transient Windows conflicts when replacing an open file."""
+    import time
+
+    for attempt in range(retries + 1):
+        try:
+            return write()
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == retries:
+                raise
+            time.sleep(delay)
+
+
 def _ensure_global_store(
     dest: "StoreLocation",
     num_levels: int,
 ) -> None:
     """Create the global_rgb/ pyramid group within the store.
 
-    Safe to call concurrently: every creation step is idempotent, so parallel
-    callers build the identical structure and converge.
+    Safe to call concurrently with the same num_levels: every creation step
+    is idempotent, so callers build the identical structure and converge.
     """
     from zarr.codecs import BloscCodec
 
     root = dest.open_group(mode="r+", zarr_format=3)
-
-    # Check if already exists with correct shape
-    if "global_rgb/0/rgb" in root:
-        shape = root["global_rgb/0/rgb"].shape
-        if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
-            return
-        if dest.is_remote:
-            # Dropping the prefix could be millions of objects; deleting that
-            # implicitly is not something a build step should decide.
-            raise ValueError(
-                f"{dest} already holds a global_rgb pyramid of shape {shape}, "
-                f"which does not match the expected "
-                f"{(GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS)}. "
-                f"Delete the global_rgb/ prefix yourself and re-run."
-            )
-        import shutil
-
-        shutil.rmtree(str(Path(dest.url) / "global_rgb"))
-        root = dest.open_group(mode="r+", zarr_format=3)
 
     # Create pyramid levels via zarr API. A parallel zone sweep starts every
     # zone at once and they all arrive here together; zarr's create is
@@ -5383,14 +5377,19 @@ def _ensure_global_store(
     # winner — which needs a lock this layer does not have — every step is
     # idempotent, so all callers build the identical structure and converge.
     global_grp = _require_group(root, "global_rgb")
+    # Level 0 exists before initialization is complete. Ensure every requested
+    # level on retries, retaining any previously published deeper pyramid.
+    published = global_grp.attrs.get("multiscales", {}).get("layout", [])
+    num_levels = max(num_levels, len(published))
     h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
     band_data = np.arange(GLOBAL_NUM_BANDS, dtype=np.int32)
+    actual_levels = 0
 
     for lvl in range(num_levels):
         if h < 1 or w < 1:
             break
         lvl_grp = _require_group(global_grp, str(lvl))
-        _require_array(
+        rgb = _require_array(
             lvl_grp,
             "rgb",
             shape=(h, w, GLOBAL_NUM_BANDS),
@@ -5400,13 +5399,29 @@ def _ensure_global_store(
             compressors=BloscCodec(cname="zstd", clevel=3),
             dimension_names=["lat", "lon", "band"],
         )
-        _require_array(
+        if rgb.shape != (h, w, GLOBAL_NUM_BANDS):
+            # Deleting the pyramid here could remove another caller's work.
+            raise ValueError(
+                f"{dest} has global_rgb/{lvl}/rgb with shape {rgb.shape}, "
+                f"expected {(h, w, GLOBAL_NUM_BANDS)}. "
+                "Delete the global_rgb/ prefix yourself and re-run."
+            )
+        band = _require_array(
             lvl_grp,
             "band",
             data=band_data,
             chunks=(GLOBAL_NUM_BANDS,),
             dimension_names=["band"],
         )
+        # Array metadata can become visible before create_array(data=...)
+        # finishes writing the coordinate chunk. Repair interrupted writes.
+        if not np.array_equal(band[:], band_data):
+
+            def write_band():
+                band[:] = band_data
+
+            _retry_windows_sharing(write_band)
+        actual_levels += 1
         h //= 2
         w //= 2
 
@@ -5419,7 +5434,6 @@ def _ensure_global_store(
     from zarr_cm import multiscales
 
     west, south, east, north_ = GLOBAL_BOUNDS
-    actual_levels = len([k for k in global_grp.keys() if k.isdigit()])
 
     # Build multiscale layout
     h_lvl, w_lvl = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
@@ -5456,7 +5470,12 @@ def _ensure_global_store(
             resampling_method="mean",
         ),
     )
-    global_grp.attrs.update(attrs)
+    if any(global_grp.attrs.get(key) != value for key, value in attrs.items()):
+        # Attributes.update writes once per key. Publish the complete map in
+        # one metadata replacement so concurrent writers cannot expose a
+        # partially published layout. Windows may briefly deny replacement
+        # while another initializer is reading that same metadata file.
+        _retry_windows_sharing(lambda: global_grp.update_attributes(attrs))
 
 
 # Per-worker state for reprojection
