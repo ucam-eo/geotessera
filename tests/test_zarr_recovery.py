@@ -1,5 +1,6 @@
 """Recovery after failed Zarr writes, using small real stores."""
 
+from pathlib import PureWindowsPath
 from types import SimpleNamespace
 
 import numpy as np
@@ -253,6 +254,22 @@ def test_resume_checks_both_arrays_without_listing(tiny_store, monkeypatch):
     assert build._existing_shards(
         tiny_store.location, "utm31", 0, {(0, 0), (0, 1)}
     ) == {(0, 0), (0, 1)}
+
+
+def test_resume_accepts_windows_directory_listings(tiny_store, monkeypatch):
+    assert _fill(tiny_store) == 2
+    listdir = tiny_store.location.listdir
+
+    def windows_listing(*parts, **kwargs):
+        return [str(PureWindowsPath(entry)) for entry in listdir(*parts, **kwargs)]
+
+    monkeypatch.setattr(tiny_store.location, "listdir", windows_listing)
+    assert build._existing_shards(
+        tiny_store.location, "utm31", 0, {(0, 0), (0, 1)}
+    ) == {(0, 0), (0, 1)}
+    assert _fill(tiny_store) == 0
+    assert build.backfill_stretch_stats(tiny_store.location, zones=[31]) == 1
+    assert int(tiny_store.group["stretch_stats_count"][0]) == 32
 
 
 def test_extend_recovers_failed_coordinate_write(tiny_store, monkeypatch):

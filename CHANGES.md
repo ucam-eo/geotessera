@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Zarr shard discovery now handles Windows path separators, allowing local
+  fills to resume and statistics rebuilds to include completed shards.
+  Opening groups through `StoreLocation` now uses the same URL adapter as
+  other store operations, preserving Windows file URLs and storage options.
+
 - Zarr scalar and batch point sampling now agree at exact pixel midpoints,
   consistently resolving ties north/west. NaN and infinite query coordinates
   now return `outside` from `probe()` and NaN embeddings from sampling.

@@ -144,6 +144,20 @@ def test_store_location_round_trip(tmp_path: Path):
         assert_check(f"{label} store remove is idempotent", True)
 
 
+@pytest.mark.parametrize("storage_options", [None, {"auto_mkdir": True}])
+def test_store_location_opens_file_url_groups(tmp_path, storage_options):
+    location = StoreLocation(url(tmp_path / "groups.zarr"), storage_options)
+    root = location.open_group(mode="w", zarr_format=3)
+    root.create_group("nested").create_array("values", data=np.array([1], dtype="i4"))
+
+    writable = location.open_group(mode="r+", path="nested")
+    writable["values"][0] = 2
+    readonly = location.open_group(mode="r", path="nested")
+    np.testing.assert_array_equal(readonly["values"][:], [2])
+    with pytest.raises(ValueError, match="read.only"):
+        readonly["values"][0] = 3
+
+
 def test_permission_denied_probes(monkeypatch: pytest.MonkeyPatch):
     class _DenyingFS:
         def exists(self, path):

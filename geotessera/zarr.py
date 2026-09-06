@@ -316,8 +316,12 @@ class StoreLocation:
         self._ensure_backend()
         from zarr.storage import FsspecStore
 
+        options = dict(self.storage_options or {})
+        if self.url.startswith(("file://", "local://")):
+            # Match local stores: create directories for metadata and chunks.
+            options.setdefault("auto_mkdir", True)
         return FsspecStore.from_url(
-            self.url, storage_options=self.storage_options, read_only=read_only
+            self.url, storage_options=options, read_only=read_only
         )
 
     def open_group(
@@ -330,7 +334,6 @@ class StoreLocation:
         """Open the store (or a group within it) with the right backend."""
         import zarr
 
-        self._ensure_backend()
         kwargs: Dict[str, Any] = {
             "mode": mode,
             "use_consolidated": use_consolidated,
@@ -339,9 +342,7 @@ class StoreLocation:
             kwargs["path"] = path
         if zarr_format is not None:
             kwargs["zarr_format"] = zarr_format
-        if self.storage_options:
-            kwargs["storage_options"] = self.storage_options
-        return zarr.open_group(self.url, **kwargs)
+        return zarr.open_group(self.as_zarr_store(read_only=mode == "r"), **kwargs)
 
     def __str__(self) -> str:
         return self.url
@@ -2764,12 +2765,13 @@ def _existing_array_shards(
     # which is the common case on a fresh zone — no probing needed.
     present = set()
     for row_entry in rows:
-        sr_name = row_entry.rstrip("/").rsplit("/", 1)[-1]
+        # Local Windows listings use backslashes; object-store URLs use '/'.
+        sr_name = row_entry.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
         if not sr_name.isdigit():
             continue
         sr = int(sr_name)
         for col_entry in store.listdir(prefix, sr_name, on_denied=[]):
-            sc_name = col_entry.rstrip("/").rsplit("/", 1)[-1]
+            sc_name = col_entry.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             if sc_name.isdigit() and (sr, int(sc_name)) in wanted:
                 present.add((sr, int(sc_name)))
     return present
