@@ -3501,11 +3501,9 @@ def s3sync_command(args):
     if rewrite:
         # A tile added since the last sync can fall inside a shard that
         # already exists, which the default skip-existing resume would skip.
-        # Statistics stay off because the fold is additive — re-folding a
-        # rewritten shard would double-count it; the preview samples
-        # percentiles from the store instead (--sample-store below).
-        fill_extra += ["--rewrite-existing-shards", "--no-stretch-stats"]
-    elif args.no_stretch_stats:
+        # The fill rebuilds statistics for rewritten zone/year pairs.
+        fill_extra += ["--rewrite-existing-shards"]
+    if args.no_stretch_stats:
         fill_extra += ["--no-stretch-stats"]
 
     if not store_exists:
@@ -4521,7 +4519,7 @@ def zarr_fill_command(args):
             spill_dir=args.spill_dir,
             collect_stretch_stats=not args.no_stretch_stats,
         )
-    except RuntimeError as e:
+    except (ValueError, RuntimeError) as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
         return 1
     except (ImportError, *_object_store_errors()) as e:
@@ -5765,9 +5763,8 @@ Directory Structure:
     s3sync_parser.add_argument(
         "--no-stretch-stats",
         action="store_true",
-        help="Pass --no-stretch-stats to non-rewrite fills (escape hatch "
-        "for the stats catch-up hang on resumed zones; rewrite fills "
-        "always disable stats to avoid double-counting)",
+        help="Skip statistics collection during fills. Rewrites invalidate "
+        "old statistics; use --no-preview and backfill before rendering previews.",
     )
     _add_storage_args(s3sync_parser, "source", "Tile source")
     _add_storage_args(s3sync_parser, "store", "Store", writable=True)

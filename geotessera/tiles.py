@@ -52,6 +52,7 @@ class Tile:
         self.bounds = None
         self.height = None
         self.width = None
+        self.band_count = None
 
     @property
     def grid_name(self) -> str:
@@ -193,6 +194,7 @@ class Tile:
             self.bounds = src.bounds
             self.height = src.height
             self.width = src.width
+            self.band_count = src.count
 
     # -------------------------------------------------------------------------
     # Convenience methods

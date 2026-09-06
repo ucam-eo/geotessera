@@ -1434,27 +1434,47 @@ class GeoTessera:
         """Helper function to reproject a single GeoTIFF file.
 
         Args:
-            args: Tuple containing (source_file, output_file, target_crs, source_resolution, compress)
+            args: Tuple containing (source_file, output_file, target_crs, target_resolution, compress)
 
         Returns:
             Tuple of (output_file, None) on success or (None, error_message) on failure
         """
-        source_file, output_file, target_crs, source_resolution, compress = args
+        source_file, output_file, target_crs, target_resolution, compress = args
 
         try:
             import rasterio
-            from rasterio.warp import calculate_default_transform, reproject, Resampling
+            from rasterio.warp import (
+                Resampling,
+                aligned_target,
+                calculate_default_transform,
+                reproject,
+            )
 
             with rasterio.open(source_file) as src:
-                # Calculate transform and dimensions for target CRS
-                transform, width, height = calculate_default_transform(
-                    src.crs,
-                    target_crs,
-                    src.width,
-                    src.height,
-                    *src.bounds,
-                    resolution=source_resolution,
-                )
+                target_crs_obj = rasterio.crs.CRS.from_user_input(target_crs)
+                preserve_grid = src.crs == target_crs_obj and src.res == target_resolution
+                if preserve_grid:
+                    # There is no coordinate conversion to perform.  Retain
+                    # the source grid exactly rather than snapping its origin
+                    # or resampling its values.
+                    transform, width, height = src.transform, src.width, src.height
+                else:
+                    # Calculate transform and dimensions for target CRS.  The
+                    # target resolution is calculated before this helper is
+                    # called, so its units are those of target_crs rather than
+                    # src.crs.
+                    transform, width, height = calculate_default_transform(
+                        src.crs,
+                        target_crs_obj,
+                        src.width,
+                        src.height,
+                        *src.bounds,
+                        resolution=target_resolution,
+                    )
+                    # Snap converted inputs to the same target-CRS pixel grid.
+                    transform, width, height = aligned_target(
+                        transform, width, height, target_resolution
+                    )
 
                 # Create reprojected file
                 with rasterio.open(
@@ -1474,15 +1494,18 @@ class GeoTessera:
                 ) as dst:
                     # Reproject each band
                     for band_idx in range(1, src.count + 1):
-                        reproject(
-                            source=rasterio.band(src, band_idx),
-                            destination=rasterio.band(dst, band_idx),
-                            src_transform=src.transform,
-                            src_crs=src.crs,
-                            dst_transform=transform,
-                            dst_crs=target_crs,
-                            resampling=Resampling.bilinear,
-                        )
+                        if preserve_grid:
+                            dst.write(src.read(band_idx), band_idx)
+                        else:
+                            reproject(
+                                source=rasterio.band(src, band_idx),
+                                destination=rasterio.band(dst, band_idx),
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=transform,
+                                dst_crs=target_crs_obj,
+                                resampling=Resampling.bilinear,
+                            )
 
                     # Copy metadata and band descriptions
                     dst.update_tags(**src.tags())
@@ -1762,6 +1785,7 @@ class GeoTessera:
         try:
             import rasterio
             from rasterio.merge import merge
+            from rasterio.warp import calculate_default_transform
             import tempfile
             import os
         except ImportError:
@@ -1775,11 +1799,32 @@ class GeoTessera:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Determine source resolution from first file
+        # Determine a common resolution in the target CRS.  Passing a source
+        # resolution through to calculate_default_transform is wrong whenever
+        # the CRS changes (for example, 10 metres is not 10 degrees).
         with rasterio.open(geotiff_paths[0]) as first_src:
-            source_resolution = min(
-                abs(first_src.transform.a), abs(first_src.transform.e)
-            )
+            if first_src.crs is None:
+                raise RuntimeError(
+                    f"Cannot reproject {geotiff_paths[0]} because it has no CRS"
+                )
+
+            target_crs_obj = rasterio.crs.CRS.from_user_input(target_crs)
+            if first_src.crs == target_crs_obj:
+                # Retain the native grid exactly when no CRS conversion is
+                # needed, including non-square pixels.
+                target_resolution = first_src.res
+            else:
+                default_transform, _, _ = calculate_default_transform(
+                    first_src.crs,
+                    target_crs_obj,
+                    first_src.width,
+                    first_src.height,
+                    *first_src.bounds,
+                )
+                target_resolution = (
+                    abs(default_transform.a),
+                    abs(default_transform.e),
+                )
 
         # Create temporary directory for reprojected files
         with tempfile.TemporaryDirectory(prefix="geotessera_reproject_") as temp_dir:
@@ -1796,7 +1841,7 @@ class GeoTessera:
                         geotiff_file,
                         reprojected_file,
                         target_crs,
-                        source_resolution,
+                        target_resolution,
                         compress,
                     )
                 )
@@ -1889,7 +1934,9 @@ class GeoTessera:
                     # Update metadata
                     dst.update_tags(
                         TESSERA_TARGET_CRS=target_crs,
-                        TESSERA_RESOLUTION=str(source_resolution),
+                        TESSERA_RESOLUTION=",".join(
+                            str(resolution) for resolution in target_resolution
+                        ),
                         TESSERA_TILE_COUNT=str(len(geotiff_paths)),
                         TESSERA_DESCRIPTION="GeoTessera satellite embedding mosaic",
                         GEOTESSERA_VERSION=__version__,

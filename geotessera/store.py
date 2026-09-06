@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from datetime import timedelta
 from functools import lru_cache
@@ -115,7 +116,7 @@ def _store_cache_key(location: str) -> str:
 
 
 def zarr_store(
-    location,
+    location: Union[str, os.PathLike[str], ZarrStore],
     cache_dir: Optional[Union[str, Path]] = None,
     cache_max_size: Optional[int] = None,
 ) -> ZarrStore:
@@ -147,6 +148,7 @@ def zarr_store(
                 "existing Store in zarr's CacheStore yourself"
             )
         return location
+    location = os.fsdecode(os.fspath(location))
     location = location.rstrip("/")
     if location.startswith(("http://", "https://")):
         http = HTTPStore.from_url(
@@ -286,11 +288,28 @@ def _progress_iter(items, label: str, total: Optional[int] = None):
 _OK, _WATER, _HOLE, _OUT = 0, 1, 2, 3
 
 
-def _nearest_indices(ascending: np.ndarray, targets: np.ndarray) -> np.ndarray:
-    """Index of the nearest value in a sorted array, for each target."""
-    i = np.clip(np.searchsorted(ascending, targets), 1, len(ascending) - 1)
-    left, right = ascending[i - 1], ascending[i]
-    return np.where(targets - left <= right - targets, i - 1, i)
+def _nearest_indices(coords: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    """Nearest indices on a finite monotonic axis, for finite targets.
+
+    Ties choose the first original coordinate: west on an ascending X axis,
+    north on a descending Y axis. Callers exclude empty axes and invalid
+    query coordinates before indexing.
+    """
+    if len(coords) == 1:
+        return np.zeros(targets.shape, dtype=np.intp)
+    descending = coords[0] > coords[-1]
+    ascending = coords[::-1] if descending else coords
+    i = np.clip(np.searchsorted(ascending, targets), 1, len(coords) - 1)
+    left_distance = targets - ascending[i - 1]
+    right_distance = ascending[i] - targets
+    # The right side of a tie comes first in the original descending axis.
+    choose_left = (
+        left_distance < right_distance
+        if descending
+        else left_distance <= right_distance
+    )
+    nearest = np.where(choose_left, i - 1, i)
+    return len(coords) - 1 - nearest if descending else nearest
 
 
 def _bulk_sample(
@@ -318,17 +337,24 @@ def _bulk_sample(
 
     values = np.full((len(es), bands), np.nan, np.float32)
     cause = np.full(len(es), _OUT, np.int8)
-    inside = (
-        (es >= xs[0] - px)
-        & (es <= xs[-1] + px)
-        & (ns <= ys[0] + px)
-        & (ns >= ys[-1] - px)
-    )
-    if not inside.any():
+    if not len(xs) or not len(ys):
         return values, cause
 
-    xi = _nearest_indices(xs, es[inside])
-    yi = len(ys) - 1 - _nearest_indices(ys[::-1], ns[inside])
+    finite_indices = np.flatnonzero(np.isfinite(es) & np.isfinite(ns))
+    if not len(finite_indices):
+        return values, cause
+
+    xi = _nearest_indices(xs, es[finite_indices])
+    yi = _nearest_indices(ys, ns[finite_indices])
+    close = (
+        (np.abs(xs[xi] - es[finite_indices]) <= px)
+        & (np.abs(ys[yi] - ns[finite_indices]) <= px)
+    )
+    if not close.any():
+        return values, cause
+
+    read_indices = finite_indices[close]
+    xi, yi = xi[close], yi[close]
     if read is None:
 
         def read(xi, yi):
@@ -344,8 +370,8 @@ def _bulk_sample(
     emb = emb.astype(np.float32) * np.where(
         np.isfinite(scales), scales, np.nan
     )[:, None]
-    values[inside] = emb
-    cause[inside] = np.where(
+    values[read_indices] = emb
+    cause[read_indices] = np.where(
         np.isnan(scales), _WATER, np.where(np.isinf(scales), _HOLE, _OK)
     )
     return values, cause
@@ -426,19 +452,12 @@ def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
 def _utm_envelope(
     bbox: Tuple[float, float, float, float], crs: str
 ) -> Tuple[float, float, float, float]:
-    """The UTM extent enclosing a lon/lat bbox, from all four corners.
+    """The UTM extent enclosing a lon/lat bbox, including curved edges.
 
-    Northing extremes sit on different corners as the grid curves away
-    from the central meridian; two corners under-cover a wide box.
+    Northing extremes can fall between the corners as the grid curves away
+    from the central meridian, so densify the bbox edges during projection.
     """
-    corners = [
-        _project(lon, lat, "EPSG:4326", crs)
-        for lon in (bbox[0], bbox[2])
-        for lat in (bbox[1], bbox[3])
-    ]
-    es = [c[0] for c in corners]
-    ns = [c[1] for c in corners]
-    return min(es), min(ns), max(es), max(ns)
+    return _transformer("EPSG:4326", crs).transform_bounds(*bbox, densify_pts=21)
 
 
 def open_zone(
@@ -491,9 +510,9 @@ def open_zone(
 class TesseraAccessor:
     """Tessera-aware methods on an xarray Dataset from a zarr zone.
 
-    Uses coordinate-based selection (``sel(method='nearest')``) for all
-    spatial lookups — no manual affine math.  Reads ``proj:code`` and
-    ``spatial:transform`` from Dataset attrs, years from the time coordinate.
+    Point lookups choose the nearest coordinate, resolving ties to the
+    first axis entry (west/north on the stored grid). Reads ``proj:code``
+    and ``spatial:transform`` from Dataset attrs, years from the time coordinate.
     """
 
     def __init__(self, ds: xr.Dataset):
@@ -587,7 +606,7 @@ class TesseraAccessor:
 
         Returns ``(embedding, status)``, the status one of ``valid``,
         ``water``, ``nodata`` (never written) or ``outside`` (beyond this
-        zone's grid).
+        zone's grid, including non-finite query coordinates).
 
         Within *search_px*, an unwritten pixel falls back to the nearest valid
         one; 0 disables that.  Water is answered as ``water`` rather than
@@ -597,8 +616,10 @@ class TesseraAccessor:
         xname, yname = ("xc", "yc") if "xc" in self._ds.coords else ("x", "y")
         xs = self._ds.coords[xname].values
         ys = self._ds.coords[yname].values
-        xi = int(np.abs(xs - e).argmin())
-        yi = int(np.abs(ys - n).argmin())
+        if not len(xs) or not len(ys) or not np.isfinite(e) or not np.isfinite(n):
+            return None, OUTSIDE
+        xi = int(_nearest_indices(xs, np.asarray([e]))[0])
+        yi = int(_nearest_indices(ys, np.asarray([n]))[0])
 
         # sel(method="nearest") would snap a distant point to an edge pixel.
         if abs(xs[xi] - e) > self._px or abs(ys[yi] - n) > self._px:
@@ -813,12 +834,12 @@ class GeoTesseraZarr:
 
     def __init__(
         self,
-        store_url: Union[str, ZarrStore] = DEFAULT_STORE,
+        store_url: Union[str, os.PathLike[str], ZarrStore] = DEFAULT_STORE,
         cache_dir: Optional[Union[str, Path]] = None,
         cache_max_size: Optional[int] = None,
     ):
-        if isinstance(store_url, str):
-            store_url = store_url.rstrip("/")
+        if not isinstance(store_url, ZarrStore):
+            store_url = os.fsdecode(os.fspath(store_url)).rstrip("/")
         self.url = str(store_url)
         self._store = zarr_store(
             store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
@@ -933,6 +954,8 @@ class GeoTesseraZarr:
         Use it in place of testing ``sample_at`` for NaN, which cannot tell
         open water from a location missing from the store.
         """
+        if not np.isfinite(lon) or not np.isfinite(lat):
+            return None, OUTSIDE
         zones = [_zone_for_lon(lon)]
         if cross_zone:
             zones += [z for z in _seam_neighbours(lon) if z not in zones]
@@ -1000,8 +1023,12 @@ class GeoTesseraZarr:
         values = np.full((len(coords), n_bands), np.nan, np.float32)
         cause = np.full(len(coords), _OUT, np.int8)
 
-        zones = np.array([_zone_for_lon(lon) for lon in lons])
+        finite = np.isfinite(lons) & np.isfinite(lats)
+        zones = np.full(len(coords), -1, dtype=int)
+        zones[finite] = [_zone_for_lon(lon) for lon in lons[finite]]
         for z in np.unique(zones):
+            if z < 0:
+                continue
             idx = np.flatnonzero(zones == z)
             try:
                 ds = self.open_zone(zone=int(z))
@@ -1016,7 +1043,8 @@ class GeoTesseraZarr:
                 array=array,
             )
 
-        near_seam = np.array([bool(_seam_neighbours(lon)) for lon in lons])
+        near_seam = np.zeros(len(coords), dtype=bool)
+        near_seam[finite] = [bool(_seam_neighbours(lon)) for lon in lons[finite]]
         retry = ((cause == _HOLE) & (search_px > 0)) | (
             (cause != _OK) & near_seam & cross_zone
         )

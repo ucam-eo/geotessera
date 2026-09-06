@@ -316,8 +316,12 @@ class StoreLocation:
         self._ensure_backend()
         from zarr.storage import FsspecStore
 
+        options = dict(self.storage_options or {})
+        if self.url.startswith(("file://", "local://")):
+            # Match local stores: create directories for metadata and chunks.
+            options.setdefault("auto_mkdir", True)
         return FsspecStore.from_url(
-            self.url, storage_options=self.storage_options, read_only=read_only
+            self.url, storage_options=options, read_only=read_only
         )
 
     def open_group(
@@ -330,7 +334,6 @@ class StoreLocation:
         """Open the store (or a group within it) with the right backend."""
         import zarr
 
-        self._ensure_backend()
         kwargs: Dict[str, Any] = {
             "mode": mode,
             "use_consolidated": use_consolidated,
@@ -339,9 +342,7 @@ class StoreLocation:
             kwargs["path"] = path
         if zarr_format is not None:
             kwargs["zarr_format"] = zarr_format
-        if self.storage_options:
-            kwargs["storage_options"] = self.storage_options
-        return zarr.open_group(self.url, **kwargs)
+        return zarr.open_group(self.as_zarr_store(read_only=mode == "r"), **kwargs)
 
     def __str__(self) -> str:
         return self.url
@@ -2250,15 +2251,17 @@ def update_zone_stretch_stats(
     The additive triple is summed onto what is stored; the sample is re-drawn
     from the stored sample and the new candidates together, weighted so the
     result still approximates a uniform draw over all pixels either has seen.
-    ``seen_coords`` marks those shards in the coverage mask — written after
-    the sums, so a crash in between re-folds rather than silently drops.
+    A negative count marks an unfinished update. Readers reject it and the
+    next fill rebuilds from complete shards before using the aggregates.
     One fill per (zone, year) at a time remains the operating contract.
     """
     t = time_index
     count_arr = zone_group["stretch_stats_count"]
     prev_n = int(count_arr[t])
+    if prev_n < 0:
+        raise RuntimeError("Stretch statistics need rebuilding before another update")
 
-    count_arr[t] = prev_n + n
+    count_arr[t] = -1
     zone_group["stretch_stats_sum"][t] = (
         np.asarray(zone_group["stretch_stats_sum"][t]) + s
     )
@@ -2283,13 +2286,14 @@ def update_zone_stretch_stats(
     if filled:
         zone_group["stretch_sample"][t, :filled] = emb
         zone_group["stretch_sample_scales"][t, :filled] = scales
-        zone_group["stretch_sample_count"][t] = filled
+    zone_group["stretch_sample_count"][t] = filled
 
     if seen_coords:
         mask = np.asarray(zone_group["stretch_stats_shards"][t])
         for sr, sc in seen_coords:
             mask[sr, sc] = 1
         zone_group["stretch_stats_shards"][t] = mask
+    count_arr[t] = prev_n + n
 
 
 # ---------------------------------------------------------------------------
@@ -2600,17 +2604,27 @@ def _fill_and_write_shard(
         return False
 
     r, c = spec.row_px, spec.col_px
-    # Nested depths first, full depth last. Every one is a slice of the buffer
-    # already in memory, so there are no extra source reads — but the ordering
-    # is load-bearing: it makes "the `embeddings` shard object exists" imply
-    # every shallower depth exists too, which is what lets _existing_shards
-    # stay the single resume oracle. Written the other way round, a crash
-    # would strand the shallow depths permanently because resume would see
-    # `embeddings` present and skip the shard forever.
+    # Publish the full embedding last, after its scales and nested depths.
+    # Resume also checks scales to repair incomplete pairs from older builds.
+    # Remove the previous completion object before a rewrite, so an interrupted
+    # replacement cannot look complete with old embeddings and new scales.
+    from zarr.core.sync import sync
+
+    def write_depth(depth):
+        array = store[depth_array_name(depth)]
+        values = emb_buf[:depth]
+        # Zarr normally removes all-zero shards. Keep their completion
+        # objects, while allowing zero inner chunks in nonzero shards to
+        # remain sparse. This runtime setting also covers reopened stores.
+        if not np.any(values):
+            array = array.with_config({"write_empty_chunks": True})
+        array[t, :, r : r + S, c : c + S] = values
+
+    sync((store["embeddings"].store_path / f"c/{t}/0/{spec.sr}/{spec.sc}").delete())
     for depth in depths:
-        store[depth_array_name(depth)][t, :, r : r + S, c : c + S] = emb_buf[:depth]
-    store["embeddings"][t, :, r : r + S, c : c + S] = emb_buf
+        write_depth(depth)
     store["scales"][t, r : r + S, c : c + S] = scales_buf
+    write_depth(N_BANDS)
 
     if sample_cap > 0:
         stats = shard_stretch_stats(emb_buf, scales_buf, sample_cap)
@@ -2688,7 +2702,30 @@ def _existing_shards(
     console: Optional["rich.console.Console"] = None,
     array_name: str = "embeddings",
 ) -> set:
-    """Which of *wanted* shard coordinates already exist in the store.
+    """Return complete shards, or the objects present in a selected depth.
+
+    Embeddings require matching scales, including for stores written before
+    scales were published first. Scans and fills share this completion rule.
+    """
+    present = _existing_array_shards(
+        store, zone_group, time_index, wanted, console, array_name
+    )
+    if array_name == "embeddings" and present:
+        present &= _existing_array_shards(
+            store, zone_group, time_index, present, console, "scales"
+        )
+    return present
+
+
+def _existing_array_shards(
+    store: StoreLocation,
+    zone_group: str,
+    time_index: int,
+    wanted: set,
+    console: Optional["rich.console.Console"] = None,
+    array_name: str = "embeddings",
+) -> set:
+    """Which of *wanted* shard objects already exist in one array.
 
     A written shard is a single object under the array's chunk prefix, so its
     presence is proof the shard landed — bookkeeping that survives a ``kill
@@ -2701,12 +2738,12 @@ def _existing_shards(
     each wanted shard when listing is refused, which credentials without
     ``s3:ListBucket`` will be.
 
-    *array_name* selects which array to interrogate. Nested-depth arrays are
-    also one shard wide on the band axis, so the ``/0/`` component is the same
-    for them; only ``embeddings`` is ever used as the resume oracle, because
-    the write order guarantees it is the last one to land.
+    Scales have no band dimension; embeddings and nested depths have one
+    shard across that dimension.
     """
-    prefix = f"{zone_group}/{array_name}/c/{time_index}/0"
+    prefix = f"{zone_group}/{array_name}/c/{time_index}"
+    if array_name != "scales":
+        prefix += "/0"
 
     try:
         rows = store.listdir(prefix)
@@ -2728,12 +2765,13 @@ def _existing_shards(
     # which is the common case on a fresh zone — no probing needed.
     present = set()
     for row_entry in rows:
-        sr_name = row_entry.rstrip("/").rsplit("/", 1)[-1]
+        # Local Windows listings use backslashes; object-store URLs use '/'.
+        sr_name = row_entry.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
         if not sr_name.isdigit():
             continue
         sr = int(sr_name)
         for col_entry in store.listdir(prefix, sr_name, on_denied=[]):
-            sc_name = col_entry.rstrip("/").rsplit("/", 1)[-1]
+            sc_name = col_entry.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             if sc_name.isdigit() and (sr, int(sc_name)) in wanted:
                 present.add((sr, int(sc_name)))
     return present
@@ -2749,9 +2787,13 @@ def _store_years(store: StoreLocation, zones: Optional[List[int]] = None) -> Lis
 
     def years_from(name: str) -> Optional[List[int]]:
         try:
-            return [int(v) for v in root[name]["time"][:]]
-        except Exception:
+            group = root[name]
+        except KeyError:
             return None
+        years = [int(v) for v in group["time"][:]]
+        if _PENDING_TIME_ATTR in group.attrs or any(y <= 0 for y in years):
+            raise ValueError(f"{name}: unfinished time axis; re-run zarr-extend first")
+        return years
 
     tried = set()
     for zone in zones or []:
@@ -2802,6 +2844,9 @@ def _zone_group_names(
     return names
 
 
+_PENDING_TIME_ATTR = "tessera:pending_years"
+
+
 def extend_store(
     store_path: "str | Path | StoreLocation",
     years: List[int],
@@ -2828,8 +2873,8 @@ def extend_store(
     """
     store = StoreLocation.resolve(store_path, storage_options)
     years = sorted(set(int(y) for y in years))
-    if not years:
-        raise ValueError("No years given to add")
+    if not years or years[0] <= 0:
+        raise ValueError("Provide positive years to add")
 
     zone_names = _zone_group_names(store, zones)
     if not zone_names:
@@ -2849,23 +2894,40 @@ def extend_store(
     skipped = 0
     for name in zone_names:
         group = store.open_group(mode="r+", path=name, zarr_format=3)
-        existing = [int(v) for v in group["time"][:]]
+        time_values = [int(v) for v in group["time"][:]]
+        pending = group.attrs.get(_PENDING_TIME_ATTR)
+        existing = list(pending) if pending is not None else list(time_values)
+        if pending is None:
+            # Older interrupted extensions leave zero-filled trailing slots.
+            # Reuse them rather than appending after an invented year zero.
+            while existing and existing[-1] == 0:
+                existing.pop()
+        if any(y <= 0 for y in existing) or any(
+            a >= b for a, b in zip(existing, existing[1:])
+        ):
+            raise ValueError(f"{name}: invalid time coordinates {existing}")
+        if pending is not None and (
+            len(time_values) > len(existing)
+            or any(v not in (0, y) for v, y in zip(time_values, existing))
+        ):
+            raise ValueError(f"{name}: time coordinates disagree with pending extension")
 
         missing = [y for y in years if y not in existing]
-        if not missing:
+        if not missing and pending is None and existing == time_values:
             skipped += 1
             continue
 
-        earliest_new = min(missing)
-        if existing and earliest_new <= max(existing):
+        earliest_new = min(missing) if missing else None
+        if existing and earliest_new is not None and earliest_new <= max(existing):
             raise ValueError(
                 f"{name}: cannot add {earliest_new} to a time axis ending at "
                 f"{max(existing)}. Years may only be appended — inserting an "
                 f"earlier one would renumber every existing chunk."
             )
 
-        old_t = len(existing)
-        new_t = old_t + len(missing)
+        old_t = len(time_values)
+        target_years = existing + missing
+        new_t = len(target_years)
 
         # Every time-indexed array must grow together, or the group's axes
         # desynchronise. A zone from a store that predates the stretch
@@ -2893,16 +2955,17 @@ def extend_store(
                 f"would need rewriting to populate it."
             )
 
-        # Order matters only for crash-safety: grow the data arrays before
-        # advertising the year on the time axis, so a run interrupted midway
-        # never leaves a year readers can select but not read.
+        # Persist the intended coordinates before changing any array. A retry
+        # can finish even if resize succeeded but a coordinate chunk did not.
+        group.attrs[_PENDING_TIME_ATTR] = target_years
         for arr_name in ("embeddings", "scales", *depth_names, *STRETCH_ARRAY_NAMES):
             arr = group[arr_name]
             arr.resize((new_t,) + tuple(arr.shape[1:]))
 
         time_arr = group["time"]
         time_arr.resize((new_t,))
-        time_arr[old_t:new_t] = np.array(missing, dtype=time_arr.dtype)
+        time_arr[:] = np.array(target_years, dtype=time_arr.dtype)
+        del group.attrs[_PENDING_TIME_ATTR]
 
         extended += 1
         if console:
@@ -2916,7 +2979,8 @@ def extend_store(
 
     # Array metadata changed, so the consolidated root is now stale — unlike
     # a fill, this step genuinely requires re-consolidation.
-    if consolidate and extended:
+    # A prior run may have finished every zone but failed consolidation.
+    if consolidate:
         consolidate_store(store, console=console)
 
     return extended
@@ -3470,7 +3534,7 @@ def fill_store(
 ) -> int:
     """Incrementally fill a store with tile data.
 
-    Reads the tile registry to skip already-written tiles.
+    Skips shards with complete embeddings and scales objects.
     Returns the number of shards written.
 
     Args:
@@ -3485,15 +3549,17 @@ def fill_store(
             is set, because the root object is the one thing parallel zone
             jobs share — run ``zarr-consolidate`` once after the sweep.
         skip_existing_shards: Scan for shards already in the store and skip
-            them (the default). A shard is always written from every tile
-            covering it, so its presence means it is complete, and the
-            objects outlive the ingestion registry — which makes this both
-            the cheapest resume and the only one that survives a kill -9.
+            them (the default). A complete shard has matching embeddings and
+            scales objects, written from every tile covering it.
             Set False to rebuild them, which is needed only when the tile
             inventory has grown: a tile added to the manifest afterwards
             falls inside an existing shard and would otherwise be skipped
-            rather than merged in.
+            rather than merged in. Rewrites rebuild the affected zone/year's
+            statistics from its complete shards. With collection disabled,
+            statistics remain invalid until a subsequent fill or backfill.
     """
+    from zarr.errors import GroupNotFoundError
+
     store = StoreLocation.resolve(store_path, storage_options)
     if workers is None:
         workers = DEFAULT_WORKERS
@@ -3559,7 +3625,7 @@ def fill_store(
             # check on a prefix needs list permission the writer may lack.
             try:
                 zone_store = store.open_group(mode="r", path=zone_group)
-            except Exception:
+            except GroupNotFoundError:
                 if console:
                     console.print(
                         f"  [yellow]Zone {zone_num} not initialised, skipping[/yellow]"
@@ -3615,15 +3681,13 @@ def fill_store(
                 )
                 shard_specs = [s for s in shard_specs if (s.sr, s.sc) not in present]
 
-            # Stretch statistics. The coverage mask says which store shards
-            # are already folded into the sums; anything present but unseen
-            # is a catch-up read. That makes stats collection idempotent and
-            # crash-safe by the same scan that drives the fill itself:
-            # a crash between shard write and stats fold just leaves the
-            # shard present-but-unseen, and the next run reads it back.
+            # Catch up on complete shards absent from the coverage mask.
+            # Rewrites and interrupted aggregate updates need a replacement
+            # for the whole zone/year, since individual sums are not stored.
             sample_cap = 0
             catch_up: List[Tuple[int, int]] = []
-            if collect_stretch_stats:
+            rebuild_stats = False
+            if collect_stretch_stats or not skip_existing_shards:
                 zone_rw = store.open_group(mode="r+", path=zone_group)
                 ensure_stretch_arrays(zone_rw, console=console)
                 seen = {
@@ -3635,11 +3699,22 @@ def fill_store(
                     )
                 }
                 writing = {(s.sr, s.sc) for s in shard_specs}
-                catch_up = sorted(present - seen - writing)
-                k_slots = zone_rw["stretch_sample"].shape[1]
-                sample_cap = _shard_sample_cap(
-                    k_slots, len(shard_specs) + len(catch_up)
+                rebuild_stats = (
+                    int(zone_rw["stretch_stats_count"][time_index]) < 0
+                    or bool(writing & seen)
+                    or (bool(writing) and not skip_existing_shards)
                 )
+                if rebuild_stats:
+                    # Invalidate before overwriting data, including when
+                    # collection is disabled. Old aggregates must not be used
+                    # for new pixels, nor added to the rewritten shard again.
+                    zone_rw["stretch_stats_count"][time_index] = -1
+                elif collect_stretch_stats:
+                    catch_up = sorted(present - seen - writing)
+                    k_slots = zone_rw["stretch_sample"].shape[1]
+                    sample_cap = _shard_sample_cap(
+                        k_slots, len(shard_specs) + len(catch_up)
+                    )
 
             if console:
                 console.print(
@@ -3673,10 +3748,13 @@ def fill_store(
             total_shards_written += written_count
             total_shards_failed += len(failed)
 
-            if collect_stretch_stats and shard_stats:
-                # Sums before mask: a crash in between re-folds those shards
-                # next run (double count, drift-detectable and repairable)
-                # rather than silently dropping them.
+            if collect_stretch_stats and failed:
+                zone_rw["stretch_stats_count"][time_index] = -1
+            elif collect_stretch_stats and rebuild_stats:
+                backfill_stretch_stats(
+                    store, zones=[zone_num], years=[fill_year], console=console
+                )
+            elif collect_stretch_stats and shard_stats:
                 update_zone_stretch_stats(
                     zone_rw,
                     time_index,
@@ -3705,9 +3783,7 @@ def fill_store(
                 if failed:
                     console.print(f"    [red]{len(failed)} shard(s) failed[/red]")
 
-    # A failed shard leaves its tiles unrecorded, so re-running finishes the
-    # job. Surface it as an error rather than a quiet partial success — a
-    # sweep orchestrator has no other way to tell the zone needs a retry.
+    # Failed writes and statistics reads must be visible to sweep callers.
     if total_shards_failed:
         raise RuntimeError(
             f"{total_shards_failed} shard(s) failed "
@@ -3749,10 +3825,10 @@ def _write_shards(
 
     ``stats_coords`` are shards already in the store whose statistics the
     coverage mask has not seen; they are read back and folded alongside the
-    writes. A failed catch-up is only a warning (the mask stays unset, so
-    the next run retries it); a failed write is a hard error as before.
+    writes. Failed writes and catch-up reads both fail the fill, which marks
+    the aggregate incomplete until a retry rebuilds it.
 
-    Returns (shards written, set of (sr, sc) writes that failed, per-shard
+    Returns (shards written, set of failed (sr, sc) coordinates, per-shard
     stretch statistics from both task kinds).
     """
     import multiprocessing
@@ -3805,6 +3881,7 @@ def _write_shards(
                     failed.add((item.sr, item.sc))
                 else:
                     logger.warning(f"Stats catch-up for shard {item} failed: {e}")
+                    failed.add(item)
             if advance is not None:
                 advance()
 
@@ -4282,6 +4359,11 @@ def compute_stretch_from_stats(
             continue
 
         n_z = int(group["stretch_stats_count"][t])
+        if n_z < 0:
+            raise RuntimeError(
+                f"{name} {year}: stretch statistics are incomplete. Run "
+                "zarr-fill --backfill-stretch-stats before computing a stretch."
+            )
         if n_z == 0:
             continue
         s_z = np.asarray(group["stretch_stats_sum"][t])
@@ -4790,10 +4872,10 @@ def backfill_stretch_stats(
                 continue
             t = zone_years.index(fill_year)
             present = _existing_shards(store, name, t, all_coords, console=None)
-            if not present:
-                continue
-
-            cap = _shard_sample_cap(k_slots, len(present))
+            # Leave the slot visibly invalid if reading or publishing its
+            # replacement fails. The next fill can retry this same rebuild.
+            group["stretch_stats_count"][t] = -1
+            cap = _shard_sample_cap(k_slots, max(len(present), 1))
             n_total, s_total = 0, np.zeros(N_BANDS, dtype=np.float64)
             m_total = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
             candidates: List[Tuple[np.ndarray, np.ndarray, float]] = []
@@ -4823,7 +4905,6 @@ def backfill_stretch_stats(
             emb_s, scales_s = merge_stretch_samples(candidates, k_slots)
             # Backfill SETS from actual contents (it is the repair for
             # double-counting), unlike the fill's additive fold.
-            group["stretch_stats_count"][t] = n_total
             group["stretch_stats_sum"][t] = s_total
             group["stretch_stats_prod"][t] = m_total
             full_emb = np.zeros((k_slots, N_BANDS), dtype=np.int8)
@@ -4837,6 +4918,7 @@ def backfill_stretch_stats(
             for sr, sc in present:
                 mask[sr, sc] = 1
             group["stretch_stats_shards"][t] = mask
+            group["stretch_stats_count"][t] = n_total
             rebuilt += 1
             if console:
                 console.print(
@@ -5261,37 +5343,31 @@ def _require_array(parent, name: str, **kwargs):
     )
 
 
+def _retry_windows_sharing(write, retries: int = 20, delay: float = 0.5):
+    """Retry transient Windows conflicts when replacing an open file."""
+    import time
+
+    for attempt in range(retries + 1):
+        try:
+            return write()
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == retries:
+                raise
+            time.sleep(delay)
+
+
 def _ensure_global_store(
     dest: "StoreLocation",
     num_levels: int,
 ) -> None:
     """Create the global_rgb/ pyramid group within the store.
 
-    Safe to call concurrently: every creation step is idempotent, so parallel
-    callers build the identical structure and converge.
+    Safe to call concurrently with the same num_levels: every creation step
+    is idempotent, so callers build the identical structure and converge.
     """
     from zarr.codecs import BloscCodec
 
     root = dest.open_group(mode="r+", zarr_format=3)
-
-    # Check if already exists with correct shape
-    if "global_rgb/0/rgb" in root:
-        shape = root["global_rgb/0/rgb"].shape
-        if shape == (GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS):
-            return
-        if dest.is_remote:
-            # Dropping the prefix could be millions of objects; deleting that
-            # implicitly is not something a build step should decide.
-            raise ValueError(
-                f"{dest} already holds a global_rgb pyramid of shape {shape}, "
-                f"which does not match the expected "
-                f"{(GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W, GLOBAL_NUM_BANDS)}. "
-                f"Delete the global_rgb/ prefix yourself and re-run."
-            )
-        import shutil
-
-        shutil.rmtree(str(Path(dest.url) / "global_rgb"))
-        root = dest.open_group(mode="r+", zarr_format=3)
 
     # Create pyramid levels via zarr API. A parallel zone sweep starts every
     # zone at once and they all arrive here together; zarr's create is
@@ -5301,14 +5377,19 @@ def _ensure_global_store(
     # winner — which needs a lock this layer does not have — every step is
     # idempotent, so all callers build the identical structure and converge.
     global_grp = _require_group(root, "global_rgb")
+    # Level 0 exists before initialization is complete. Ensure every requested
+    # level on retries, retaining any previously published deeper pyramid.
+    published = global_grp.attrs.get("multiscales", {}).get("layout", [])
+    num_levels = max(num_levels, len(published))
     h, w = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
     band_data = np.arange(GLOBAL_NUM_BANDS, dtype=np.int32)
+    actual_levels = 0
 
     for lvl in range(num_levels):
         if h < 1 or w < 1:
             break
         lvl_grp = _require_group(global_grp, str(lvl))
-        _require_array(
+        rgb = _require_array(
             lvl_grp,
             "rgb",
             shape=(h, w, GLOBAL_NUM_BANDS),
@@ -5318,13 +5399,29 @@ def _ensure_global_store(
             compressors=BloscCodec(cname="zstd", clevel=3),
             dimension_names=["lat", "lon", "band"],
         )
-        _require_array(
+        if rgb.shape != (h, w, GLOBAL_NUM_BANDS):
+            # Deleting the pyramid here could remove another caller's work.
+            raise ValueError(
+                f"{dest} has global_rgb/{lvl}/rgb with shape {rgb.shape}, "
+                f"expected {(h, w, GLOBAL_NUM_BANDS)}. "
+                "Delete the global_rgb/ prefix yourself and re-run."
+            )
+        band = _require_array(
             lvl_grp,
             "band",
             data=band_data,
             chunks=(GLOBAL_NUM_BANDS,),
             dimension_names=["band"],
         )
+        # Array metadata can become visible before create_array(data=...)
+        # finishes writing the coordinate chunk. Repair interrupted writes.
+        if not np.array_equal(band[:], band_data):
+
+            def write_band():
+                band[:] = band_data
+
+            _retry_windows_sharing(write_band)
+        actual_levels += 1
         h //= 2
         w //= 2
 
@@ -5337,7 +5434,6 @@ def _ensure_global_store(
     from zarr_cm import multiscales
 
     west, south, east, north_ = GLOBAL_BOUNDS
-    actual_levels = len([k for k in global_grp.keys() if k.isdigit()])
 
     # Build multiscale layout
     h_lvl, w_lvl = GLOBAL_LEVEL0_H, GLOBAL_LEVEL0_W
@@ -5374,7 +5470,12 @@ def _ensure_global_store(
             resampling_method="mean",
         ),
     )
-    global_grp.attrs.update(attrs)
+    if any(global_grp.attrs.get(key) != value for key, value in attrs.items()):
+        # Attributes.update writes once per key. Publish the complete map in
+        # one metadata replacement so concurrent writers cannot expose a
+        # partially published layout. Windows may briefly deny replacement
+        # while another initializer is reading that same metadata file.
+        _retry_windows_sharing(lambda: global_grp.update_attributes(attrs))
 
 
 # Per-worker state for reprojection

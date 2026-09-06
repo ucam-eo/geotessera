@@ -37,5 +37,8 @@ jobs:
       - name: Build
         run: uv sync --locked --all-extras --dev
 
-      - name: Test
+      - name: Test Python API
+        run: env MPLCONFIGDIR=/tmp/geotessera-mpl uv run pytest tests -v
+
+      - name: Test CLI
         run: env TERM=dumb TTY_INTERACTIVE=0 uv run cram tests -v

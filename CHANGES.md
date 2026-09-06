@@ -1,3 +1,19 @@
+## Unreleased
+
+- Global preview initialization now resumes incomplete pyramids and publishes
+  complete metadata in one write, retrying Windows file-sharing conflicts
+  during concurrent initialization. Incompatible local pyramids now raise
+  an error instead of being deleted automatically.
+
+- Zarr shard discovery now handles Windows path separators, allowing local
+  fills to resume and statistics rebuilds to include completed shards.
+  Opening groups through `StoreLocation` now uses the same URL adapter as
+  other store operations, preserving Windows file URLs and storage options.
+
+- Zarr scalar and batch point sampling now agree at exact pixel midpoints,
+  consistently resolving ties north/west. NaN and infinite query coordinates
+  now return `outside` from `probe()` and NaN embeddings from sampling.
+
 ## v0.10.1 (2026-08-27)
 
 - Sampling npy points or regions from a local `embeddings_dir` no longer
