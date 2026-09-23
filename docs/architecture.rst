@@ -38,7 +38,8 @@ The library follows a layered architecture:
             ↓
     Storage Layer
     ├── Source Cooperative repository (https://data.source.coop/tessera/tessera)
-    ├── Zarr store (https://data.source.coop/tessera/tessera/zarr/v1)
+    ├── Zarr stores (https://data.source.coop/tessera/tessera/zarr/)
+    ├── Icechunk store (s3://tessera-embeddings/v1.1/dclimate.icechunk)
     └── Local cache (~/.cache/geotessera/{v1,v1.1-cam,...}/manifest.parquet)
 
 Coordinate System and Grid
@@ -263,14 +264,14 @@ The manifest can be loaded from multiple sources:
 
 **1. Default Remote** (recommended)::
 
-    # Downloads and caches the v1 manifest automatically.
+    # Downloads and caches the v1.1 cambridge manifest automatically.
     from geotessera import GeoTessera
-    gt = GeoTessera()
+    gt = GeoTessera(dataset_version="v1.1", dataset_variant="cambridge")
 
-    # Cached at: ~/.cache/geotessera/v1/manifest.parquet
+    # Cached at: ~/.cache/geotessera/v1.1-cam/manifest.parquet
 
     # Pick a different (version, variant) — see :ref:`dataset-versions`
-    gt = GeoTessera(dataset_version="v1.1", dataset_variant="cambridge")
+    gt = GeoTessera(dataset_version="v1")
 
 **2. Local File**::
 
@@ -320,14 +321,16 @@ request shares one ``urllib3`` connection pool.
 
     ~/.cache/geotessera/
     ├── v1/
-    │   ├── manifest.parquet           # Per-version tile manifest
+    │   ├── manifest.parquet           # Per-dataset tile manifest
+    │   └── landmasks.parquet          # Per-version landmask registry
+    ├── v1.1-cam/
+    │   └── manifest.parquet
+    ├── v1.1/
     │   └── landmasks.parquet
-    └── v1.1/
-        ├── manifest.parquet
-        └── landmasks.parquet
+    └── tile-registry/                 # Icechunk tile registry parts
 
     # Embedding/landmark tile data lives in the user's --output dir,
-    # not in this cache. The cache holds only per-version manifests.
+    # not in this cache.
 
 **Download Process**::
 

@@ -754,6 +754,129 @@ def visualize_global_coverage(
     return output_path
 
 
+def visualize_tile_registry_coverage(
+    tiles: pd.DataFrame,
+    output_path: str = "tessera_coverage.png",
+    year: Optional[int] = None,
+    width_pixels: int = 2000,
+    show_countries: bool = True,
+    tile_alpha: float = 0.6,
+    region_bbox: Optional[Tuple[float, float, float, float]] = None,
+    region_file=None,
+    title: str = "Tessera Embedding Coverage",
+) -> str:
+    """Draw tile-registry rows from :class:`geotessera.icechunk.TileRegistry`.
+
+    A tile is usable in a year when it is embedded and its depth rule
+    refused at most half its pixels. For one year, tiles are green when
+    usable, orange when embedded but mostly refused and red when not
+    embedded. Across years, green marks tiles usable in every year,
+    orange in some and red in none.
+
+    Returns:
+        The PNG path.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.collections import PatchCollection
+
+    refused = tiles["refused_px"] / tiles["eligible_px"].where(
+        tiles["eligible_px"] > 0
+    )
+    tiles = tiles.assign(
+        usable=tiles["embedded"] & (refused.fillna(0) <= 0.5),
+    )
+    colors = {"good": "darkgreen", "partial": "darkorange", "none": "firebrick"}
+    if year is not None:
+        tiles = tiles[tiles["year"] == year]
+        status = np.where(
+            tiles["usable"], "good", np.where(tiles["embedded"], "partial", "none")
+        )
+        labels = {
+            "good": "Embedded",
+            "partial": "Embedded, mostly refused",
+            "none": "Not embedded",
+        }
+        title = f"{title} - Year {year}"
+    else:
+        years = sorted(tiles["year"].unique())
+        grouped = tiles.groupby(["zone", "tile"], sort=False)
+        usable = grouped["usable"].sum()
+        tiles = grouped[["bbox_west", "bbox_south", "bbox_east", "bbox_north"]].first()
+        status = np.where(
+            usable == len(years), "good", np.where(usable > 0, "partial", "none")
+        )
+        labels = {
+            "good": f"Usable in all {len(years)} years",
+            "partial": "Usable in some years",
+            "none": "Usable in no year",
+        }
+
+    rects, facecolors = [], []
+    for (w, s, e, n), st in zip(
+        tiles[["bbox_west", "bbox_south", "bbox_east", "bbox_north"]].to_numpy(),
+        status,
+    ):
+        spans = [(w, e)] if w <= e else [(w, 180.0), (-180.0, e)]
+        for x0, x1 in spans:
+            rects.append(mpatches.Rectangle((x0, s), x1 - x0, n - s, linewidth=0))
+            facecolors.append(colors[st])
+
+    if region_bbox:
+        west, south, east, north = region_bbox
+        pad_x = max((east - west) * 0.05, 0.05)
+        pad_y = max((north - south) * 0.05, 0.05)
+        xlim, ylim = (west - pad_x, east + pad_x), (south - pad_y, north + pad_y)
+    else:
+        xlim, ylim = (-180, 180), (-90, 90)
+    aspect = (ylim[1] - ylim[0]) / (xlim[1] - xlim[0])
+    dpi = 100
+    fig, ax = plt.subplots(
+        figsize=(width_pixels / dpi, width_pixels / dpi * aspect), dpi=dpi
+    )
+    try:
+        if show_countries:
+            import geodatasets
+            from shapely.geometry import box
+
+            world = gpd.read_file(geodatasets.get_path("naturalearth.land"))
+            world.clip(box(xlim[0], ylim[0], xlim[1], ylim[1])).plot(
+                ax=ax, color="lightgray", edgecolor="darkgray", linewidth=0.5
+            )
+        ax.add_collection(
+            PatchCollection(rects, facecolors=facecolors, alpha=tile_alpha)
+        )
+        if region_file is not None:
+            from .inputs import read_region_file
+
+            read_region_file(region_file).plot(
+                ax=ax, facecolor="none", edgecolor="red", linewidth=2, linestyle="--"
+            )
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_title(title, fontsize=14, fontweight="bold")
+        ax.grid(True, alpha=0.3, linestyle="--")
+        counts = pd.Series(status).value_counts()
+        ax.legend(
+            handles=[
+                mpatches.Patch(
+                    color=colors[k],
+                    alpha=tile_alpha,
+                    label=f"{labels[k]} ({counts.get(k, 0):,})",
+                )
+                for k in colors
+            ],
+            loc="lower right",
+        )
+        output_path = str(output_path)
+        fig.savefig(output_path, bbox_inches="tight")
+    finally:
+        plt.close(fig)
+    return output_path
+
+
 def create_rgb_mosaic(
     geotiff_paths: List[str],
     output_path: str,

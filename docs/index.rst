@@ -9,14 +9,11 @@ representations optimized for downstream geospatial analysis tasks.
 
 .. important::
 
-   **Multiple Tessera versions are now published.** Prefer the newer **1.1**
-   model wherever it's available; it's a strict improvement over the legacy
-   1.0 line. The 1.1 currently runs in a ``cambridge`` variant — test
-   embeddings produced by the Cambridge team while the model is being rolled
-   out (a complete global ``dclimate`` run is coming soon). **TESSERA v2**
-   betas (``2B-L~beta1``, ``2B-L~beta2``) are also in the repository. The
-   legacy 1.0 line is frozen (no new years will be added) but remains the
-   default, as the only version with full global coverage. **Never mix
+   **Multiple Tessera versions are published.** The default is **1.1** /
+   ``dclimate``, a complete global run streamed from Icechunk. Its NPY
+   tiles are not published; v1.1 NPY tiles come from the separate
+   ``cambridge`` run. **TESSERA v2** betas (``2B-L~beta1``, ``2B-L~beta2``)
+   are also published. The legacy 1.0 line is frozen. **Never mix
    embeddings from different versions or variants in the same downstream
    task**: the 128-channel feature spaces are independently learned and not
    interchangeable. Pick one ``(dataset_version, dataset_variant)`` pair per
@@ -80,16 +77,22 @@ Export a region or create a web map from Zarr::
     geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --output map/ --serve
 
 See :doc:`cli_reference` for options and restart behavior. The following
-examples use individual tiles with ``--source tiles``.
+examples use individual tiles with ``--source tiles``, which are
+deprecated and will be removed. v1.1 tiles exist only for the
+``cambridge`` variant; commands without ``--dataset-variant cambridge``
+use it with a warning.
 
 Check data availability first::
 
-    # Generate coverage visualizations (creates PNG map, JSON data, and interactive HTML globe)
+    # Map the default v1.1 dclimate dataset from its tile registry
     geotessera coverage --output coverage_map.png
+
+    # Map tile coverage (creates PNG map, JSON data, and interactive HTML globe)
+    geotessera coverage --dataset-variant cambridge --output coverage_map.png
     # Creates: coverage_map.png, coverage.json, globe.html
 
-    # View coverage for a specific year
-    geotessera coverage --year 2024
+    # View tile coverage for a specific year
+    geotessera coverage --dataset-variant cambridge --year 2024
 
     # Check coverage for a single country with precise boundary outline
     geotessera coverage --country "United Kingdom"
@@ -284,45 +287,51 @@ GeoTessera ships embeddings under two orthogonal axes:
 * **dataset version** — the trained Tessera model (``1.0`` or ``1.1``).
   Different versions have *different 128-channel feature spaces*: a feature
   vector from one version is **not comparable** to a vector from another.
-* **dataset variant** — for a given version, an independent model run /
-  release channel. ``vultr`` (the production hosting on Vultr) is the
-  variant for the 1.0 line; ``cambridge`` is the Cambridge team's deployment
-  for the 1.1 line; ``2B-L~beta1`` is the v2 beta run. Each version has a
-  default variant that is selected when ``--dataset-variant`` is omitted.
+* **dataset variant** — for a given version, a separate inference run.
+  Embeddings from different variants do not interoperate either, even
+  within one version. Each version has a default variant, selected when
+  ``--dataset-variant`` is omitted.
 
-Each ``(version, variant)`` pair — a *dataset* — has its own directory in
-the repository's ``npy/`` tree. The v1 series predates this scheme, so all
-its variants share the bare ``v1/`` directory; later versions encode the
-variant as a suffix. Known datasets on ``data.source.coop/tessera/tessera``
-(list them any time with ``geotessera info``):
+Each variant is published in one or more formats: NPY tiles under
+``npy/``, a Zarr store under ``zarr/`` on
+``data.source.coop/tessera/tessera``, or an Icechunk repository. List them
+with ``geotessera info``:
 
-+-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
-| ``version`` | ``variant``         | ``npy/`` directory | Years          | Notes                                                          |
-+=============+=====================+====================+================+================================================================+
-| ``1.0``     | ``vultr`` (default) | ``v1/``            | 2017–2025      | Legacy production line. Frozen — no new years will be added.   |
-+-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
-| ``1.1``     | ``cambridge``       | ``v1.1-cam/``      | 2015–2025      | Newer model. Cambridge test embeddings; active development.    |
-|             | (default)           |                    |                |                                                                |
-+-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
-| ``1.1``     | ``dclimate``        | —                  | —              | **Coming soon.** Complete global v1.1 run; not yet published.  |
-+-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
-| ``2.0``     | ``2B-L~beta1``      | ``v2-2B-L~beta1/`` | 2017–2025      | TESSERA v2 beta (2B parameters, L size). Experimental.         |
-|             | (default)           |                    |                |                                                                |
-+-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
-| ``2.0``     | ``2B-L~beta2``      | ``v2-2B-L~beta2/`` | 2017–2025      | Second v2 beta run. Experimental.                              |
-+-------------+---------------------+--------------------+----------------+----------------------------------------------------------------+
++-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
+| ``version`` | ``variant``          | NPY (``npy/``)       | Zarr (``zarr/``)   | Icechunk                                           | Years     |
++=============+======================+======================+====================+====================================================+===========+
+| ``1.0``     | ``vultr`` (default)  | ``v1/``              | ``v1/``            | —                                                  | 2017–2025 |
++-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
+| ``1.1``     | ``dclimate``         | —                    | —                  | ``s3://tessera-embeddings/v1.1/dclimate.icechunk`` | 2017–2025 |
+|             | (default)            |                      |                    |                                                    |           |
++-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
+| ``1.1``     | ``cambridge``        | ``v1.1-cam/``        | ``v1.1/``          | —                                                  | 2015–2025 |
++-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
+| ``2.0``     | ``2B-L~beta1``       | ``v2-2B-L~beta1/``   | ``v2-2B-L~beta1/`` | —                                                  | 2017–2025 |
+|             | (default)            |                      |                    |                                                    |           |
++-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
+| ``2.0``     | ``2B-L~beta2``       | ``v2-2B-L~beta2/``   | ``v2-2B-L~beta2/`` | —                                                  | 2017–2025 |
++-------------+----------------------+----------------------+--------------------+----------------------------------------------------+-----------+
 
-The library defaults remain ``dataset_version="v1"`` and ``year=2024`` —
-the only combination with full global coverage today.
+``1.0`` / ``vultr`` is frozen. ``1.1`` / ``dclimate`` is the complete
+global v1.1 run. ``1.1`` / ``cambridge`` holds the Cambridge test
+embeddings. The ``2.0`` variants are experimental betas.
+
+The default version is ``v1.1``. Streamed reads use ``dclimate``. NPY tiles
+of v1.1 exist only for ``cambridge``, so ``GeoTessera`` and ``download
+--format npy`` fall back to it with a warning; select it explicitly with
+``--dataset-variant cambridge``.
+
+.. note::
+
+   NPY tiles are deprecated and will be removed. Use Zarr or Icechunk.
 
 Which one should I use?
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-**Prefer ``1.1`` / ``cambridge`` for new projects** where it's available
-— it reflects the latest model and is where ongoing development happens.
-Stick with ``1.0`` / ``vultr`` only if you're (a) reproducing prior
-published work that used it, or (b) need a specific tile that the 1.1
-deployment doesn't yet have.
+**Prefer ``1.1`` / ``dclimate`` for new projects.** Use ``1.1`` /
+``cambridge`` only when a workflow requires NPY tiles, and then use it
+throughout. Use ``1.0`` / ``vultr`` only to reproduce prior work.
 
 .. warning::
 
@@ -337,16 +346,16 @@ deployment doesn't yet have.
      numeric values* across versions/variants. The grid geometry matches;
      the channel semantics do not.
 
-   GeoTessera enforces a single ``(version, variant)`` per ``GeoTessera``
-   instance and records the choice in the ``tessera_metadata.json``
-   sidecar that every download writes — re-check that file before
-   combining datasets from different runs.
+   Each client reads a single ``(version, variant)``. Downloads record it
+   (see `What gets recorded`_), and GeoTessera refuses to download into a
+   directory holding another dataset or to merge GeoTIFFs of different
+   datasets.
 
 Specifying version + variant
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**CLI** — every data-fetching command (``download``, ``coverage``, ``info``)
-accepts both flags::
+**CLI** — every data-fetching command (``download``, ``webmap``,
+``coverage``, ``info``) accepts both flags::
 
     geotessera download --source tiles \
         --dataset-version v1.1 \
@@ -362,39 +371,46 @@ the ``npy/`` tree directory is derived from the (version, variant) pair
 (``v1``, ``v1.1-cam``, ``v2-2B-L~beta1``).
 
 ``--dataset-variant`` defaults to the version's default variant
-(``vultr`` for 1.0, ``cambridge`` for 1.1, ``2B-L~beta1`` for 2.0), so
-unflagged commands work for any version; pass a variant explicitly to
-override. List every known dataset — including reserved coming-soon
-variants — with ``geotessera info``.
+(``vultr`` for 1.0, ``dclimate`` for 1.1, ``2B-L~beta1`` for 2.0). If
+that variant is not published in the requested format, the first variant
+that is is used with a warning: v1.1 NPY tiles come from ``cambridge``.
+List every dataset and its formats with ``geotessera info``.
 
 **Python API**::
 
-    from geotessera import GeoTessera
+    from geotessera import GeoTessera, GeoTesseraZarr
+    from geotessera.registry import zarr_store_url
 
-    # Default: dataset_version='v1', dataset_variant='vultr' (legacy 1.0)
-    gt = GeoTessera()
+    # Recommended: stream the default v1.1 dclimate dataset
+    gt = GeoTesseraZarr()
+    print(gt.dataset.name)                      # 1.1-dclimate
 
-    # Recommended for new work:
+    # Stream another dataset
+    gt = GeoTesseraZarr(zarr_store_url('v1.1', 'cambridge'))
+
+    # NPY tiles (deprecated); v1.1 tiles exist only for cambridge
     gt = GeoTessera(dataset_version='v1.1', dataset_variant='cambridge')
-
-    # Either of these is also accepted:
-    gt = GeoTessera(dataset_version='1.1', dataset_variant='cambridge')
-
-    # Inspect what's loaded:
     print(gt.dataset_version, gt.dataset_variant)
-    print(sorted(gt.registry.get_available_years()))
 
 What gets recorded
 ~~~~~~~~~~~~~~~~~~
 
-Every NPY download drops a ``tessera_metadata.json`` sidecar in the output
-directory with the resolved ``(version, variant)``, the source URL prefix the
-tiles came from, generation time, and tile count. Every exported GeoTIFF
-is stamped with ``TESSERA_DATASET_VERSION``, ``TESSERA_DATASET_VERSION_PATH``,
-and ``TESSERA_DATASET_VARIANT`` metadata tags. Use these as the source of
-truth for which run produced a given file — local directory names alone
-won't tell you (NPY tiles always land under ``global_0.1_degree_representation/``
-regardless of variant, by design).
+Every download writes a ``tessera_metadata.json`` file in its output
+directory naming the dataset version and variant, and every exported
+GeoTIFF carries ``TESSERA_DATASET_VERSION``,
+``TESSERA_DATASET_VERSION_PATH`` and ``TESSERA_DATASET_VARIANT`` tags.
+Streamed GeoTIFFs also record the store in ``TESSERA_SOURCE``.
+
+GeoTessera reads these records to keep datasets apart:
+
+* A download into a directory whose ``tessera_metadata.json`` names
+  another dataset fails.
+* Merging GeoTIFFs whose tags name different datasets fails, including
+  RGB mosaics and web maps.
+
+A directory without ``tessera_metadata.json``, a GeoTIFF without dataset
+tags, and a ``--store-url`` store that is not a published dataset are not
+checked.
 
 Coverage compositing
 ~~~~~~~~~~~~~~~~~~~~
@@ -433,12 +449,17 @@ Data Organization
     │       ├── landmasks.parquet
     │       └── grid_0.15_52.05.tiff
     └── zarr/                                        # Cloud-native zarr stores
-        ├── v1/                                      # 60 UTM zone groups + RGB pyramid
-        └── v2-2B-L~beta1/                           # v2 beta, with embeddings_d4/d16
+        ├── v1/                                      # 1.0 / vultr: 60 UTM zone groups + RGB pyramid
+        ├── v1.1/                                    # 1.1 / cambridge
+        ├── v2-2B-L~beta1/                           # v2 beta, with embeddings_d4/d16
+        └── v2-2B-L~beta2/
+
+The ``1.1`` / ``dclimate`` dataset is an Icechunk repository at
+``s3://tessera-embeddings/v1.1/dclimate.icechunk``, with its tile registry
+under ``s3://tessera-embeddings/v1.1/dclimate.registry/``.
 
 Each ``manifest.parquet`` is scoped to one dataset — the npy/ directory
-name encodes the ``(version, variant)`` pair (a future ``v1.1-dclimate``
-dataset is reserved but not yet published). The client downloads only the
+name encodes the ``(version, variant)`` pair. The client downloads only the
 manifest for its dataset directory and filters by ``dataset_variant`` on
 load. Landmasks are a property of the 0.1° grid, so they stay keyed by
 plain version (``landmasks/v1.1/`` serves every 1.1 variant).
@@ -477,8 +498,8 @@ only when the server copy has actually changed, and the server returns
 
 Embeddings are organized by:
 
-* **Year**: 2017–2025 for ``1.0/vultr`` and ``2.0/2B-L~beta1``;
-  2015–2025 for ``1.1/cambridge``
+* **Year**: 2017–2025 for ``1.0/vultr``, ``1.1/dclimate`` and
+  ``2.0/2B-L~beta1``; 2015–2025 for ``1.1/cambridge``
 * **Location**: Global 0.1-degree grid system (same grid across all versions)
 * **Format**: NumPy arrays with shape (height, width, 128) after dequantisation
 

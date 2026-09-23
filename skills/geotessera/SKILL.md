@@ -17,7 +17,10 @@ Requires Python 3.12 or later: `pip install geotessera`.
 
 - Use `GeoTesseraZarr` (the zarr interface), not the tile-download
   `GeoTessera` class, unless the user explicitly needs offline NPY or
-  GeoTIFF tile files.
+  GeoTIFF tile files. NPY tiles are deprecated and will be removed.
+- Never mix embeddings of different dataset versions or variants: train
+  and predict on the same one. v1.1 has two separate runs, `dclimate`
+  (the default) and `cambridge`, whose embeddings cannot be interchanged.
 - Never reproject embeddings before analysis. Embeddings return on their
   native UTM grid; classify or cluster on that grid, and reproject only
   the final result (predictions, renders).
@@ -39,7 +42,7 @@ Requires Python 3.12 or later: `pip install geotessera`.
 ```python
 from geotessera import GeoTesseraZarr
 
-gt = GeoTesseraZarr()                    # default v1 store
+gt = GeoTesseraZarr()                    # default v1.1 dClimate Icechunk store
 gt.years                                 # [2017, ..., 2025]
 
 vec, status = gt.probe(lon, lat, year)   # status: valid|water|nodata|outside
@@ -61,8 +64,14 @@ dequantise blockwise as `values * scales`.
 ```python
 from geotessera.registry import zarr_store_url
 
-gt = GeoTesseraZarr(zarr_store_url("v2"))   # "v1", "v2", or an explicit store URL
+gt = GeoTesseraZarr(zarr_store_url("v2"))   # "v1", "v1.1", "v2", or an explicit store URL
+gt = GeoTesseraZarr(zarr_store_url("v1.1", "cambridge"))
+gt.dataset.name                             # "1.1-cambridge"
 ```
+
+`zarr_store_url` takes a version and optional variant; `geotessera info`
+lists them. `gt.dataset` is None for a store that is not a published
+dataset.
 
 v2 stores publish matryoshka prefixes of each embedding. Passing
 `depth=16` (or `depth=4`) to `sample_points`, `read_region`,
@@ -90,11 +99,12 @@ them, and do not add tqdm or other progress wrappers around reads.
 ## Caching and retries
 
 HTTP retries with exponential backoff are built in; do not add a retry
-layer. Pass `cache_dir` to cache reads locally — store metadata
-persists across runs, chunk data for the session:
+layer. Pass `cache_dir` to cache reads from a Zarr store locally — store
+metadata persists across runs, chunk data for the session. Icechunk
+stores, including the default, ignore it:
 
 ```python
-gt = GeoTesseraZarr(cache_dir="tessera-cache")
+gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")
 ```
 
 The cache is keyed per store under `cache_dir`; never share one

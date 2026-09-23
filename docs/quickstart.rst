@@ -6,17 +6,20 @@ The default ``download`` command exports regions from Zarr. See
 :doc:`cli_reference` for Zarr exports and direct web maps, or
 :doc:`zarr_quickstart` for the Python streaming API.
 
+.. warning::
+
+   NPY tiles are deprecated and will be removed. Prefer
+   :doc:`zarr_quickstart` for new work.
+
 .. tip::
 
-   **Pick your Tessera version first.** Several model versions are
-   published on the Source Cooperative repository: the frozen ``1.0``
-   default, the newer ``1.1``, and experimental ``2.0`` betas. List
-   every available dataset (and each version's default variant)
-   with ``geotessera info``.
-   Add ``--dataset-version v1.1 --dataset-variant cambridge`` to every
-   command in this guide if that's the line you want. Never mix versions or
-   variants within the same downstream task — they are independently learned
-   feature spaces. See the main :ref:`dataset-versions` section for details.
+   **Pick your dataset first.** The default version is ``1.1``, whose
+   tiles exist only for the ``cambridge`` variant. Commands in this guide
+   use it with a warning; add ``--dataset-variant cambridge`` to select it
+   explicitly, or ``--dataset-version`` for another version. List every
+   dataset and its formats with ``geotessera info``. Never mix versions or
+   variants within the same downstream task: their embeddings cannot be
+   interchanged. See :ref:`dataset-versions` for details.
 
 Installation
 ------------
@@ -36,7 +39,7 @@ Check which years and tiles are available for your region.
 
 Generate coverage visualizations (PNG map, JSON data, and interactive HTML globe)::
 
-    geotessera coverage --output global_coverage.png
+    geotessera coverage --dataset-variant cambridge --output global_coverage.png
     # Creates three files:
     # 1. global_coverage.png - Static world map with tiles
     # 2. coverage.json - JSON data with global coverage information
@@ -53,23 +56,23 @@ the map.
 
 For a specific region (recommended)::
 
-    geotessera coverage --region-file study_area.geojson
+    geotessera coverage --dataset-variant cambridge --region-file study_area.geojson
     # Next step: geotessera download --source tiles --region-file study_area.geojson --output tiles/
     
     # You can also use remote URLs directly:
-    geotessera coverage --region-file https://example.com/region.geojson
+    geotessera coverage --dataset-variant cambridge --region-file https://example.com/region.geojson
 
     # Or check coverage for a specific country (with precise boundary outline):
-    geotessera coverage --country "United Kingdom"
+    geotessera coverage --dataset-variant cambridge --country "United Kingdom"
     # Next step: geotessera download --source tiles --country "United Kingdom" --output tiles/
 
 For a specific year::
 
-    geotessera coverage --year 2024 --output coverage_2024.png
+    geotessera coverage --dataset-variant cambridge --year 2024 --output coverage_2024.png
 
 You can customize the visualization::
 
-    geotessera coverage \
+    geotessera coverage --dataset-variant cambridge \
         --region-file area.geojson \
         --tile-alpha 0.3
 
@@ -334,10 +337,10 @@ Coverage Maps
 Create coverage maps using the coverage command to visualize data availability::
 
     # Generate coverage map for your downloaded tiles
-    geotessera coverage --output my_coverage.png
+    geotessera coverage --dataset-variant cambridge --output my_coverage.png
     
     # Or generate coverage for a specific region
-    geotessera coverage --region-file area.geojson --output area_coverage.png
+    geotessera coverage --dataset-variant cambridge --region-file area.geojson --output area_coverage.png
 
 Step 5: Advanced Workflows
 ---------------------------

@@ -7,6 +7,15 @@ visualisation built on ``GeoTesseraZarr`` — see the
 `geotessera-examples <https://github.com/ucam-eo/geotessera-examples>`_
 repository and the :doc:`zarr_quickstart`.
 
+.. warning::
+
+   NPY tiles are deprecated and will be removed. The default version,
+   ``1.1``, has tiles only for the ``cambridge`` variant, so
+   ``GeoTessera()`` and ``--source tiles`` use it with a warning. Pass
+   ``dataset_variant="cambridge"`` or ``--dataset-variant cambridge`` to
+   select it explicitly. ``coverage`` without a variant maps the default
+   ``dclimate`` dataset instead.
+
 Tutorial 1: Basic Data Analysis
 -------------------------------
 

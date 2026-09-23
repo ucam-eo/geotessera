@@ -43,6 +43,8 @@ dependencies = [
     "aiohttp",
     "zarr-cm>=0.4.1",
     "contextily",
+    "icechunk>=2.2",
+    "numcodecs[pcodec]>=0.16",
 ]
 
 [project.optional-dependencies]

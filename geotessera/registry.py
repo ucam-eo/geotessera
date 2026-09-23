@@ -7,6 +7,7 @@ Also includes utilities for block-based registry management, organizing global g
 data into 5x5 degree blocks for efficient data access.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Dict, Iterator, Callable
 import os
@@ -35,57 +36,156 @@ except ImportError:
 # Constants for block-based registry management
 BLOCK_SIZE = 5  # 5x5 degree blocks
 
-# Default dataset variant. The bare ``global_0.1_degree_representation``
-# subdirectory corresponds to this variant; named variants get a ``.<name>``
-# suffix.
+# Fallback variant for versions missing from DATASETS. The bare
+# ``global_0.1_degree_representation`` subdirectory corresponds to this
+# variant; named variants get a ``.<name>`` suffix.
 DEFAULT_VARIANT = "vultr"
 
-# Known (version, variant) datasets and their directory names in the npy/
-# tree, one row per pair: (normalised version, variant, npy/ directory).
-# A ``None`` directory reserves a variant that is not yet published
-# ("coming soon"). The v1 series predates the variant-suffix scheme, so
-# every 1.0 variant shares the bare ``v1/`` directory; later versions get
-# one directory per variant, named ``{version_path}-{suffix}``.
-KNOWN_DATASETS = (
-    ("1.0", "vultr", "v1"),
-    ("1.1", "cambridge", "v1.1-cam"),
-    ("1.1", "dclimate", None),  # complete global v1.1 run — coming soon
-    ("2.0", "2B-L~beta1", "v2-2B-L~beta1"),
-    ("2.0", "2B-L~beta2", "v2-2B-L~beta2"),
+# Formats a dataset can be published in.
+FORMATS = ("npy", "zarr", "icechunk")
+
+# Formats read by streaming, most preferred first.
+STREAM_FORMATS = ("zarr", "icechunk")
+
+
+@dataclass(frozen=True)
+class Dataset:
+    """One inference run of a TESSERA model and where it is published.
+
+    Each variant is a separate run. Embeddings from different variants
+    do not interoperate, even within one version. ``npy`` and ``zarr``
+    are directories in the ``npy/`` and ``zarr/`` trees of
+    :data:`TESSERA_MIRROR_URL`; ``icechunk`` is a repository URL and
+    ``tile_registry`` the Parquet tile registry beside it. NPY tiles are
+    deprecated in favour of Zarr and Icechunk.
+    """
+
+    version: str
+    variant: str
+    description: str = ""
+    npy: Optional[str] = None
+    zarr: Optional[str] = None
+    icechunk: Optional[str] = None
+    tile_registry: Optional[str] = None
+
+    @property
+    def name(self) -> str:
+        """``"1.1-cambridge"``."""
+        return f"{self.version}-{self.variant}"
+
+    def location(self, fmt: str) -> Optional[str]:
+        """Where the dataset is published in *fmt*, or None."""
+        return getattr(self, fmt)
+
+    def formats(self) -> List[str]:
+        """Formats the dataset is published in."""
+        return [f for f in FORMATS if self.location(f)]
+
+
+# Published datasets. The first row of a version is its default variant;
+# the first row of a version with a format is the default for that format.
+DATASETS: Tuple[Dataset, ...] = (
+    Dataset("1.0", "vultr", "Legacy model; frozen", npy="v1", zarr="v1"),
+    Dataset(
+        "1.1",
+        "dclimate",
+        "Complete global run",
+        icechunk="s3://tessera-embeddings/v1.1/dclimate.icechunk",
+        tile_registry="s3://tessera-embeddings/v1.1/dclimate.registry/parts",
+    ),
+    Dataset("1.1", "cambridge", "Cambridge test run", npy="v1.1-cam", zarr="v1.1"),
+    Dataset(
+        "2.0", "2B-L~beta1", "v2 beta", npy="v2-2B-L~beta1", zarr="v2-2B-L~beta1"
+    ),
+    Dataset(
+        "2.0", "2B-L~beta2", "v2 beta", npy="v2-2B-L~beta2", zarr="v2-2B-L~beta2"
+    ),
 )
 
-# Each version's default variant is the first *published* (non-None)
-# variant listed for it in KNOWN_DATASETS. Reorder the rows to change a
-# default when a newer variant (e.g. the v1.1 ``dclimate`` run) becomes
-# the preferred one.
-VERSION_DEFAULT_VARIANTS: Dict[str, str] = {}
-for _version, _variant, _dir in KNOWN_DATASETS:
-    if _dir is not None:
-        VERSION_DEFAULT_VARIANTS.setdefault(_version, _variant)
+# Default dataset version when none is given.
+DEFAULT_VERSION = "v1.1"
 
 
-def default_variant(version_norm: str) -> str:
-    """Default variant for *version_norm* (e.g. ``"1.1"`` → ``"cambridge"``)."""
-    return VERSION_DEFAULT_VARIANTS.get(version_norm, DEFAULT_VARIANT)
+def find_dataset(version_norm: str, variant: str) -> Optional[Dataset]:
+    """The dataset for *version_norm* and *variant*, or None."""
+    for ds in DATASETS:
+        if ds.version == version_norm and ds.variant == variant:
+            return ds
+    return None
 
 
-def known_variants(version_norm: str) -> List[Tuple[str, Optional[str]]]:
-    """Known variants for *version_norm* as ``(variant, npy_directory)`` pairs.
+def default_variant(version_norm: str, fmt: Optional[str] = None) -> str:
+    """Default variant of *version_norm*, optionally among those in *fmt*.
 
-    A ``None`` directory marks a variant that is reserved but not yet
-    published ("coming soon").
+    *fmt* is a format from :data:`FORMATS` or ``"stream"`` for any of
+    :data:`STREAM_FORMATS`. ``default_variant("1.1")`` is ``"dclimate"``;
+    ``default_variant("1.1", "npy")`` is ``"cambridge"``.
     """
-    return [(var, d) for v, var, d in KNOWN_DATASETS if v == version_norm]
+    variants = [ds for ds in DATASETS if ds.version == version_norm]
+    if not variants:
+        return DEFAULT_VARIANT
+    fmts = STREAM_FORMATS if fmt == "stream" else (fmt,) if fmt else ()
+    for ds in variants:
+        if not fmts or any(ds.location(f) for f in fmts):
+            return ds.variant
+    return variants[0].variant
 
 
-def published_datasets() -> List[Tuple[str, str, str]]:
-    """Published ``(version_norm, variant, npy_directory)`` triples.
+def variant_note(version_norm: str, fmt: str) -> Optional[str]:
+    """Why *fmt* defaults to another variant than *version_norm*'s, or None."""
+    version_default = default_variant(version_norm)
+    fmt_default = default_variant(version_norm, fmt)
+    fmts = STREAM_FORMATS if fmt == "stream" else (fmt,)
+    ds = find_dataset(version_norm, fmt_default)
+    if (
+        fmt_default == version_default
+        or ds is None
+        or not any(ds.location(f) for f in fmts)
+    ):
+        return None
+    label = "Zarr or Icechunk" if fmt == "stream" else fmt.upper()
+    return (
+        f"v{version_norm} {label} is published only for variant "
+        f"{fmt_default!r}, whose embeddings do not interoperate with the "
+        f"default {version_default!r}. Select {fmt_default!r} explicitly "
+        f"to silence this warning."
+    )
 
-    Skips reserved coming-soon variants. Multi-dataset operations (e.g.
-    ``coverage --by-source --dataset-version=all``) enumerate manifests
-    from this list rather than issuing a bucket listing call.
+
+def icechunk_dataset(version: str, variant: Optional[str] = None):
+    """``(repository URL, tile registry URL)``, or None for other datasets.
+
+    *variant* defaults to the version's streamed default.
     """
-    return [(v, var, d) for v, var, d in KNOWN_DATASETS if d is not None]
+    norm = _parse_dataset_version(version)[1]
+    ds = find_dataset(norm, variant or default_variant(norm, "stream"))
+    if ds is None or ds.icechunk is None:
+        return None
+    return ds.icechunk, ds.tile_registry
+
+
+def known_variants(version_norm: str) -> List[str]:
+    """Variants of *version_norm*, default first."""
+    return [ds.variant for ds in DATASETS if ds.version == version_norm]
+
+
+def published_datasets(fmt: str = "npy") -> List[Tuple[str, str, str]]:
+    """``(version_norm, variant, location)`` of every dataset in *fmt*."""
+    return [
+        (ds.version, ds.variant, ds.location(fmt))
+        for ds in DATASETS
+        if ds.location(fmt)
+    ]
+
+
+def _unavailable(ds: Dataset, fmt: str) -> ValueError:
+    others = [v for n, v, _ in published_datasets(fmt) if n == ds.version]
+    return ValueError(
+        f"Dataset {ds.name} is not published as {fmt.upper()}; it is "
+        f"available as {', '.join(ds.formats()) or 'nothing'}. "
+        f"{fmt.upper()} variants of v{ds.version}: {', '.join(others) or 'none'}. "
+        f"Run 'geotessera info' to list datasets."
+    )
 
 
 def _parse_dataset_version(spec: str) -> Tuple[str, str]:
@@ -136,25 +236,16 @@ def dataset_path(version_norm: str, variant: str) -> str:
     ``("2.0", "2B-L~beta1")`` → ``"v2-2B-L~beta1"``.
 
     Raises:
-        ValueError: If the variant is reserved but not yet published
-            (e.g. ``("1.1", "dclimate")``).
+        ValueError: If the dataset has no NPY tiles (e.g.
+            ``("1.1", "dclimate")``).
     """
     if version_norm == "1.0":
         return "v1"
-    for v, var, dirname in KNOWN_DATASETS:
-        if v == version_norm and var == variant:
-            if dirname is None:
-                published = [
-                    var2 for var2, d in known_variants(version_norm) if d is not None
-                ]
-                raise ValueError(
-                    f"Dataset variant {variant!r} for version {version_norm} "
-                    f"is coming soon but not yet published. Currently "
-                    f"available variant(s) for {version_norm}: "
-                    f"{', '.join(published) or 'none'}. Run 'geotessera info' "
-                    f"to list all datasets."
-                )
-            return dirname
+    ds = find_dataset(version_norm, variant)
+    if ds is not None:
+        if ds.npy is None:
+            raise _unavailable(ds, "npy")
+        return ds.npy
     # Unknown pair: assume the generic ``{version_path}-{variant}`` naming
     # so freshly published datasets work without a code change.
     return f"{_version_path_from_norm(version_norm)}-{variant}"
@@ -173,14 +264,14 @@ def dataset_from_path(dirname: str) -> Optional[Tuple[str, str]]:
     as the variant name. Returns ``None`` if *dirname* does not look like
     a dataset directory.
     """
-    for v, var, d in KNOWN_DATASETS:
+    for v, var, d in published_datasets("npy"):
         if d == dirname:
             return v, var
     m = _DATASET_DIR_RE.match(dirname)
     if not m:
         return None
     version_norm = f"{m.group(1)}.{m.group(2) or '0'}"
-    variant = m.group(3) or default_variant(version_norm)
+    variant = m.group(3) or default_variant(version_norm, "npy")
     return version_norm, variant
 
 
@@ -208,16 +299,23 @@ def write_tessera_metadata(
         "dataset_version": version_norm,
         "dataset_version_path": version_path,
         "dataset_variant": dataset_variant,
-        # Directory in the npy/ tree this (version, variant) pair was
-        # downloaded from (e.g. "v1", "v1.1-cam", "v2-2B-L~beta1").
-        "dataset_path": dataset_path(version_norm, dataset_variant),
-        "embeddings_subdir": EMBEDDINGS_DIR_NAME,
-        # Variant-aware subdirectory name, kept for downstream readers. The
-        # repository layout itself has no variant level.
-        "s3_embeddings_subdir": _variant_subdir(dataset_variant),
-        "source_url_prefix": f"{TESSERA_NPY_MIRROR_URL}/{dataset_path(version_norm, dataset_variant)}/",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+    ds = find_dataset(version_norm, dataset_variant)
+    if ds is None or ds.npy is not None:
+        npy_dir = dataset_path(version_norm, dataset_variant)
+        payload.update(
+            {
+                # Directory in the npy/ tree this (version, variant) pair was
+                # downloaded from (e.g. "v1", "v1.1-cam", "v2-2B-L~beta1").
+                "dataset_path": npy_dir,
+                "embeddings_subdir": EMBEDDINGS_DIR_NAME,
+                # Variant-aware subdirectory name, kept for downstream
+                # readers. The repository layout has no variant level.
+                "s3_embeddings_subdir": _variant_subdir(dataset_variant),
+                "source_url_prefix": f"{TESSERA_NPY_MIRROR_URL}/{npy_dir}/",
+            }
+        )
     if extra:
         payload.update(extra)
 
@@ -225,6 +323,62 @@ def write_tessera_metadata(
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return out
+
+
+def recorded_dataset(directory: Union[str, Path]) -> Optional[Tuple[str, str]]:
+    """``(version_norm, variant)`` recorded in *directory*'s sidecar, or None."""
+    import json
+
+    try:
+        data = json.loads((Path(directory) / TESSERA_METADATA_FILENAME).read_text())
+    except (OSError, ValueError):
+        return None
+    version = data.get("dataset_version_path") or data.get("dataset_version")
+    variant = data.get("dataset_variant")
+    if not (version and variant):
+        return None
+    return _parse_dataset_version(str(version))[1], str(variant)
+
+
+def check_dataset_dir(directory: Union[str, Path], version: str, variant: str) -> None:
+    """Raise ``ValueError`` if *directory* holds another dataset's embeddings.
+
+    The ``tessera_metadata.json`` sidecar names the dataset that populated
+    *directory*. A directory without one is accepted.
+    """
+    recorded = recorded_dataset(directory)
+    requested = (_parse_dataset_version(version)[1], variant)
+    if recorded is not None and recorded != requested:
+        raise ValueError(
+            f"{directory} holds v{recorded[0]} {recorded[1]} embeddings, but "
+            f"v{requested[0]} {requested[1]} was requested. Embeddings of "
+            f"different datasets cannot be interchanged; use a separate "
+            f"directory."
+        )
+
+
+def dataset_tags(version: str, variant: str) -> Dict[str, str]:
+    """GeoTIFF tags identifying the dataset *version* and *variant*."""
+    version_path, version_norm = _parse_dataset_version(version)
+    return {
+        "TESSERA_DATASET_VERSION": version_norm,
+        "TESSERA_DATASET_VERSION_PATH": version_path,
+        "TESSERA_DATASET_VARIANT": variant,
+    }
+
+
+def dataset_from_tags(tags: Dict[str, str]) -> Optional[Tuple[str, str]]:
+    """``(version_norm, variant)`` recorded in GeoTIFF *tags*, or None.
+
+    Reads the tags of :func:`dataset_tags`, or else resolves a
+    ``TESSERA_SOURCE`` store URL through :func:`dataset_for_location`.
+    """
+    version = tags.get("TESSERA_DATASET_VERSION")
+    variant = tags.get("TESSERA_DATASET_VARIANT")
+    if version and variant:
+        return _parse_dataset_version(version)[1], variant
+    ds = dataset_for_location(tags.get("TESSERA_SOURCE"))
+    return (ds.version, ds.variant) if ds else None
 
 
 # ==============================================================================
@@ -455,13 +609,13 @@ def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
 
 # All Tessera data is served over plain HTTPS from the public Source
 # Cooperative repository. The npy/ tree has one directory per dataset —
-# a (version, variant) pair (see KNOWN_DATASETS / dataset_path); the
-# landmasks/ and zarr/ trees are keyed by plain version:
+# a (version, variant) pair (see DATASETS / dataset_path); the
+# landmasks/ tree is keyed by plain version and the zarr/ tree by dataset:
 #   npy/{dataset_path}/{year}/grid_.../grid_....npy    embeddings and scales
 #   npy/{dataset_path}/manifest.parquet                per-dataset manifest
 #   landmasks/{version_path}/grid_....tiff             landmask TIFFs
 #   landmasks/{version_path}/landmasks.parquet         landmask registry
-#   zarr/{version_path}/                               zarr store root
+#   zarr/{Dataset.zarr}/                               zarr store root
 # Each dataset directory holds a complete embedding tree with no variant
 # subdirectory. New datasets appear as they are uploaded. The repository is
 # also reachable as an S3-compatible endpoint at TESSERA_MIRROR_ENDPOINT
@@ -501,21 +655,42 @@ def landmask_url(version_path: str, filename: str) -> str:
     return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/{filename}"
 
 
-def zarr_store_url(version: str) -> str:
-    """Default URL of the zarr store for *version*.
+def zarr_store_url(version: str = DEFAULT_VERSION, variant: Optional[str] = None) -> str:
+    """URL of the streamed store for *version* and *variant*.
 
-    Accepts a version name (``"v1"``, ``"v2"``), resolved through the
-    version's default variant, or an explicit store path such as
-    ``"v2-2B-L~beta1"``.
+    Accepts a version name (``"v1"``, ``"v1.1"``, ``"v2"``) or an explicit
+    store path such as ``"v2-2B-L~beta1"``. *variant* defaults to the
+    version's streamed default. A dataset published as both Zarr and
+    Icechunk resolves to Zarr.
+
+    Raises:
+        ValueError: If the dataset is published in neither format.
     """
-    version_path, norm = _parse_dataset_version(version)
-    if norm in VERSION_DEFAULT_VARIANTS:
-        variant = default_variant(norm)
-        if norm == "1.1":
-            version = version_path
-        else:
-            version = dataset_path(norm, variant)
-    return f"{TESSERA_MIRROR_URL}/zarr/{version}"
+    _, norm = _parse_dataset_version(version)
+    if not known_variants(norm):
+        return f"{TESSERA_MIRROR_URL}/zarr/{version}"
+    variant = variant or default_variant(norm, "stream")
+    ds = find_dataset(norm, variant)
+    if ds is None:
+        return f"{TESSERA_MIRROR_URL}/zarr/{dataset_path(norm, variant)}"
+    if ds.zarr is not None:
+        return f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}"
+    if ds.icechunk is not None:
+        return ds.icechunk
+    raise _unavailable(ds, "zarr")
+
+
+def dataset_for_location(location) -> Optional[Dataset]:
+    """The published dataset whose Zarr or Icechunk store is *location*."""
+    if not isinstance(location, (str, os.PathLike)):
+        return None
+    location = os.fsdecode(location).rstrip("/")
+    for ds in DATASETS:
+        if ds.zarr and location == f"{TESSERA_MIRROR_URL}/zarr/{ds.zarr}":
+            return ds
+        if ds.icechunk and location == ds.icechunk:
+            return ds
+    return None
 
 
 def format_bytes(num_bytes: float) -> str:
@@ -842,12 +1017,10 @@ class Registry:
             version: Dataset version. Accepts ``"v1"``/``"1.0"``,
                 ``"v1.1"``/``"1.1"``, ``"v2"``/``"2.0"``, etc.
             variant: Dataset variant. Defaults to the version's default
-                variant (``"vultr"`` for v1, ``"cambridge"`` for v1.1,
-                ``"2B-L~beta1"`` for v2 — see ``KNOWN_DATASETS``). The
-                (version, variant) pair selects the npy/ tree directory
-                the manifest and tiles are fetched from. Reserved
-                coming-soon variants (e.g. the v1.1 ``dclimate`` run)
-                raise ``ValueError`` until published.
+                NPY variant (``"vultr"`` for v1, ``"cambridge"`` for v1.1,
+                ``"2B-L~beta1"`` for v2 — see ``DATASETS``), with a
+                warning when that differs from the version's default.
+                A variant without NPY tiles raises ``ValueError``.
             cache_dir: Optional directory for caching Parquet registries only (not data files)
             embeddings_dir: Directory for storing embedding tiles (defaults to current directory).
                 Expected structure: global_0.1_degree_representation[.<variant>]/{year}/
@@ -870,10 +1043,12 @@ class Registry:
         """
         # Resolve version into a path component and a normalised numeric form.
         self._version_path, self._version_norm = _parse_dataset_version(version)
-        self._variant = variant or default_variant(self._version_norm)
+        self.logger = logger or logging.getLogger(__name__)
+        self._variant = variant or default_variant(self._version_norm, "npy")
+        if variant is None and (note := variant_note(self._version_norm, "npy")):
+            self.logger.warning(note)
         # npy/ tree directory for this (version, variant) dataset, e.g.
-        # "v1", "v1.1-cam", "v2-2B-L~beta1". Raises for variants that are
-        # reserved but not yet published (e.g. the v1.1 dclimate run).
+        # "v1", "v1.1-cam", "v2-2B-L~beta1".
         self._dataset_path = dataset_path(self._version_norm, self._variant)
         self._embeddings_subdir = _variant_subdir(self._variant)
         # Preserve the original kwarg for callers that still read .version.
@@ -886,7 +1061,6 @@ class Registry:
         # parquet (cache file or user-supplied). Useful for tools that need
         # the raw unfiltered manifest (e.g. multi-source coverage rendering).
         self.manifest_path: Optional[Path] = None
-        self.logger = logger or logging.getLogger(__name__)
 
         # Set up cache directory for Parquet registries only
         if cache_dir:
@@ -1413,21 +1587,6 @@ class Registry:
             for year, lon_i, lat_i in unique_idx
         ]
 
-    def _sidecar_dataset_path(self) -> Optional[str]:
-        """Dataset directory recorded in the embeddings_dir sidecar, if any."""
-        import json
-
-        sidecar = self._embeddings_dir / TESSERA_METADATA_FILENAME
-        try:
-            data = json.loads(sidecar.read_text())
-            version = data.get("dataset_version_path") or data.get("dataset_version")
-            variant = data.get("dataset_variant")
-            if not (version and variant):
-                return None
-            return dataset_path(_parse_dataset_version(str(version))[1], str(variant))
-        except (OSError, ValueError):
-            return None
-
     def validate_embeddings_dir(self) -> None:
         """Raise ``ValueError`` if embeddings_dir holds a different dataset.
 
@@ -1437,14 +1596,7 @@ class Registry:
         """
         if self._embeddings_dir_validated:
             return
-        recorded = self._sidecar_dataset_path()
-        if recorded is not None and recorded != self._dataset_path:
-            raise ValueError(
-                f"{self._embeddings_dir} holds tiles from dataset "
-                f"'{recorded}', but '{self._dataset_path}' was requested. "
-                f"Datasets share one local layout, so mixing them returns "
-                f"wrong embeddings; use a separate embeddings_dir per dataset."
-            )
+        check_dataset_dir(self._embeddings_dir, self._version_path, self._variant)
         self._embeddings_dir_validated = True
 
     def _record_embeddings_dir_dataset(self) -> None:

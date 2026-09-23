@@ -1,13 +1,17 @@
 """Stream published Zarr embeddings into local GIS products."""
 
+import logging
 from pathlib import Path
 
 import numpy as np
 import rasterio
 
 from .inputs import parse_bbox
+from .registry import check_dataset_dir, dataset_tags, write_tessera_metadata
 from .remote import atomic_output
 from .store import _region_window, _time_index, _utm_envelope, _zone_for_lon
+
+log = logging.getLogger(__name__)
 
 
 def region_windows(client, bbox, year):
@@ -21,6 +25,9 @@ def region_windows(client, bbox, year):
         except KeyError:
             continue
         _time_index(ds, year)
+        for group, years in ds.attrs.get("geotessera:years_incomplete", {}).items():
+            if year in years:
+                log.warning("%s has no complete %d; it reads as nodata", group, year)
         zone_bbox = (max(west, zone * 6 - 186), south, min(east, zone * 6 - 180), north)
         try:
             window = _region_window(ds, _utm_envelope(zone_bbox, ds.tessera.crs))
@@ -45,8 +52,11 @@ def export_region(
     """Write one float32 GeoTIFF per intersecting UTM zone, in row strips.
 
     Only selected bands are read. Files carry NaN nodata, the native transform,
-    and source/model provenance. Each file is committed atomically. ``dry_run``
-    returns metadata estimates without reading embedding or scale chunks.
+    and source/model provenance. A published dataset is also recorded in each
+    file's tags and in the directory's ``tessera_metadata.json``, and a
+    directory holding another dataset is refused. Each file is committed
+    atomically. ``dry_run`` returns metadata estimates without reading
+    embedding or scale chunks.
     """
     if strip_rows <= 0:
         raise ValueError("strip_rows must be positive")
@@ -69,6 +79,12 @@ def export_region(
     if dry_run:
         return estimates
     output_dir = Path(output_dir)
+    dataset = client.dataset
+    if dataset is not None:
+        check_dataset_dir(output_dir, dataset.version, dataset.variant)
+        tags = dataset_tags(dataset.version, dataset.variant)
+    else:
+        tags = {}
     output_dir.mkdir(parents=True, exist_ok=True)
     files = []
 
@@ -84,7 +100,7 @@ def export_region(
     completed = 0
     for zone, ds, window in windows:
         rows = rows_for(window)
-        group = client._root[f"utm{zone:02d}"]
+        group = client._zone_arrays(zone)
         ti = _time_index(ds, year)
         path = output_dir / f"tessera_{year}_utm{zone:02d}.tif"
         with atomic_output(path, suffix=".tif") as temporary:
@@ -120,6 +136,7 @@ def export_region(
                     if progress_callback:
                         progress_callback(completed, total, f"Writing UTM zone {zone}")
                 dst.update_tags(
+                    **tags,
                     TESSERA_YEAR=str(year),
                     TESSERA_SOURCE=client.url,
                     TESSERA_MODEL=client.model_version,
@@ -129,4 +146,11 @@ def export_region(
                 for i, band in enumerate(bands, 1):
                     dst.set_band_description(i, f"Tessera_Band_{band}")
         files.append(str(path))
+    if dataset is not None:
+        write_tessera_metadata(
+            output_dir,
+            dataset.version,
+            dataset.variant,
+            extra={"format": "tiff", "year": year, "source": client.url},
+        )
     return files

@@ -13,6 +13,26 @@ from rasterio.warp import calculate_default_transform
 from .remote import atomic_output
 
 
+def _check_one_dataset(paths, sources):
+    """Raise ``ValueError`` if *sources* hold more than one dataset.
+
+    Rasters without dataset tags are not checked.
+    """
+    from .registry import dataset_from_tags
+
+    found = {}
+    for path, src in zip(paths, sources):
+        dataset = dataset_from_tags(src.tags())
+        if dataset is not None:
+            found.setdefault(dataset, path)
+    if len(found) > 1:
+        listed = ", ".join(f"v{v} {var} ({p})" for (v, var), p in found.items())
+        raise ValueError(
+            f"Cannot merge embeddings of different datasets: {listed}. "
+            f"Embeddings of different datasets cannot be interchanged."
+        )
+
+
 def merge_geotiffs(
     paths,
     output_path,
@@ -26,6 +46,7 @@ def merge_geotiffs(
     """Merge valid pixels to disk with virtual warps and bounded working memory.
 
     ``bands`` uses zero-based indices; ``bounds`` is in the target CRS.
+    Inputs tagged with different datasets raise ``ValueError``.
     Uncovered pixels are NaN. The first valid source wins at overlaps,
     including when its value is zero. Native grids are retained when possible.
     """
@@ -40,6 +61,7 @@ def merge_geotiffs(
         first = sources[0]
         if any(src.crs is None for src in sources):
             raise ValueError("Every input raster must have a CRS")
+        _check_one_dataset(paths, sources)
         indexes = None if bands is None else [int(b) + 1 for b in bands]
         if indexes is not None and (
             not indexes

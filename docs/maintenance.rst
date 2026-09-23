@@ -33,18 +33,22 @@ the ``landmasks/`` and ``zarr/`` trees are keyed by plain version::
     │   │   └── ...
     │   └── v2/
     │       └── ...
-    └── zarr/                                    # cloud-native zarr store
-        └── v1/
+    └── zarr/                                    # cloud-native zarr stores
+        ├── v1/                                  # 1.0 / vultr
+        ├── v1.1/                                # 1.1 / cambridge
+        └── v2-2B-L~beta1/
 
 The dataset directory name is the version path plus a ``-<variant>``
 suffix; the v1 series predates this scheme, so every 1.0 variant
 (including the default ``vultr``) collapses into the bare ``v1/``
 directory, and ``cambridge`` abbreviates to ``cam``. The known mapping
-lives in ``KNOWN_DATASETS`` in ``geotessera/registry.py`` — extend that
-table when publishing a new dataset (the reserved ``v1.1-dclimate``
-complete-global run is already listed there as coming soon, and the
-per-version *default* variant is simply the first published row for the
-version, so reordering rows flips the default).
+lives in ``DATASETS`` in ``geotessera/registry.py``, one row per
+``(version, variant)`` with its NPY, Zarr and Icechunk locations. Add a
+row, or a location to an existing row, when publishing. The first row of
+a version is its default variant; the first row with a format is that
+format's default. Downloads identify their dataset by matching the store
+URL against this table, so a store missing from it is read but its
+downloads are not recorded or checked.
 
 Clients fetch ``npy/{dataset}/manifest.parquet`` and
 ``landmasks/{version}/landmasks.parquet`` to discover tiles, then download

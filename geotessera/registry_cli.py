@@ -2590,7 +2590,7 @@ def _discover_scan_units(
                 # A year directly under a bare version dir is the flat
                 # layout; under a suffixed dataset dir the variant is
                 # already bound.
-                var = variant or flat_variant or default_variant(version)
+                var = variant or flat_variant or default_variant(version, "npy")
                 units.append((version, var, int(m.group(1)), sp))
 
     walk(root_prefix, pre_version, pre_variant, 1)
@@ -3381,7 +3381,7 @@ def s3sync_command(args):
 
     version = args.dataset_version or "v1"
     _, norm = _parse_dataset_version(version)
-    variant = args.dataset_variant or default_variant(norm)
+    variant = args.dataset_variant or default_variant(norm, "npy")
     try:
         ddir = dataset_path(norm, variant)
     except ValueError as e:
@@ -3937,7 +3937,7 @@ def _detect_dataset_metadata(
     from .registry import _parse_dataset_version
 
     version = explicit_version or "v1"
-    variant = explicit_variant or default_variant(_parse_dataset_version(version)[1])
+    variant = explicit_variant or default_variant(_parse_dataset_version(version)[1], "npy")
     return version, variant
 
 
@@ -4285,7 +4285,7 @@ def _resolve_source(args, console: "Console"):
     # Remote mirror.
     dataset_version = args.dataset_version or "v1"
     version_path, version_norm = _parse_dataset_version(dataset_version)
-    dataset_variant = args.dataset_variant or default_variant(version_norm)
+    dataset_variant = args.dataset_variant or default_variant(version_norm, "npy")
     storage_options = _storage_options_for(args, "source", base_dir)
 
     # The npy/ tree is keyed by *dataset* — a (version, variant) pair — with

@@ -34,8 +34,9 @@ Test: Info Command (Library Info)
 Test the info command without arguments to see library information.
 We just verify key information is present, ignoring formatting:
 
-  $ geotessera info --dataset-version v1 2>&1 | grep -E 'Available years'
-   Available years: 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025 
+  $ geotessera info --dataset-version v1 2>&1 | grep -E 'Selected|Years' | sed 's/ *$//'
+   Selected:  v1 vultr (NPY)
+   Years:     2017-2025
 
 Test: Download Dry Run for UK Tile
 -----------------------------------

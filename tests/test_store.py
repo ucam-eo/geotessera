@@ -586,7 +586,9 @@ def test_zarr_store_adapters_and_errors(tmp_path: Path):
     assert_check(
         "version names resolve to their store path",
         zarr_store_url("v1").endswith("/zarr/v1")
-        and zarr_store_url("v1.1").endswith("/zarr/v1.1")
+        and zarr_store_url("v1.1") == "s3://tessera-embeddings/v1.1/dclimate.icechunk"
+        and zarr_store_url() == zarr_store_url("v1.1")
+        and zarr_store_url("v1.1", "cambridge").endswith("/zarr/v1.1")
         and zarr_store_url("v2").endswith("/zarr/v2-2B-L~beta1")
         and zarr_store_url("v2-2B-L~beta1").endswith("/zarr/v2-2B-L~beta1"),
     )

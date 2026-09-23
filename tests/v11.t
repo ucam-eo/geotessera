@@ -83,14 +83,18 @@ The numeric form ``1.1`` is equivalent:
 Test: Variant Defaults Are Per Version
 --------------------------------------
 
-Each version has a default variant (the first published variant listed for
-it in ``KNOWN_DATASETS``); unknown versions fall back to ``vultr``:
+Each version has a default variant (its first row in ``DATASETS``) and a
+default per format (its first row published in that format); unknown
+versions fall back to ``vultr``:
 
   $ uv run python -c "
   > from geotessera.registry import default_variant
-  > print(default_variant('1.0'), default_variant('1.1'), default_variant('2.0'), default_variant('9.9'))
+  > for fmt in (None, 'npy', 'stream'):
+  >     print(fmt, *(default_variant(v, fmt) for v in ('1.0', '1.1', '2.0', '9.9')))
   > "
-  vultr cambridge 2B-L~beta1 vultr
+  None vultr dclimate 2B-L~beta1 vultr
+  npy vultr cambridge 2B-L~beta1 vultr
+  stream vultr dclimate 2B-L~beta1 vultr
 
 Test: Dataset Paths Encode (version, variant)
 ---------------------------------------------
@@ -124,11 +128,11 @@ with bare version dirs resolving to the version's default variant:
   v2-2B-L~beta1 -> ('2.0', '2B-L~beta1')
   not-a-dataset -> None
 
-Test: Reserved Variants Raise Until Published
----------------------------------------------
+Test: Variants Without NPY Tiles Raise
+--------------------------------------
 
-The ``dclimate`` variant of v1.1 is reserved but not yet published, so
-selecting it fails with a clear "coming soon" error:
+The ``dclimate`` variant of v1.1 has no NPY tiles, so selecting it for
+tiles fails and names the variants that have them:
 
   $ uv run python -c "
   > from geotessera.registry import dataset_path
@@ -137,9 +141,10 @@ selecting it fails with a clear "coming soon" error:
   > except ValueError as e:
   >     print('ValueError:', e)
   > "
-  ValueError: Dataset variant 'dclimate' for version 1.1 is coming soon but not yet published. Currently available variant(s) for 1.1: cambridge. Run 'geotessera info' to list all datasets.
+  ValueError: Dataset 1.1-dclimate is not published as NPY; it is available as icechunk. NPY variants of v1.1: cambridge. Run 'geotessera info' to list datasets.
 
-Omitting ``dataset_variant`` for v1.1 selects cambridge:
+Omitting ``dataset_variant`` for v1.1 tiles selects cambridge with a
+warning, since the version default ``dclimate`` has no NPY tiles:
 
   $ uv run python -c "
   > from geotessera import GeoTessera
@@ -150,6 +155,7 @@ Omitting ``dataset_variant`` for v1.1 selects cambridge:
   >     print(gt.dataset_variant)
   >     print(min(gt.registry.get_available_years()), max(gt.registry.get_available_years()))
   > "
+  v1.1 NPY is published only for variant 'cambridge', whose embeddings do not interoperate with the default 'dclimate'. Select 'cambridge' explicitly to silence this warning.
   cambridge
   2015 2025
 
@@ -295,12 +301,12 @@ mismatch; the same dataset (or an empty directory) is accepted:
   >         print('mismatch: NOT refused')
   >     except ValueError as e:
   >         print('mismatch: refused')
-  >         print(str(e).split('.')[0].replace(d, 'DIR'))
+  >         print(str(e).replace(d, 'DIR'))
   > "
   empty dir: accepted
   same dataset: accepted
   mismatch: refused
-  DIR holds tiles from dataset 'v1', but 'v2-2B-L~beta1' was requested
+  DIR holds v1.0 vultr embeddings, but v2.0 2B-L~beta1 was requested. Embeddings of different datasets cannot be interchanged; use a separate directory.
 
 The Python API download path now records the sidecar too (previously only
 the CLI download flow wrote it, so API-populated directories carried no

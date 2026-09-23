@@ -4,26 +4,21 @@ from pathlib import Path
 import tempfile
 import json
 import hashlib
+import logging
 
 from .inputs import resolve_region
 
 
-def open_stream(version="v1", variant=None, store_url=None, cache_dir=None):
-    from .registry import (
-        zarr_store_url,
-        _parse_dataset_version,
-        default_variant,
-        dataset_path,
-        TESSERA_MIRROR_URL,
-    )
+def open_stream(version="v1.1", variant=None, store_url=None, cache_dir=None):
+    from .registry import _parse_dataset_version, variant_note, zarr_store_url
     from .store import GeoTesseraZarr
 
     if store_url is None:
-        _, norm = _parse_dataset_version(version)
-        if variant is None or variant == default_variant(norm):
-            store_url = zarr_store_url(version)
-        else:
-            store_url = f"{TESSERA_MIRROR_URL}/zarr/{dataset_path(norm, variant)}"
+        if variant is None and (
+            note := variant_note(_parse_dataset_version(version)[1], "stream")
+        ):
+            logging.getLogger(__name__).warning(note)
+        store_url = zarr_store_url(version, variant)
     return GeoTesseraZarr(store_url, cache_dir=cache_dir)
 
 
@@ -35,7 +30,7 @@ def stream_download(
     region_file=None,
     country=None,
     year=2024,
-    version="v1",
+    version="v1.1",
     variant=None,
     store_url=None,
     cache_dir=None,
@@ -68,7 +63,7 @@ def stream_rgb(
     region_file=None,
     country=None,
     year=2024,
-    version="v1",
+    version="v1.1",
     variant=None,
     store_url=None,
     cache_dir=None,
@@ -126,6 +121,8 @@ def cached_stream_rgb(output, *, force=False, **kwargs):
     Source contents are assumed immutable; force refreshes an updated store.
     Cache location is deliberately excluded from the rendering identity.
     """
+    from .registry import zarr_store_url
+
     output = Path(output)
     bounds, _ = resolve_region(
         **{key: kwargs.get(key) for key in ("bbox", "tile", "region_file", "country")}
@@ -136,7 +133,11 @@ def cached_stream_rgb(output, *, force=False, **kwargs):
         if key not in ("bbox", "tile", "region_file", "country", "cache_dir")
     }
     request["bounds"] = list(map(float, bounds))
-    request["schema"] = 1
+    # Key on the resolved store, since defaults change between releases.
+    request["store_url"] = kwargs.get("store_url") or zarr_store_url(
+        kwargs.get("version", "v1.1"), kwargs.get("variant")
+    )
+    request["schema"] = 2
     # Persist a digest so authenticated store URLs are not written to disk.
     digest = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
     marker = output.with_suffix(".json")

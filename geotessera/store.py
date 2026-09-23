@@ -2,7 +2,10 @@
 GeoTesseraZarr — read embeddings from a Tessera zarr store.
 
 The store is UTM-native: embeddings live under one ``utm{NN}`` group per UTM
-zone, on the grid they were produced on.  Nothing here reprojects pixels, and
+zone, on the grid they were produced on.  An Icechunk repository
+(``*.icechunk``), such as the default dClimate v1.1 store, is read through
+:class:`geotessera.icechunk.IcechunkStore`, which presents its hemisphere
+groups in the same layout.  Nothing here reprojects pixels, and
 the two layers each speak one coordinate system:
 
 ``GeoTesseraZarr``
@@ -22,7 +25,7 @@ Usage::
 
     from geotessera.store import GeoTesseraZarr
 
-    gt = GeoTesseraZarr()  # default public store
+    gt = GeoTesseraZarr()  # default public store, v1.1 dClimate
     X = gt.sample_points([(-2.97, 53.44), (-2.96, 53.43)], year=2025)
     mosaic, transform, crs = gt.read_region(bbox, year=2025)  # bbox in lon/lat
 
@@ -62,11 +65,11 @@ from rasterio.warp import Resampling, reproject
 from zarr.abc.store import Store as ZarrStore
 from zarr.storage import ObjectStore
 
-from .registry import zarr_store_url
+from .registry import dataset_for_location, zarr_store_url
 
 log = logging.getLogger(__name__)
 
-DEFAULT_STORE = zarr_store_url("v1")
+DEFAULT_STORE = zarr_store_url()
 
 # Shard-aligned chunk sizes so dask tasks match zarr shards
 SHARD_CHUNKS = {"time": 1, "band": 128, "y": 4096, "x": 4096}
@@ -350,6 +353,11 @@ def _region_window(ds, bbox):
     )
 
 
+def _nan_is_nodata(ds) -> bool:
+    """True if NaN scales mark unembedded pixels rather than water."""
+    return ds.attrs.get("geotessera:mask_source") == "source_nodata"
+
+
 def _bulk_sample(
     ds: xr.Dataset,
     es: np.ndarray,
@@ -409,7 +417,9 @@ def _bulk_sample(
     )
     values[read_indices] = emb
     cause[read_indices] = np.where(
-        np.isnan(scales), _WATER, np.where(np.isinf(scales), _HOLE, _OK)
+        np.isnan(scales),
+        _HOLE if _nan_is_nodata(ds) else _WATER,
+        np.where(np.isinf(scales), _HOLE, _OK),
     )
     return values, cause
 
@@ -511,7 +521,8 @@ def open_zone(
     UTM zone.  Returns a Dataset with the ``.tessera`` accessor.
 
     Args:
-        store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``.
+        store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``,
+            or an Icechunk repository location ending in ``.icechunk``.
         zone: UTM zone number (1-60).
         lon: A longitude — zone is derived automatically.
         bbox: (min_lon, min_lat, max_lon, max_lat) — zone from centre.
@@ -526,6 +537,10 @@ def open_zone(
     z = _resolve_zone(zone, lon, bbox)
 
     log.debug("open_zone: utm%02d from %s", z, store_url)
+    from .icechunk import IcechunkStore, is_icechunk_location
+
+    if is_icechunk_location(store_url):
+        return IcechunkStore(store_url).open_zone(z)
     ds = xr.open_zarr(
         zarr_store(store_url),
         group=f"utm{z:02d}",
@@ -670,7 +685,7 @@ class TesseraAccessor:
         ci, cj = yi - y0, xi - x0
 
         centre = scales[ci, cj]
-        if np.isnan(centre):
+        if np.isnan(centre) and not _nan_is_nodata(self._ds):
             return None, WATER
         if np.isfinite(centre):
             bi, bj = ci, cj
@@ -842,14 +857,20 @@ class GeoTesseraZarr:
 
     Args:
         store_url: Zarr store URL, local path, or a ``zarr.abc.store.Store``
-            such as a cache-wrapped store from :func:`zarr_store`.
-            Defaults to the public TESSERA store at
-            ``data.source.coop/tessera/tessera/zarr``.
+            such as a cache-wrapped store from :func:`zarr_store`. A
+            location ending in ``.icechunk`` opens an Icechunk repository.
+            Defaults to the v1.1 dClimate Icechunk store,
+            ``zarr_store_url()``.
         cache_dir: Persist reads under this directory, keyed per store
             location (see :func:`zarr_store`). Requires a URL or path
-            ``store_url``, not a ``Store`` object.
+            ``store_url``, not a ``Store`` object. Ignored for Icechunk
+            repositories.
         cache_max_size: Bound the *cache_dir* cache in bytes (default
             unbounded).
+
+    Attributes:
+        dataset: The published :class:`~geotessera.registry.Dataset` at
+            *store_url*, or None for another store. Exports record it.
 
     Example::
 
@@ -867,34 +888,47 @@ class GeoTesseraZarr:
         )
     """
 
+    _icechunk = None  # IcechunkStore when reading an Icechunk repository
+    dataset = None  # registry.Dataset when reading a published store
+
     def __init__(
         self,
         store_url: Union[str, os.PathLike[str], ZarrStore] = DEFAULT_STORE,
         cache_dir: Optional[Union[str, Path]] = None,
         cache_max_size: Optional[int] = None,
     ):
+        from .icechunk import IcechunkStore, is_icechunk_location
+
         if not isinstance(store_url, ZarrStore):
             store_url = os.fsdecode(os.fspath(store_url)).rstrip("/")
         self.url = str(store_url)
-        self._store = zarr_store(
-            store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
-        )
+        self.dataset = dataset_for_location(store_url)
         try:
-            root = zarr.open_group(self._store, mode="r")
+            if is_icechunk_location(store_url):
+                if cache_dir is not None:
+                    log.warning("GeoTesseraZarr: cache_dir is ignored for Icechunk")
+                self._icechunk = IcechunkStore(store_url)
+                self._store = self._icechunk.session.store
+                root = self._icechunk.root
+            else:
+                self._store = zarr_store(
+                    store_url, cache_dir=cache_dir, cache_max_size=cache_max_size
+                )
+                root = zarr.open_group(self._store, mode="r")
         except (
             zarr.errors.GroupNotFoundError,
             zarr.errors.ArrayNotFoundError,
             KeyError,
         ) as e:
-            from .registry import KNOWN_DATASETS
+            from .registry import DATASETS
 
-            available = ", ".join(sorted({f"v{v}" for v, _, d in KNOWN_DATASETS if d}))
+            available = ", ".join(sorted({f"v{ds.version}" for ds in DATASETS}))
             raise ValueError(
                 f"Failed to open zarr store at {self.url!r}. "
                 f"The store may not exist or the URL may be incorrect.\n"
                 f"Known versions: {available}. "
                 f"Use zarr_store_url() to generate correct store URLs, e.g., "
-                f"zarr_store_url('v1') or zarr_store_url('v2')."
+                f"zarr_store_url('v1.1') or zarr_store_url('v2')."
             ) from e
 
         self._root = root
@@ -908,8 +942,8 @@ class GeoTesseraZarr:
             for d in root_attrs.get("geoemb:depths", [])
         } or {self.n_bands: "embeddings"}
         # Derive years from the first zone's time coordinate array
-        self.years: list[int] = []
-        for member_name in sorted(root.keys()):
+        self.years: list[int] = list(self._icechunk.years) if self._icechunk else []
+        for member_name in [] if self._icechunk else sorted(root.keys()):
             if member_name.startswith("utm"):
                 try:
                     zone_grp = root[member_name]
@@ -986,10 +1020,18 @@ class GeoTesseraZarr:
         Datasets are cached for the lifetime of this instance.
         """
         z = _resolve_zone(zone, lon, bbox)
+        if self._icechunk is not None:
+            return self._icechunk.open_zone(z)
         if z not in self._cache:
             ds = open_zone(self._store, zone=z)
             self._cache[z] = ds
         return self._cache[z]
+
+    def _zone_arrays(self, zone: int):
+        """Zone *zone*'s arrays by name, indexed ``[time, band, y, x]``."""
+        if self._icechunk is not None:
+            return self._icechunk.zone_arrays(zone)
+        return self._root[f"utm{zone:02d}"]
 
     # -- Point sampling (cross-zone) ----------------------------------------
 
@@ -1153,7 +1195,7 @@ class GeoTesseraZarr:
 
     def _point_reader(self, zone: int, ds: xr.Dataset, year: int, array: str):
         """A pixel-index reader through zarr's own concurrent pipeline."""
-        group = self._root[f"utm{zone:02d}"]
+        group = self._zone_arrays(zone)
         ti = _time_index(ds, year)
 
         def read(xi, yi):
@@ -1263,7 +1305,7 @@ class GeoTesseraZarr:
         utm_bbox = _utm_envelope(bbox, zone_crs)
 
         # A strip is one getitem, so its chunk fetches run concurrently.
-        group = self._root[f"utm{z:02d}"]
+        group = self._zone_arrays(z)
         if strip_rows <= 0:
             raise ValueError("strip_rows must be positive")
         window = _region_window(ds, utm_bbox)
@@ -1405,7 +1447,7 @@ class GeoTesseraZarr:
 
         out = np.full((size_px, size_px, int(ds[array].shape[1])), np.nan, np.float32)
         if cx1 > cx0 and cy1 > cy0:
-            group = self._root[f"utm{int(acc.crs.split(':')[1]) % 100:02d}"]
+            group = self._zone_arrays(int(acc.crs.split(":")[1]) % 100)
             ti = _time_index(ds, year)
             with zarr.config.set({"async.concurrency": POINT_CONCURRENCY}):
                 emb_int8 = group[array][ti, :, cy0:cy1, cx0:cx1]

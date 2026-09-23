@@ -124,8 +124,8 @@ try {
     $infoOutput = Invoke-Geotessera -Arguments @("info", "--dataset-version", "v1")
     $infoString = $infoOutput | Out-String
 
-    $hasAvailableYears = $infoString -match "Available years"
-    Write-TestResult -TestName "Info command shows 'Available years'" -Passed $hasAvailableYears
+    $hasSelectedYears = $infoString -match "Selected:.*vultr" -and $infoString -match "Years:\s*2017-2025"
+    Write-TestResult -TestName "Info command shows the selected dataset and years" -Passed $hasSelectedYears
 
     # Manifest replaces the old per-version registry.parquet (see PR #250).
     # Either of these phrases is acceptable — a cold run downloads the

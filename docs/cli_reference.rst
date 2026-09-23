@@ -27,7 +27,8 @@ Specify one region selector from :ref:`cli-regions`.
 ``--source auto|zarr|tiles``
     Select the data source. The default, ``auto``, uses Zarr for TIFF
     output and individual tiles for NPY output or ``--registry-dir``.
-    Zarr supports TIFF output only.
+    Zarr supports TIFF output only. Tiles are deprecated and will be
+    removed.
 
 ``-o, --output DIRECTORY``
     Write files to this directory. This option is required unless
@@ -36,6 +37,7 @@ Specify one region selector from :ref:`cli-regions`.
 ``-f, --format tiff|npy``
     Select the output format. The default is ``tiff``. NPY downloads
     contain quantized embeddings, scale arrays, and landmask GeoTIFFs.
+    NPY is deprecated and will be removed.
 
 ``--year INTEGER``
     Select the embedding year. The default is 2024.
@@ -80,18 +82,23 @@ when needed.
 
 Each destination is replaced only after the new Zarr export file is complete.
 Rerunning repeats the export, including zones completed before a failure.
-Use a separate output directory for each region and dataset to keep their
-files separate.
+Use a separate output directory for each region.
 
 Individual tile downloads use the
 ``global_0.1_degree_representation/YEAR/grid_LON_LAT/`` layout. NPY scale
 files accompany the embedding arrays, and landmasks are stored under
-``global_0.1_degree_tiff_all/``. ``tessera_metadata.json`` records the dataset
-version and variant.
+``global_0.1_degree_tiff_all/``.
+
+Both sources record the dataset version and variant in the output
+directory's ``tessera_metadata.json``, and GeoTIFFs also record them in
+their ``TESSERA_DATASET_VERSION`` and ``TESSERA_DATASET_VARIANT`` tags.
+Downloading into a directory that holds another dataset is an error. A
+store given by ``--store-url`` that is not a published dataset is not
+recorded or checked.
 
 Tile downloads skip existing files. Rerun the same command to continue an
-interrupted download. Use a new output directory when changing the dataset
-or exported bands, since existing tiles are reused by filename.
+interrupted download. Use a new output directory when changing the
+exported bands, since existing tiles are reused by filename.
 
 Examples
 ^^^^^^^^
@@ -111,10 +118,13 @@ Estimate an export from a published prefix::
     geotessera download --dataset-version v2 --depth 16 \
         --bbox '-3.0,53.4,-2.9,53.5' --year 2024 --dry-run
 
-Download an individual tile as GeoTIFF or raw NPY files::
+Download an individual v1.1 tile, which exists only for the ``cambridge``
+variant, as GeoTIFF or raw NPY files::
 
-    geotessera download --source tiles --tile '0.17,52.23' --output tiles/
-    geotessera download --format npy --tile '0.17,52.23' --output arrays/
+    geotessera download --source tiles --dataset-variant cambridge \
+        --tile '0.17,52.23' --output tiles/
+    geotessera download --format npy --dataset-variant cambridge \
+        --tile '0.17,52.23' --output arrays/
 
 visualize
 ~~~~~~~~~
@@ -290,8 +300,8 @@ the globe shows global coverage.
 ``--by-source``
     Show each dataset version and variant in a separate color, with
     selectable layers in the globe. Omitted version and variant options
-    select all known datasets in this mode. Otherwise the default is
-    ``v1`` and its default variant.
+    select all datasets with NPY tiles in this mode. Otherwise the
+    default is ``v1.1`` and its default variant.
 
 ``--tile-color TEXT``
     Set the tile color when year-based colors are disabled. The default
@@ -320,6 +330,10 @@ the globe shows global coverage.
 This command accepts :ref:`cli-regions` and the dataset and manifest
 options in :ref:`cli-data-source`. It does not accept ``--store-url``.
 
+For a dataset published as Icechunk, such as the default, the PNG map is
+drawn from the store's tile registry, one rectangle per 2048-pixel tile,
+and no globe is written.
+
 Inspect coverage for a region or compare datasets::
 
     geotessera coverage --country 'United Kingdom' --year 2024
@@ -332,8 +346,9 @@ info
 
     geotessera info [OPTIONS]
 
-Show library information and known dataset versions and variants. The
-dataset table lists availability and each version's default variant.
+Show every dataset version and variant, the formats each is published in
+(NPY, Zarr, Icechunk) and its store URLs, followed by a summary of the
+selected dataset. A ``*`` marks each version's default variant.
 
 ``--tiles PATH``
     Inspect a local GeoTIFF or NPY file or directory. Report the files,
@@ -343,11 +358,12 @@ dataset table lists availability and each version's default variant.
     Use the deprecated alias for ``--tiles``.
 
 ``--dataset-version TEXT``, ``--dataset-variant TEXT``
-    Select the dataset for registry information. The defaults are ``v1``
-    and that version's default variant.
+    Select the dataset to summarise. The defaults are ``v1.1`` and that
+    version's default variant.
 
 ``-v, --verbose``
-    Include individual tile details.
+    Include individual tile details, tile counts per year, and the
+    incomplete zone-years of an Icechunk store.
 
 Inspect exported files::
 
@@ -394,12 +410,15 @@ Dataset and storage options
 
 ``--dataset-version TEXT``
     Select a dataset version, such as ``v1``, ``v1.1``, or ``v2``. The
-    default is ``v1``. Run ``geotessera info`` to list known datasets.
+    default is ``v1.1``. Run ``geotessera info`` to list known datasets.
 
 ``--dataset-variant TEXT``
     Select a variant within the version. If omitted, use the version's
-    default variant. Use one version and variant per analysis; their
-    embedding spaces are independently learned.
+    default variant. If that variant is not published in the requested
+    format, use the first variant that is, with a warning: v1.1 NPY
+    tiles exist only for ``cambridge``. Variants are separate inference
+    runs; embeddings of different versions or variants cannot be
+    interchanged.
 
 ``--store-url URL_OR_PATH``
     Read a Zarr store from this URL or local path. This overrides the

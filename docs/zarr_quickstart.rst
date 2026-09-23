@@ -1,7 +1,8 @@
 Zarr Quick Start
 ================
 
-``GeoTesseraZarr`` reads embeddings from a local or remote Zarr store.
+``GeoTesseraZarr`` reads embeddings from a local or remote Zarr store or
+Icechunk repository. The default is the global v1.1 dClimate Icechunk store.
 Queries select the required UTM zones and return dequantized float32 values.
 GeoTessera requires Python 3.12 or later::
 
@@ -26,6 +27,8 @@ Read an embedding at a WGS84 longitude and latitude::
 ``probe`` returns ``valid`` for an available embedding, ``water`` for open
 water, ``nodata`` for an unwritten pixel, and ``outside`` beyond coverage.
 ``sample_at`` returns only the vector, with NaN values for missing embeddings.
+The default dClimate store does not mark water, so every missing pixel
+reports ``nodata``.
 
 Sample points
 -------------
@@ -76,6 +79,11 @@ Files are named ``tessera_YEAR_utmNN.tif`` and contain float32 embeddings,
 NaN nodata, the native grid, band descriptions, and source metadata.
 Output windows enclose the bounds within the available zone grids.
 Each completed file replaces its destination. Rerunning repeats the export.
+
+For a published dataset, each file's ``TESSERA_DATASET_VERSION`` and
+``TESSERA_DATASET_VARIANT`` tags and the directory's
+``tessera_metadata.json`` record the dataset. Exporting into a directory
+that holds another dataset raises ``ValueError``.
 
 Omit ``bands`` to export all bands. Use ``depth`` to select a published
 embedding prefix; band indices are zero-based within that prefix.
@@ -134,28 +142,39 @@ depend on the physical chunk layout.
 Select a store
 --------------
 
-Use ``zarr_store_url`` to select another dataset version, or pass a local
-store path::
+Use ``zarr_store_url`` to select another dataset version or variant, or
+pass a local store path::
 
-    gt = GeoTesseraZarr(zarr_store_url("v1.1"))
+    gt = GeoTesseraZarr(zarr_store_url("v1.1", "cambridge"))
+    print(gt.dataset.name)      # 1.1-cambridge
     local = GeoTesseraZarr("/data/tessera.zarr")
 
-Use one version and variant per analysis because their embedding spaces
-are independently learned. See :ref:`dataset-versions`.
+``gt.dataset`` names the published dataset being read, or is None for
+another store. ``geotessera info`` lists every dataset and its formats.
+
+A location ending in ``.icechunk`` opens an Icechunk repository. Each UTM
+zone's ``N`` and ``S`` groups read as one zone on the northern CRS, with
+negative northings south of the equator. Zone-years absent from a group's
+``years_complete`` read as ``nodata``.
+
+Variants are separate inference runs. Use one version and variant per
+analysis: their embeddings cannot be interchanged. See
+:ref:`dataset-versions`.
 
 Caching
 -------
 
-Set ``cache_dir`` to persist metadata between runs. Byte-range reads of
-sharded embeddings are cached within the process. Each store uses a
-separate cache subdirectory::
+Set ``cache_dir`` to persist Zarr metadata between runs. Byte-range reads
+of sharded embeddings are cached within the process. Each store uses a
+separate cache subdirectory. Icechunk stores, including the default,
+ignore ``cache_dir``::
 
-    gt = GeoTesseraZarr(cache_dir="tessera-cache")
+    gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")
 
 Set ``cache_max_size`` to bound the cache in bytes::
 
     gt = GeoTesseraZarr(
-        cache_dir="tessera-cache", cache_max_size=2 * 1024**3
+        zarr_store_url("v2"), cache_dir="tessera-cache", cache_max_size=2 * 1024**3
     )
 
 Keep exported GeoTIFFs or completed web map directories for reuse between

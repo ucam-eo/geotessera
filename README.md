@@ -33,7 +33,7 @@ geospatial analysis tasks. Read more details about [the model](https://github.co
 The [Zarr API](#cloud-native-zarr-access) reads selected points and regions
 from the cloud store and returns dequantized values on their native UTM
 grid. The [tile API](#python-api) downloads individual NPY or GeoTIFF files
-for offline use.
+for offline use; NPY tiles are deprecated and will be removed.
 
 ### Stream regions to GeoTIFF or a web map
 
@@ -53,6 +53,11 @@ Country and vector regions select their bounding boxes.
 Rerunning a Zarr export replaces its completed files. Use `--source tiles`
 for individual tiles that skip existing files on rerun. `--format npy`
 also selects individual tiles.
+
+Every download records its dataset version and variant in
+`tessera_metadata.json` in the output directory, and GeoTIFFs record them
+in their tags. Downloading into a directory that holds another dataset,
+or merging GeoTIFFs of different datasets, fails.
 
 Web maps reuse matching completed mosaics and tiles. Keep the output
 directory and its JSON completion files. Use `--force` to refresh a map
@@ -122,7 +127,7 @@ grid. Patches can combine pixels across zone boundaries.
 ```python
 from geotessera import GeoTesseraZarr
 
-gt = GeoTesseraZarr()
+gt = GeoTesseraZarr()  # v1.1 dClimate Icechunk store
 print(gt.years)  # [2017, ..., 2025]
 
 # One embedding, with a status explaining any missing value
@@ -150,6 +155,11 @@ Export a region without holding the full array in memory:
 files = gt.export_geotiffs(bbox, 2024, "region/", bands=[0, 1, 2])
 ```
 
+`gt.dataset` names the published dataset being read, such as
+`1.1-dclimate`. Exports record it in their tags and in the directory's
+`tessera_metadata.json`, and exporting into a directory that holds
+another dataset fails.
+
 Other dataset versions are selected by store URL. v2 stores also publish
 matryoshka prefixes. `depth=16` reads the first 16 dimensions; the bytes
 transferred depend on the store's chunk layout:
@@ -161,11 +171,17 @@ gt = GeoTesseraZarr(zarr_store_url("v2"))
 X16 = gt.sample_points([(0.12, 52.20)], year=2024, depth=16)  # (N, 16)
 ```
 
+A location ending in `.icechunk` opens an Icechunk repository. Its UTM zone
+and hemisphere groups read as one `utmNN` zone on the northern CRS, with
+negative northings south of the equator; NaN scales mark unembedded pixels,
+reported as `nodata`.
+
 Set `cache_dir` to persist Zarr metadata between runs. Byte-range reads
-of sharded embeddings are cached within the process.
+of sharded embeddings are cached within the process. Icechunk stores,
+including the default, ignore it.
 
 ```python
-gt = GeoTesseraZarr(cache_dir="tessera-cache")
+gt = GeoTesseraZarr(zarr_store_url("v2"), cache_dir="tessera-cache")
 ```
 
 For direct access to one UTM zone, `gt.open_zone(lon=0.15)` returns an xarray
@@ -274,22 +290,23 @@ for re-use across runs.
 Before downloading, check what data is available:
 
 ```bash
-# Generate a coverage map showing all available tiles
+# Map the default v1.1 dclimate dataset from its tile registry
 geotessera coverage --output coverage_map.png
 
-# Generate a coverage map for the UK
+# Map it for the UK, or for one year
 geotessera coverage --country uk
-
-# View coverage for a specific year
 geotessera coverage --year 2024 --output coverage_2024.png
 
-# Customize the visualization
-geotessera coverage --year 2024 --tile-color blue --tile-alpha 0.3
+# Map NPY tile coverage, with coverage.json and globe.html
+geotessera coverage --dataset-variant cambridge --output tiles_coverage.png
 ```
 
 ### Download Embeddings
 
-Download individual tiles as NumPy arrays or GeoTIFF files:
+Download individual tiles as NumPy arrays or GeoTIFF files. Tiles are
+deprecated and will be removed. v1.1 tiles exist only for the `cambridge`
+variant, which these commands use with a warning; add
+`--dataset-variant cambridge` to select it explicitly.
 
 ```bash
 # Download as GeoTIFF (default, with georeferencing)
@@ -343,7 +360,10 @@ geotessera serve ./london_web --open
 ### Core Methods
 
 The `GeoTessera` class downloads embedding tiles as files; for streaming
-access use the [zarr backend](#cloud-native-zarr-access). The tile interface
+access use the [zarr backend](#cloud-native-zarr-access). NPY tiles are
+deprecated and will be removed. v1.1 tiles exist only for the `cambridge`
+variant, which `GeoTessera()` uses with a warning; pass
+`dataset_variant="cambridge"` to select it explicitly. The tile interface
 provides two main methods for retrieving embeddings:
 
 ```python
@@ -488,8 +508,9 @@ geotessera webmap --bbox '-3.0,53.4,-2.9,53.5' --output region_map/
 
 ### coverage
 
-Show data availability as a PNG map and HTML globe. Use `--by-source`
-to compare dataset versions and variants.
+Show data availability as a PNG map and HTML globe. Icechunk datasets,
+including the default, are drawn from their tile registry as a PNG map
+alone. Use `--by-source` to compare the datasets with NPY tiles.
 
 ```bash
 geotessera coverage --country 'United Kingdom' --year 2024
@@ -505,7 +526,8 @@ geotessera serve map/ --port 8001 --html viewer.html
 
 ### info
 
-List known datasets or inspect local GeoTIFF and NPY files.
+List every dataset, its formats and store URLs, and summarise the selected
+dataset; or inspect local GeoTIFF and NPY files.
 
 ```bash
 geotessera info
@@ -532,21 +554,29 @@ GeoTessera uses a Parquet-based registry system to efficiently manage and access
 ### Dataset Versions and Variants
 
 Tessera embeddings are published as dataset *versions* (e.g. `v1`, `v1.1`,
-`v2`) and, within a version, as *variants* produced by different model runs.
-Each `(version, variant)` pair — a *dataset* — has its own directory in the
-repository's `npy/` tree:
+`v2`) and, within a version, as *variants*, each a separate inference run.
+Embeddings from different variants do not interoperate, even within one
+version: train and predict on the same `(version, variant)`. Each variant is
+published in one or more formats:
 
-| Version | Variant                | `npy/` directory | Status      |
-|---------|------------------------|------------------|-------------|
-| `1.0`   | `vultr` (default)      | `v1/`            | available   |
-| `1.1`   | `cambridge` (default)  | `v1.1-cam/`      | available   |
-| `1.1`   | `dclimate`             | —                | coming soon |
-| `2.0`   | `2B-L~beta1` (default) | `v2-2B-L~beta1/` | available   |
-| `2.0`   | `2B-L~beta2`           | `v2-2B-L~beta2/` | available   |
+| Version | Variant                | NPY tiles (`npy/`)   | Zarr (`zarr/`)   | Icechunk                                         |
+|---------|------------------------|----------------------|------------------|--------------------------------------------------|
+| `1.0`   | `vultr` (default)      | `v1/`                | `v1/`            | —                                                |
+| `1.1`   | `dclimate` (default)   | —                    | —                | `s3://tessera-embeddings/v1.1/dclimate.icechunk` |
+| `1.1`   | `cambridge`            | `v1.1-cam/`          | `v1.1/`          | —                                                |
+| `2.0`   | `2B-L~beta1` (default) | `v2-2B-L~beta1/`     | `v2-2B-L~beta1/` | —                                                |
+| `2.0`   | `2B-L~beta2`           | `v2-2B-L~beta2/`     | `v2-2B-L~beta2/` | —                                                |
 
-The v1 series predates the variant-suffix scheme, so all its variants share
-the bare `v1/` directory. The library defaults remain `dataset_version="v1"`
-and `year=2024` — the only combination with full global coverage today.
+The default version is `v1.1`. Streamed reads (`GeoTesseraZarr()`,
+`download`, `webmap`) use the version's default variant, `dclimate`, read
+from the global [Icechunk store](https://github.com/dClimate/tessera-embeddings/blob/main/docs/global-store.md).
+NPY tiles of v1.1 exist only for `cambridge`, so `GeoTessera` and
+`download --format npy` fall back to it with a warning; pass
+`--dataset-variant cambridge` to select it explicitly. `coverage` and
+`info` read the Icechunk store's Parquet tile registry in place of an NPY
+manifest. The table is `DATASETS` in `geotessera/registry.py`.
+
+NPY tiles are deprecated and will be removed; use Zarr or Icechunk.
 List the datasets at any time with `geotessera info`, and select them on the
 CLI with `--dataset-version` and `--dataset-variant`, or in Python:
 
@@ -671,9 +701,14 @@ Remote Server (https://data.source.coop/tessera/tessera)
 │       ├── landmasks.parquet
 │       └── grid_0.15_52.05.tiff
 └── zarr/                                      # Cloud-native zarr stores
-    ├── v1/                                    # 60 UTM zone groups + RGB pyramid
+    ├── v1/                                    # 1.0 / vultr: 60 UTM zone groups + RGB pyramid
+    ├── v1.1/                                  # 1.1 / cambridge
     ├── v2-2B-L~beta1/                         # v2 stores add matryoshka
     └── v2-2B-L~beta2/                         # prefix arrays (d4, d16)
+
+Icechunk (s3://tessera-embeddings/v1.1)
+├── dclimate.icechunk/                         # 1.1 / dclimate, one group per zone and hemisphere
+└── dclimate.registry/parts/                   # Parquet tile registry
 ```
 
 ### Local Cache Structure
