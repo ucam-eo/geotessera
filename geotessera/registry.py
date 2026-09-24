@@ -468,6 +468,7 @@ def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
 # with bucket path TESSERA_MIRROR_REPO.
 TESSERA_MIRROR_ENDPOINT = "https://data.source.coop"
 TESSERA_MIRROR_REPO = "tessera/tessera"
+TESSERA_MIRROR_S3_BUCKET = "us-west-2.opendata.source.coop"
 TESSERA_MIRROR_URL = f"{TESSERA_MIRROR_ENDPOINT}/{TESSERA_MIRROR_REPO}"
 TESSERA_NPY_MIRROR_URL = f"{TESSERA_MIRROR_URL}/npy"
 TESSERA_LANDMASKS_MIRROR_URL = f"{TESSERA_MIRROR_URL}/landmasks"
