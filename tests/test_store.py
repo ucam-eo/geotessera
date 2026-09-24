@@ -21,6 +21,7 @@ from geotessera.store import (
     GeoTesseraZarr,
     _patch_crs,
     _resolve_zone,
+    _s3_mirror_location,
     _seam_neighbours,
     _store_cache_key,
     _zone_for_lon,
@@ -641,3 +642,34 @@ def test_persistent_cache_keying(tmp_path: Path):
 
     with pytest.raises(ValueError):
         zarr_store(zarr_store(str(tmp_path / "s1")), cache_dir=cache)
+
+
+def test_s3_mirror_location():
+    mirror_url = zarr_store_url("v1")
+    try:
+        import s3fs  # noqa: F401
+
+        s3fs_installed = True
+    except ImportError:
+        s3fs_installed = False
+
+    rewritten = _s3_mirror_location(mirror_url)
+    if s3fs_installed:
+        assert_check(
+            "a Source Cooperative URL rewrites to s3:// with anon path-style options",
+            rewritten is not None
+            and rewritten[0]
+            == "s3://us-west-2.opendata.source.coop/tessera/tessera/zarr/v1"
+            and rewritten[1]["client_kwargs"]["region_name"] == "us-west-2"
+            and rewritten[1]["anon"] is True,
+        )
+    else:
+        assert_check(
+            "without s3fs installed, no rewrite is attempted",
+            rewritten is None,
+        )
+
+    assert_check(
+        "a non-Source-Cooperative HTTPS URL is never rewritten",
+        _s3_mirror_location("https://mirror.example.org/zarr/v1") is None,
+    )

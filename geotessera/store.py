@@ -116,6 +116,34 @@ def _store_cache_key(location: str) -> str:
     return f"{slug[-80:]}-{digest}"
 
 
+def _s3_mirror_location(location: str) -> Optional[Tuple[str, dict]]:
+    """Rewrite a Source Cooperative HTTPS URL to its anonymous S3 equivalent.
+
+    ``data.source.coop`` is a Cloudflare-fronted HTTPS gateway that can choke
+    under the request volume a full zarr region read generates; reading the
+    same bucket over S3 instead avoids that proxy. Only attempted when
+    ``s3fs`` is installed, since it is an optional extra.
+    """
+    from .registry import (
+        TESSERA_MIRROR_REPO,
+        TESSERA_MIRROR_S3_BUCKET,
+        TESSERA_MIRROR_URL,
+    )
+
+    prefix = f"{TESSERA_MIRROR_URL}/"
+    if not location.startswith(prefix):
+        return None
+    try:
+        import s3fs  # noqa: F401
+    except ImportError:
+        return None
+    from .remote import build_storage_options
+
+    suffix = location[len(TESSERA_MIRROR_URL) :]
+    options = build_storage_options(anon=True, region="us-west-2", path_style=True)
+    return f"s3://{TESSERA_MIRROR_S3_BUCKET}/{TESSERA_MIRROR_REPO}{suffix}", options
+
+
 def zarr_store(
     location: Union[str, os.PathLike[str], ZarrStore],
     cache_dir: Optional[Union[str, Path]] = None,
@@ -128,7 +156,10 @@ def zarr_store(
     from an http(s) URL retry failed requests with exponential backoff,
     because a region read issues hundreds of requests and public data
     servers drop some under load.  ``s3://`` and other URL schemes open
-    through fsspec.
+    through fsspec.  A Source Cooperative HTTPS URL is transparently
+    reopened over S3 instead when ``s3fs`` is installed, bypassing the
+    HTTPS gateway's proxy for the (much heavier) request volume a zarr
+    read generates.
 
     Pass *cache_dir* to persist reads locally through zarr's
     experimental ``CacheStore`` (requires ``zarr>=3.3``)::
@@ -149,8 +180,17 @@ def zarr_store(
                 "existing Store in zarr's CacheStore yourself"
             )
         return location
-    location = os.fsdecode(os.fspath(location))
-    location = location.rstrip("/")
+    location = os.fsdecode(os.fspath(location)).rstrip("/")
+    original_location = location
+    storage_options = None
+    if location.startswith(("http://", "https://")):
+        s3_mirror = _s3_mirror_location(location)
+        if s3_mirror is not None:
+            location, storage_options = s3_mirror
+            log.info(
+                "s3fs detected; using direct S3 access for Source Cooperative store %s",
+                original_location,
+            )
     if location.startswith(("http://", "https://")):
         http = HTTPStore.from_url(
             location, retry_config=RETRY_CONFIG, client_options=CLIENT_OPTIONS
@@ -159,7 +199,7 @@ def zarr_store(
     elif "://" in location:
         from zarr.storage import FsspecStore
 
-        store = FsspecStore.from_url(location)
+        store = FsspecStore.from_url(location, storage_options=storage_options)
     else:
         from zarr.storage import LocalStore
 
@@ -169,7 +209,7 @@ def zarr_store(
         from zarr.experimental.cache_store import CacheStore
         from zarr.storage import LocalStore
 
-        keyed = Path(cache_dir) / _store_cache_key(location)
+        keyed = Path(cache_dir) / _store_cache_key(original_location)
         keyed.mkdir(parents=True, exist_ok=True)
         store = CacheStore(
             store, cache_store=LocalStore(keyed), max_size=cache_max_size
