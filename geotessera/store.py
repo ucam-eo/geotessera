@@ -87,6 +87,10 @@ RETRY_CONFIG = {
 
 CLIENT_OPTIONS = {"timeout": timedelta(seconds=120)}
 
+# A caching proxy may hold a cold request until it has downloaded the whole
+# object, and a v1.1 embedding shard is up to about 2 GB.
+PROXY_TIMEOUT = timedelta(hours=1)
+
 # Chunk fetches in flight for reads through zarr's own pipeline.  Remote
 # reads are latency-bound, so more than zarr's default of 10 helps; kept
 # scoped, since dask paths multiply it by their thread count.
@@ -147,11 +151,37 @@ def _s3_mirror_location(location: str) -> Optional[str]:
     return TESSERA_MIRROR_S3_HTTP_URL + location[len(TESSERA_MIRROR_URL) :]
 
 
+PROXY_ENV = "GEOTESSERA_PROXY"
+
+
+def _proxy_location(location: str, proxy: Optional[str]) -> Optional[str]:
+    """Rewrite a public mirror URL to the same path under a caching proxy.
+
+    *proxy* stands in for the mirror root, so the store
+    ``{TESSERA_MIRROR_URL}/zarr/v1.1-dclimate`` reads from
+    ``{proxy}/zarr/v1.1-dclimate``. *proxy* defaults to the
+    :data:`PROXY_ENV` environment variable, which is how the ``--proxy``
+    flag reaches worker processes. Locations outside the mirror are left
+    alone.
+    """
+    from .registry import TESSERA_MIRROR_URL
+
+    if proxy is None:
+        proxy = os.environ.get(PROXY_ENV, "")
+    proxy = proxy.strip().rstrip("/")
+    if not proxy or not location.startswith(f"{TESSERA_MIRROR_URL}/"):
+        return None
+    if not proxy.startswith(("http://", "https://")):
+        raise ValueError(f"proxy must be an http(s) URL, got: {proxy!r}")
+    return proxy + location[len(TESSERA_MIRROR_URL) :]
+
+
 def zarr_store(
     location: Union[str, os.PathLike[str], ZarrStore],
     cache_dir: Optional[Union[str, Path]] = None,
     cache_max_size: Optional[int] = None,
     via_gateway: Optional[bool] = None,
+    proxy: Optional[str] = None,
 ) -> ZarrStore:
     """Open *location* as a ``zarr.abc.store.Store``.
 
@@ -167,6 +197,15 @@ def zarr_store(
     gateway instead. This also applies to direct AWS HTTPS URLs for the
     public mirror. The two routes share one cache and dataset identity.
     An explicit *via_gateway* value overrides the environment variable.
+
+    Pass *proxy*, or set :data:`PROXY_ENV`, to read the public mirror
+    through a caching proxy instead of either route. It is the URL that
+    stands in for the mirror root, such as
+    ``http://127.0.0.1:9999/tessera-mirror`` for zarr-perma-proxy's
+    ``tessera`` profile. The store keeps its dataset identity and cache
+    key. Plain ``http://`` locations are allowed, for such local proxies.
+    Proxied requests wait up to :data:`PROXY_TIMEOUT`, because a cold
+    whole-object proxy answers only once it holds the complete shard.
 
     Pass *cache_dir* to persist reads locally through zarr's
     experimental ``CacheStore`` (requires ``zarr>=3.3``)::
@@ -190,7 +229,11 @@ def zarr_store(
     location = os.fsdecode(os.fspath(location)).rstrip("/")
     original_location = location
     location = canonical_store_location(location)
-    if not _via_gateway(via_gateway):
+    proxied = _proxy_location(location, proxy)
+    if proxied is not None:
+        location = proxied
+        log.info("reading %s through the proxy: %s", original_location, proxied)
+    elif not _via_gateway(via_gateway):
         direct = _s3_mirror_location(location)
         if direct is not None:
             location = direct
@@ -198,8 +241,16 @@ def zarr_store(
                 "reading %s from the bucket directly: %s", original_location, direct
             )
     if location.startswith(("http://", "https://")):
+        client_options, retry_config = dict(CLIENT_OPTIONS), RETRY_CONFIG
+        if proxied is not None:
+            client_options["timeout"] = PROXY_TIMEOUT
+            retry_config = {**RETRY_CONFIG, "retry_timeout": 2 * PROXY_TIMEOUT}
+        if location.startswith("http://"):
+            # reqwest refuses plain http unless asked, which a loopback
+            # caching proxy needs.
+            client_options["allow_http"] = True
         http = HTTPStore.from_url(
-            location, retry_config=RETRY_CONFIG, client_options=CLIENT_OPTIONS
+            location, retry_config=retry_config, client_options=client_options
         )
         store = ObjectStore(http, read_only=True)
     elif "://" in location:
@@ -913,6 +964,9 @@ class GeoTesseraZarr:
         via_gateway: Read a Source Cooperative store through the
             ``data.source.coop`` gateway instead of the bucket directly
             (see :func:`zarr_store`).
+        proxy: Read a Source Cooperative store through the caching proxy
+            at this URL, which stands in for the mirror root
+            (see :func:`zarr_store`).
 
     Attributes:
         dataset: The published :class:`~geotessera.registry.Dataset` at
@@ -943,6 +997,7 @@ class GeoTesseraZarr:
         cache_dir: Optional[Union[str, Path]] = None,
         cache_max_size: Optional[int] = None,
         via_gateway: Optional[bool] = None,
+        proxy: Optional[str] = None,
     ):
         from .icechunk import IcechunkStore, is_icechunk_location
 
@@ -963,6 +1018,7 @@ class GeoTesseraZarr:
                     cache_dir=cache_dir,
                     cache_max_size=cache_max_size,
                     via_gateway=via_gateway,
+                    proxy=proxy,
                 )
                 root = zarr.open_group(self._store, mode="r")
         except (

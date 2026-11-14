@@ -1,27 +1,19 @@
 ## Unreleased
 
+- Add a global `--proxy URL` option, the `GEOTESSERA_PROXY` environment
+  variable and the `proxy=` argument of `GeoTesseraZarr` and `zarr_store`,
+  which read the public Zarr stores through a caching proxy standing in for
+  the mirror root. Proxied requests wait up to an hour for a cold
+  whole-object proxy to fetch a shard.
+- Open plain `http://` Zarr stores, such as a loopback proxy. These
+  previously failed with a `BadScheme` error.
+
 - `zarr-fill --rewrite-existing-shards` no longer follows every zone/year
   with a serial re-read of the shards it has just written to rebuild the
-  stretch statistics. The writers report statistics for the shards they
-  write, any shard the rewrite leaves alone is read back through the same
-  process pool, and the slot is set from the lot in one pass. A fill that
-  finds a slot marked incomplete repairs it the same way.
-  `--backfill-stretch-stats` now reads shards through the worker pool too,
-  honours `--workers` and logs progress with an ETA. (@mtelvers)
-
+  stretch statistics. (@mtelvers)
 - Stretch statistics are folded into the store as the worker pool produces
   them, in batches (`--stats-batch-size`, default 64), for shards being
-  written and for shards read back alike. A fill or backfill killed
-  part-way loses at most one batch; everything folded earlier stays in
-  the store, and the next run writes only the missing shards and reads
-  back only the shards the coverage mask has not seen. Previously a fill
-  held every shard's statistics in memory until the zone-year finished,
-  so an eviction meant reading all of its shards back from the store. A
-  failed read or write no longer marks the whole slot incomplete; the
-  shard is simply picked up next time. `--backfill-stretch-stats` records
-  a marker beside the store while it runs and continues from it on a
-  retry, so a Fargate-style retry of the same command never restarts a
-  zone-year from zero. (@mtelvers)
+  written and for shards read back alike. (@mtelvers)
 
 ## v0.11.0 (04-10-2026)
 

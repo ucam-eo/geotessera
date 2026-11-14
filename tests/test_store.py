@@ -696,3 +696,77 @@ def test_s3_mirror_location(monkeypatch, direct_input):
         "an explicit via_gateway=False still overrides the environment",
         opened(zarr_store_url("v1"), via_gateway=False).startswith(direct),
     )
+
+
+@pytest.mark.parametrize("direct_input", [False, True])
+def test_proxy_location(monkeypatch, direct_input):
+    from datetime import timedelta
+
+    from geotessera.store import (
+        CLIENT_OPTIONS,
+        GATEWAY_ENV,
+        PROXY_ENV,
+        PROXY_TIMEOUT,
+        HTTPStore,
+        _proxy_location,
+    )
+
+    monkeypatch.delenv(GATEWAY_ENV, raising=False)
+    monkeypatch.delenv(PROXY_ENV, raising=False)
+    proxy = "http://127.0.0.1:9999/tessera-mirror"
+    url = zarr_store_url("v1")
+    assert _proxy_location(url, None) is None
+    assert _proxy_location(url, proxy + "/") == f"{proxy}/zarr/v1"
+    assert _proxy_location("https://mirror.example.org/zarr/v1", proxy) is None
+    with pytest.raises(ValueError):
+        _proxy_location(url, "127.0.0.1:9999")
+
+    opened_options = []
+    from_url = HTTPStore.from_url
+
+    def recording_from_url(location, **kwargs):
+        opened_options.append(kwargs)
+        return from_url(location, **kwargs)
+
+    monkeypatch.setattr(HTTPStore, "from_url", recording_from_url)
+
+    def opened(url, **kwargs):
+        if direct_input:
+            url = _s3_mirror_location(url)
+        return zarr_store(url, **kwargs).store.url
+
+    assert_check(
+        "proxy= replaces the mirror root, for either public URL form",
+        opened(url, proxy=proxy) == f"{proxy}/zarr/v1",
+    )
+    assert_check(
+        "a proxied read allows plain http and waits for a cold whole object",
+        opened_options[-1]["client_options"]
+        == {"timeout": PROXY_TIMEOUT, "allow_http": True}
+        and opened_options[-1]["retry_config"]["retry_timeout"] > timedelta(hours=1),
+    )
+    assert_check(
+        "the proxy takes precedence over the gateway",
+        opened(url, proxy=proxy, via_gateway=True) == f"{proxy}/zarr/v1",
+    )
+    assert_check(
+        "an unproxied read keeps the default timeout",
+        opened(url).startswith("https://s3.us-west-2.amazonaws.com")
+        and opened_options[-1]["client_options"] == CLIENT_OPTIONS,
+    )
+    monkeypatch.setenv(PROXY_ENV, proxy)
+    assert_check(
+        f"{PROXY_ENV} selects the proxy, for worker processes",
+        opened(url) == f"{proxy}/zarr/v1",
+    )
+    assert_check(
+        "a proxied store keeps its dataset identity and cache key",
+        _store_cache_key(url) == "v1",
+    )
+    assert_check(
+        "an explicit plain-http store opens without the proxy timeout",
+        zarr_store("http://127.0.0.1:9999/tessera").store.url
+        == "http://127.0.0.1:9999/tessera"
+        and opened_options[-1]["client_options"]
+        == {**CLIENT_OPTIONS, "allow_http": True},
+    )
