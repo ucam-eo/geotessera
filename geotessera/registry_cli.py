@@ -4466,6 +4466,8 @@ def zarr_fill_command(args):
                 years=years,
                 console=console,
                 storage_options=store_options,
+                workers=args.workers,
+                **_stats_batch_kwarg(args, "batch_size"),
             )
         except (ValueError, RuntimeError) as e:
             console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -4518,6 +4520,7 @@ def zarr_fill_command(args):
             skip_existing_shards=not args.rewrite_existing_shards,
             spill_dir=args.spill_dir,
             collect_stretch_stats=not args.no_stretch_stats,
+            **_stats_batch_kwarg(args, "stats_batch_size"),
         )
     except (ValueError, RuntimeError) as e:
         console.print(f"[red]{emoji('❌ ')}{e}[/red]")
@@ -4527,6 +4530,12 @@ def zarr_fill_command(args):
 
     console.print(f"\n{emoji('✅ ')}{n} shards written")
     return 0
+
+
+def _stats_batch_kwarg(args, name: str) -> Dict[str, int]:
+    """``--stats-batch-size`` as a keyword, or nothing to keep the default."""
+    value = getattr(args, "stats_batch_size", None)
+    return {name: value} if value else {}
 
 
 def zarr_verify_command(args):
@@ -5909,10 +5918,22 @@ Directory Structure:
         action="store_true",
         help="Rebuild the selected zones' stretch statistics by scanning "
         "their existing shards, instead of ingesting tiles. The repair path "
-        "for stores filled before fill-time collection existed, interrupted "
-        "fills, and suspected double-counting. With this flag the tile "
-        "source is not read; `zarr-fill <store> --backfill-stretch-stats` "
-        "works with the store as the only positional.",
+        "for stores filled before fill-time collection existed, statistics "
+        "that no longer match rewritten shards, and suspected "
+        "double-counting. Reads through the worker pool a batch at a time "
+        "and resumes from where an interrupted run stopped. With this flag "
+        "the tile source is not read; `zarr-fill <store> "
+        "--backfill-stretch-stats` works with the store as the only "
+        "positional.",
+    )
+    zarr_fill_parser.add_argument(
+        "--stats-batch-size",
+        type=int,
+        default=None,
+        help="Shards read back per pool run when catching stretch statistics "
+        "up from the store (fill catch-up and --backfill-stretch-stats). "
+        "Each batch is folded as soon as it is in, so an interrupted run "
+        "loses at most one batch. Default 64.",
     )
     zarr_fill_parser.add_argument(
         "--spill-dir",
