@@ -19,11 +19,18 @@ jobs:
           auto-update-conda: true
           activate-environment: true
           environment-file: environment.yml
-          channels: conda-forge,anaconda,main
+          channels: conda-forge
+          conda-remove-defaults: true
+          channel-priority: strict
           python-version: ${{ matrix.python-version }}
 
       - name: Install Local Package
         run: pip install -e . pytest
+
+      - name: Show environment
+        run: |
+          conda list
+          python -c "import numpy; numpy.show_config()"
 
       - name: Run Python API Tests
         timeout-minutes: 15

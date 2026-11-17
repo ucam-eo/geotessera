@@ -1,8 +1,6 @@
 name: base
 channels:
-  - defaults
   - conda-forge
-  - main
 dependencies:
   - dask
   - geodatasets>=2024.8.0
