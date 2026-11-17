@@ -34,6 +34,21 @@ Global options
     anonymously and share the same cache. Icechunk and unrelated stores are
     unaffected.
 
+``--proxy URL``
+    Read public mirror Zarr stores through a caching proxy. ``URL`` stands in
+    for the mirror root ``https://data.source.coop/tessera/tessera``, so the
+    default store reads from ``URL/zarr/v1.1-dclimate``. With
+    zarr-perma-proxy serving its default ``tessera`` profile::
+
+        geotessera --proxy http://127.0.0.1:9999/tessera-mirror download --bbox 0.05,52.15,0.20,52.25 --output tiles
+
+    Alternatively, set ``GEOTESSERA_PROXY`` for the command and its worker
+    processes. The proxy takes precedence over ``--via-gateway``. Stores keep
+    their dataset identity and cache entries. Requests wait up to an hour,
+    because a cold whole-object proxy answers only once it has downloaded the
+    complete shard, which can approach 2 GB. Icechunk, tile downloads and
+    unrelated stores are unaffected.
+
 Commands
 --------
 

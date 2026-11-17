@@ -184,6 +184,18 @@ HTTPS URL copied from ``info``. Both routes serve the same objects anonymously,
 require no AWS credentials, and share dataset identity and cache entries.
 Icechunk and unrelated stores are unaffected.
 
+To read through a caching proxy, pass the URL that stands in for the mirror
+root, in Python or with the global CLI flag::
+
+    gt = GeoTesseraZarr(proxy="http://127.0.0.1:9999/tessera-mirror")
+
+    geotessera --proxy http://127.0.0.1:9999/tessera-mirror download --bbox 0.05,52.15,0.20,52.25 --output tiles
+
+Or set ``GEOTESSERA_PROXY`` in the environment. The proxy takes precedence over
+the gateway option. A whole-object proxy such as zarr-perma-proxy downloads a
+complete shard before answering the first read of it, so cold reads are slow
+and later reads are local.
+
 Caching
 -------
 

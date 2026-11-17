@@ -117,8 +117,21 @@ def global_options(
         "Zarr reads use direct AWS HTTPS by default. Place this flag before "
         "the command, or set GEOTESSERA_VIA_GATEWAY=1.",
     ),
+    proxy: Optional[str] = typer.Option(
+        None,
+        "--proxy",
+        metavar="URL",
+        help="Read the public Zarr stores through a caching proxy. URL stands "
+        "in for the mirror root, e.g. http://127.0.0.1:9999/tessera-mirror for "
+        "zarr-perma-proxy. Place this flag before the command, or set "
+        "GEOTESSERA_PROXY.",
+    ),
 ) -> None:
     """Options that apply to every command, given before the command name."""
+    if proxy:
+        from .store import PROXY_ENV
+
+        os.environ[PROXY_ENV] = proxy
     if via_gateway:
         # An environment variable rather than a parameter: zarr fills and
         # preview builds open the store again in worker processes, which
