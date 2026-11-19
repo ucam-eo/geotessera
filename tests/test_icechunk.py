@@ -262,6 +262,43 @@ def test_tile_registry_keeps_latest_run(tmp_path: Path, monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("west", "east", "expected"),
+    [
+        (179.5, -179.5, ["west", "crossing", "east"]),
+        (180, -180, ["west", "crossing", "east"]),
+        (-180, -180, ["west", "crossing", "east"]),
+        (180, 180, ["west", "crossing", "east"]),
+        (2, 1, ["west", "far", "crossing", "east"]),
+        (-180, 180, ["west", "far", "gap", "crossing", "east"]),
+    ],
+)
+def test_tile_registry_antimeridian(tmp_path, monkeypatch, west, east, expected):
+    registry = TileRegistry("s3://example/parts", cache_dir=tmp_path)
+    parts = {
+        "01": [("west", -180, -179.8, 0)],
+        "40": [("far", 57, 57.1, 0)],
+        "31": [("gap", 1.4, 1.6, 0)],
+        "60": [
+            ("east", 179.8, 180, 0),
+            ("crossing", 179.9, -179.9, 0),
+            ("north", 179.9, -179.9, 3),
+        ],
+    }
+    monkeypatch.setattr(
+        registry, "parts", lambda: [(z, "N", 2025, z) for z in parts]
+    )
+
+    def read(zone):
+        df = pd.DataFrame(
+            parts[zone], columns=["tile", "bbox_west", "bbox_east", "bbox_south"]
+        )
+        return df.assign(bbox_north=df["bbox_south"] + 0.1, assembled_at="2026-01-01")
+
+    monkeypatch.setattr(registry, "_read", read)
+    assert set(registry.tiles((west, 0, east, 1), 2025)["tile"]) == set(expected)
+
+
 def test_xarray_point_reads_use_vindex(store_path, monkeypatch):
     from geotessera.icechunk import ZoneArray
 

@@ -475,10 +475,11 @@ _PART_RE = re.compile(r"zone=(\d\d)([NS])/year=(\d{4})/[^/]+\.parquet$")
 
 def _zones_for_lons(west: float, east: float) -> list[int]:
     """UTM zones covering ``[west, east]`` plus one either side."""
-    first = math.floor((west + 180.0) / 6.0) % 60 + 1
-    last = math.floor((min(east, 179.999999) + 180.0) / 6.0) % 60 + 1
-    count = (last - first) % 60 + 1
-    return sorted({(first - 2 + i) % 60 + 1 for i in range(count + 2)})
+    first = min(59, math.floor((west + 180.0) / 6.0))
+    last = min(59, math.floor((east + 180.0) / 6.0))
+    if west > east:
+        last += 60
+    return sorted({i % 60 + 1 for i in range(first - 1, last + 2)})
 
 
 class TileRegistry:
@@ -562,8 +563,9 @@ class TileRegistry:
         """Registry rows intersecting *bbox* in *year*, latest run only.
 
         Args:
-            bbox: WGS84 ``(west, south, east, north)``. The default is
-                the whole registry, about 140 MB.
+            bbox: WGS84 ``(west, south, east, north)``. Use ``west > east``
+                for a region crossing the antimeridian. The default is the
+                whole registry, about 140 MB.
             year: Select one year. The default is every year.
             progress_callback: Call ``callback(done, total, status)``
                 after each part is read.
@@ -605,11 +607,22 @@ class TileRegistry:
         )
         if bbox is not None:
             wraps = df["bbox_west"] > df["bbox_east"]
-            lon_hit = np.where(
-                wraps,
-                (df["bbox_west"] <= east) | (df["bbox_east"] >= west),
-                (df["bbox_west"] <= east) & (df["bbox_east"] >= west),
-            )
+            starts_before_east = df["bbox_west"] <= east
+            ends_after_west = df["bbox_east"] >= west
+            if west > east:
+                # Every wrapping row intersects the query at the antimeridian.
+                lon_hit = wraps | starts_before_east | ends_after_west
+            else:
+                lon_hit = np.where(
+                    wraps,
+                    starts_before_east | ends_after_west,
+                    starts_before_east & ends_after_west,
+                )
+                # Both spellings of the antimeridian denote the same boundary.
+                if west == -180:
+                    lon_hit |= df["bbox_east"] == 180
+                if east == 180:
+                    lon_hit |= df["bbox_west"] == -180
             lat_hit = (df["bbox_south"] <= north) & (df["bbox_north"] >= south)
             df = df[lon_hit & lat_hit]
         return df.sort_values(["year", "zone", "tile"]).reset_index(drop=True)
