@@ -9,7 +9,7 @@ data into 5x5 degree blocks for efficient data access.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union, List, Tuple, Dict, Iterator, Callable
+from collections.abc import Iterator
 import os
 import math
 import re
@@ -32,6 +32,8 @@ except ImportError:
     raise ImportError(
         "geopandas is required for spatial operations. Install with: pip install geopandas"
     )
+
+from ._typing import ProgressCallback
 
 # Constants for block-based registry management
 BLOCK_SIZE = 5  # 5x5 degree blocks
@@ -63,28 +65,28 @@ class Dataset:
     version: str
     variant: str
     description: str = ""
-    npy: Optional[str] = None
-    zarr: Optional[str] = None
-    icechunk: Optional[str] = None
-    tile_registry: Optional[str] = None
+    npy: str | None = None
+    zarr: str | None = None
+    icechunk: str | None = None
+    tile_registry: str | None = None
 
     @property
     def name(self) -> str:
         """``"1.1-cambridge"``."""
         return f"{self.version}-{self.variant}"
 
-    def location(self, fmt: str) -> Optional[str]:
+    def location(self, fmt: str) -> str | None:
         """Where the dataset is published in *fmt*, or None."""
         return getattr(self, fmt)
 
-    def formats(self) -> List[str]:
+    def formats(self) -> list[str]:
         """Formats the dataset is published in."""
         return [f for f in FORMATS if self.location(f)]
 
 
 # Published datasets. The first row of a version is its default variant;
 # the first row of a version with a format is the default for that format.
-DATASETS: Tuple[Dataset, ...] = (
+DATASETS: tuple[Dataset, ...] = (
     Dataset("1.0", "vultr", "Legacy model", npy="v1", zarr="v1"),
     Dataset(
         "1.1",
@@ -107,7 +109,7 @@ DATASETS: Tuple[Dataset, ...] = (
 DEFAULT_VERSION = "v1.1"
 
 
-def find_dataset(version_norm: str, variant: str) -> Optional[Dataset]:
+def find_dataset(version_norm: str, variant: str) -> Dataset | None:
     """The dataset for *version_norm* and *variant*, or None."""
     for ds in DATASETS:
         if ds.version == version_norm and ds.variant == variant:
@@ -115,7 +117,7 @@ def find_dataset(version_norm: str, variant: str) -> Optional[Dataset]:
     return None
 
 
-def default_variant(version_norm: str, fmt: Optional[str] = None) -> str:
+def default_variant(version_norm: str, fmt: str | None = None) -> str:
     """Default variant of *version_norm*, optionally among those in *fmt*.
 
     *fmt* is a format from :data:`FORMATS` or ``"stream"`` for any of
@@ -132,7 +134,7 @@ def default_variant(version_norm: str, fmt: Optional[str] = None) -> str:
     return variants[0].variant
 
 
-def variant_note(version_norm: str, fmt: str) -> Optional[str]:
+def variant_note(version_norm: str, fmt: str) -> str | None:
     """Why *fmt* defaults to another variant than *version_norm*'s, or None."""
     version_default = default_variant(version_norm)
     fmt_default = default_variant(version_norm, fmt)
@@ -153,7 +155,7 @@ def variant_note(version_norm: str, fmt: str) -> Optional[str]:
     )
 
 
-def icechunk_dataset(version: str, variant: Optional[str] = None):
+def icechunk_dataset(version: str, variant: str | None = None):
     """``(repository URL, tile registry URL)``, or None for other datasets.
 
     *variant* defaults to the version's streamed default.
@@ -165,12 +167,12 @@ def icechunk_dataset(version: str, variant: Optional[str] = None):
     return ds.icechunk, ds.tile_registry
 
 
-def known_variants(version_norm: str) -> List[str]:
+def known_variants(version_norm: str) -> list[str]:
     """Variants of *version_norm*, default first."""
     return [ds.variant for ds in DATASETS if ds.version == version_norm]
 
 
-def published_datasets(fmt: str = "npy") -> List[Tuple[str, str, str]]:
+def published_datasets(fmt: str = "npy") -> list[tuple[str, str, str]]:
     """``(version_norm, variant, location)`` of every dataset in *fmt*."""
     return [
         (ds.version, ds.variant, ds.location(fmt))
@@ -189,7 +191,7 @@ def _unavailable(ds: Dataset, fmt: str) -> ValueError:
     )
 
 
-def _parse_dataset_version(spec: str) -> Tuple[str, str]:
+def _parse_dataset_version(spec: str) -> tuple[str, str]:
     """Parse a flexible dataset-version spec.
 
     Returns ``(version_path, normalized_version)``. Accepts inputs like
@@ -257,7 +259,7 @@ def dataset_path(version_norm: str, variant: str) -> str:
 _DATASET_DIR_RE = re.compile(r"^v(\d+)(?:\.(\d+))?(?:-(.+))?$")
 
 
-def dataset_from_path(dirname: str) -> Optional[Tuple[str, str]]:
+def dataset_from_path(dirname: str) -> tuple[str, str] | None:
     """Inverse of :func:`dataset_path`: ``"v1.1-cam"`` → ``("1.1", "cambridge")``.
 
     Bare version directories resolve to the version's default variant
@@ -282,10 +284,10 @@ TESSERA_METADATA_FILENAME = "tessera_metadata.json"
 
 
 def write_tessera_metadata(
-    output_dir: Union[str, Path],
+    output_dir: str | Path,
     dataset_version: str,
     dataset_variant: str,
-    extra: Optional[Dict[str, object]] = None,
+    extra: dict[str, object] | None = None,
 ) -> Path:
     """Write a ``tessera_metadata.json`` sidecar describing a download.
 
@@ -296,7 +298,7 @@ def write_tessera_metadata(
     import json
 
     version_path, version_norm = _parse_dataset_version(dataset_version)
-    payload: Dict[str, object] = {
+    payload: dict[str, object] = {
         "dataset_version": version_norm,
         "dataset_version_path": version_path,
         "dataset_variant": dataset_variant,
@@ -326,7 +328,7 @@ def write_tessera_metadata(
     return out
 
 
-def recorded_dataset(directory: Union[str, Path]) -> Optional[Tuple[str, str]]:
+def recorded_dataset(directory: str | Path) -> tuple[str, str] | None:
     """``(version_norm, variant)`` recorded in *directory*'s sidecar, or None."""
     import json
 
@@ -341,7 +343,7 @@ def recorded_dataset(directory: Union[str, Path]) -> Optional[Tuple[str, str]]:
     return _parse_dataset_version(str(version))[1], str(variant)
 
 
-def check_dataset_dir(directory: Union[str, Path], version: str, variant: str) -> None:
+def check_dataset_dir(directory: str | Path, version: str, variant: str) -> None:
     """Raise ``ValueError`` if *directory* holds another dataset's embeddings.
 
     The ``tessera_metadata.json`` sidecar names the dataset that populated
@@ -358,7 +360,7 @@ def check_dataset_dir(directory: Union[str, Path], version: str, variant: str) -
         )
 
 
-def dataset_tags(version: str, variant: str) -> Dict[str, str]:
+def dataset_tags(version: str, variant: str) -> dict[str, str]:
     """GeoTIFF tags identifying the dataset *version* and *variant*."""
     version_path, version_norm = _parse_dataset_version(version)
     return {
@@ -368,7 +370,7 @@ def dataset_tags(version: str, variant: str) -> Dict[str, str]:
     }
 
 
-def dataset_from_tags(tags: Dict[str, str]) -> Optional[Tuple[str, str]]:
+def dataset_from_tags(tags: dict[str, str]) -> tuple[str, str] | None:
     """``(version_norm, variant)`` recorded in GeoTIFF *tags*, or None.
 
     Reads the tags of :func:`dataset_tags`, or else resolves a
@@ -403,7 +405,7 @@ def dataset_from_tags(tags: Dict[str, str]) -> Optional[Tuple[str, str]]:
 
 
 # Block-level functions (5-degree registry organization)
-def block_from_world(lon: float, lat: float) -> Tuple[int, int]:
+def block_from_world(lon: float, lat: float) -> tuple[int, int]:
     """Convert world coordinates to containing registry block coordinates.
 
     Registry blocks are 5×5 degree squares used to organize registry files.
@@ -473,7 +475,7 @@ def block_to_landmasks_registry_filename(block_lon: int, block_lat: int) -> str:
 
 
 # Tile-level functions (0.1-degree data tiles)
-def tile_from_world(lon: float, lat: float) -> Tuple[float, float]:
+def tile_from_world(lon: float, lat: float) -> tuple[float, float]:
     """Convert world coordinates to containing tile center coordinates.
 
     Tiles are 0.1×0.1 degree squares centered at 0.05-degree offsets
@@ -507,7 +509,7 @@ def tile_from_world(lon: float, lat: float) -> Tuple[float, float]:
     return round(float(tile_lon), 2), round(float(tile_lat), 2)
 
 
-def parse_grid_name(filename: str) -> Tuple[Optional[float], Optional[float]]:
+def parse_grid_name(filename: str) -> tuple[float | None, float | None]:
     """Extract tile coordinates from a grid filename.
 
     Args:
@@ -550,7 +552,7 @@ def tile_to_grid_name(lon: float, lat: float) -> str:
     return f"grid_{lon:.2f}_{lat:.2f}"
 
 
-def tile_to_embedding_paths(lon: float, lat: float, year: int) -> Tuple[Path, Path]:
+def tile_to_embedding_paths(lon: float, lat: float, year: int) -> tuple[Path, Path]:
     """Generate embedding and scales file paths for a tile.
 
     Args:
@@ -595,7 +597,7 @@ def tile_to_landmask_filename(lon: float, lat: float) -> str:
     return f"{tile_to_grid_name(lon, lat)}.tiff"
 
 
-def tile_to_bounds(lon: float, lat: float) -> Tuple[float, float, float, float]:
+def tile_to_bounds(lon: float, lat: float) -> tuple[float, float, float, float]:
     """Get geographic bounds for a tile.
 
     Args:
@@ -665,7 +667,7 @@ def landmask_url(version_path: str, filename: str) -> str:
     return f"{TESSERA_LANDMASKS_MIRROR_URL}/{version_path}/{filename}"
 
 
-def zarr_store_url(version: str = DEFAULT_VERSION, variant: Optional[str] = None) -> str:
+def zarr_store_url(version: str = DEFAULT_VERSION, variant: str | None = None) -> str:
     """URL of the streamed store for *version* and *variant*.
 
     Accepts a version name (``"v1"``, ``"v1.1"``, ``"v2"``) or an explicit
@@ -705,7 +707,7 @@ def canonical_store_location(location: str) -> str:
     return location
 
 
-def dataset_for_location(location) -> Optional[Dataset]:
+def dataset_for_location(location) -> Dataset | None:
     """The published dataset whose Zarr or Icechunk store is *location*."""
     if not isinstance(location, (str, os.PathLike)):
         return None
@@ -789,7 +791,7 @@ class HTTPStatusError(OSError):
     raises ``MaxRetryError`` once exhausted.
     """
 
-    def __init__(self, url: str, status: int, reason: Optional[str]):
+    def __init__(self, url: str, status: int, reason: str | None):
         super().__init__(f"HTTP {status} {reason or ''} for {url}".rstrip())
         self.url = url
         self.status = status
@@ -829,8 +831,8 @@ def _http():
 
 def download_file_to_temp(
     url: str,
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    cache_path: Optional[Path] = None,
+    progress_callback: ProgressCallback | None = None,
+    cache_path: Path | None = None,
 ) -> str:
     """Download a file over HTTPS with caching, retries, and integrity checks.
 
@@ -891,8 +893,8 @@ def download_file_to_temp(
 
 def _download_once(
     url: str,
-    progress_callback: Optional[Callable[[int, int, str], None]],
-    cache_path: Optional[Path],
+    progress_callback: ProgressCallback | None,
+    cache_path: Path | None,
 ) -> str:
     """Single download attempt (see :func:`download_file_to_temp`)."""
     headers = {}
@@ -930,8 +932,8 @@ def _transfer_status(downloaded: int, total: int, elapsed: float) -> str:
 def _stream_to_file(
     response,
     url: str,
-    cache_path: Optional[Path],
-    progress_callback: Optional[Callable[[int, int, str], None]],
+    cache_path: Path | None,
+    progress_callback: ProgressCallback | None,
 ) -> str:
     """Stream *response* to *cache_path*, or to a temporary file, atomically.
 
@@ -1024,17 +1026,17 @@ class Registry:
     def __init__(
         self,
         version: str,
-        variant: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
-        embeddings_dir: Optional[Union[str, Path]] = None,
-        registry_url: Optional[str] = None,
-        registry_path: Optional[Union[str, Path]] = None,
-        registry_dir: Optional[Union[str, Path]] = None,
-        landmasks_registry_url: Optional[str] = None,
-        landmasks_registry_path: Optional[Union[str, Path]] = None,
-        bbox: Optional[Tuple[float, float, float, float]] = None,
+        variant: str | None = None,
+        cache_dir: str | Path | None = None,
+        embeddings_dir: str | Path | None = None,
+        registry_url: str | None = None,
+        registry_path: str | Path | None = None,
+        registry_dir: str | Path | None = None,
+        landmasks_registry_url: str | None = None,
+        landmasks_registry_path: str | Path | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
         bbox_margin_deg: float = 0.15,
-        logger: Optional[logging.Logger] = None,
+        logger: logging.Logger | None = None,
     ):
         """Initialize Registry manager with optimized Parquet registries.
 
@@ -1085,7 +1087,7 @@ class Registry:
         # Populated by _load_registry() with the local path to the manifest
         # parquet (cache file or user-supplied). Useful for tools that need
         # the raw unfiltered manifest (e.g. multi-source coverage rendering).
-        self.manifest_path: Optional[Path] = None
+        self.manifest_path: Path | None = None
 
         # Set up cache directory for Parquet registries only
         if cache_dir:
@@ -1128,12 +1130,12 @@ class Registry:
         # Manifests are per dataset (one npy/ directory per (version,
         # variant) pair); the consumer fetches the manifest matching its
         # dataset directory and filters by variant on load.
-        self._registry_gdf: Optional[gpd.GeoDataFrame] = None
+        self._registry_gdf: gpd.GeoDataFrame | None = None
         self._registry_url = registry_url or manifest_url(self._dataset_path)
         self._registry_path = Path(registry_path) if registry_path else None
 
         # Landmasks Parquet registry (per version).
-        self._landmasks_df: Optional[pd.DataFrame] = None
+        self._landmasks_df: pd.DataFrame | None = None
         self._landmasks_registry_url = landmasks_registry_url or landmasks_parquet_url(
             self._version_path
         )
@@ -1142,8 +1144,8 @@ class Registry:
         )
 
         # Rows with tile centres inside _scope are loaded; None loads all.
-        self._bbox: Optional[Tuple[float, float, float, float]] = None
-        self._scope: Optional[Tuple[float, float, float, float]] = None
+        self._bbox: tuple[float, float, float, float] | None = None
+        self._scope: tuple[float, float, float, float] | None = None
         if bbox is not None:
             min_lon, min_lat, max_lon, max_lat = (float(v) for v in bbox)
             if min_lon > max_lon or min_lat > max_lat:
@@ -1443,7 +1445,7 @@ class Registry:
             )
 
     def _check_scope(
-        self, bounds: Tuple[float, float, float, float], expansion: float
+        self, bounds: tuple[float, float, float, float], expansion: float
     ) -> None:
         """Raise ValueError if bounds, grown by expansion, leave the loaded scope."""
         if self._scope is None:
@@ -1486,16 +1488,9 @@ class Registry:
             )
 
     def iter_tiles_in_region(
-        self, bounds: Tuple[float, float, float, float], year: int
-    ) -> Iterator[Tuple[int, float, float]]:
-        """Lazy iterator over tiles in a region using GeoPandas spatial indexing.
-
-        GeoPandas automatically uses R-tree spatial indexing for fast queries.
-        This method:
-        - Starts yielding immediately (low latency)
-        - Uses constant memory regardless of region size
-        - Allows early termination without processing all tiles
-        - Leverages GeoPandas built-in R-tree for optimal performance
+        self, bounds: tuple[float, float, float, float], year: int
+    ) -> Iterator[tuple[int, float, float]]:
+        """Yield unique tiles intersecting a region, in manifest order.
 
         Note: Registry stores tiles as Point geometries at their centers, but tiles
         are 0.1° x 0.1° boxes. The query is expanded by 0.05° (half tile width) in
@@ -1545,8 +1540,8 @@ class Registry:
                 yield (year_val, lon_i / 100.0, lat_i / 100.0)
 
     def load_blocks_for_region(
-        self, bounds: Tuple[float, float, float, float], year: int
-    ) -> List[Tuple[int, float, float]]:
+        self, bounds: tuple[float, float, float, float], year: int
+    ) -> list[tuple[int, float, float]]:
         """Load tiles for a region (list-returning version for backward compatibility).
 
         For memory-efficient streaming, use iter_tiles_in_region() instead.
@@ -1566,7 +1561,7 @@ class Registry:
 
         return tiles_list
 
-    def get_available_years(self) -> List[int]:
+    def get_available_years(self) -> list[int]:
         """List all years with available Tessera embeddings.
 
         Returns:
@@ -1576,7 +1571,7 @@ class Registry:
             self._registry_gdf.index.get_level_values("year").unique().tolist()
         )
 
-    def get_tile_counts_by_year(self) -> Dict[int, int]:
+    def get_tile_counts_by_year(self) -> dict[int, int]:
         """Get count of tiles per year using efficient pandas operations.
 
         Returns:
@@ -1599,7 +1594,7 @@ class Registry:
         )
         return {int(year): int(count) for year, count in counts.items()}
 
-    def get_available_embeddings(self) -> List[Tuple[int, float, float]]:
+    def get_available_embeddings(self) -> list[tuple[int, float, float]]:
         """Get list of all available embeddings with vectorized conversion.
 
         Returns:
@@ -1637,12 +1632,12 @@ class Registry:
 
     def fetch(
         self,
-        path: Optional[str] = None,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        path: str | None = None,
+        progress_callback: ProgressCallback | None = None,
         refresh: bool = False,
-        year: Optional[int] = None,
-        lon: Optional[float] = None,
-        lat: Optional[float] = None,
+        year: int | None = None,
+        lon: float | None = None,
+        lat: float | None = None,
         is_scales: bool = False,
     ) -> str:
         """Fetch a file using local embeddings_dir or direct HTTP download.
@@ -1695,11 +1690,11 @@ class Registry:
 
     def fetch_landmask(
         self,
-        filename: Optional[str] = None,
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        filename: str | None = None,
+        progress_callback: ProgressCallback | None = None,
         refresh: bool = False,
-        lon: Optional[float] = None,
-        lat: Optional[float] = None,
+        lon: float | None = None,
+        lat: float | None = None,
     ) -> str:
         """Fetch a landmask file using local embeddings_dir or direct HTTP download.
 
@@ -1741,7 +1736,7 @@ class Registry:
         return result
 
     @property
-    def available_embeddings(self) -> List[Tuple[int, float, float]]:
+    def available_embeddings(self) -> list[tuple[int, float, float]]:
         """Get list of available embeddings."""
         return self.get_available_embeddings()
 
@@ -1760,7 +1755,7 @@ class Registry:
         return len(idx.unique())
 
     @property
-    def available_landmasks(self) -> List[Tuple[float, float]]:
+    def available_landmasks(self) -> list[tuple[float, float]]:
         """Get list of available landmasks with vectorized conversion.
 
         Falls back to embedding tiles if landmasks registry is not available.
@@ -1776,7 +1771,7 @@ class Registry:
         unique_idx = self._registry_gdf.index.droplevel("year").unique()
         return [(lon_i / 100.0, lat_i / 100.0) for lon_i, lat_i in unique_idx]
 
-    def get_manifest_info(self) -> Tuple[Optional[str], Optional[str]]:
+    def get_manifest_info(self) -> tuple[str | None, str | None]:
         """Get manifest information (git hash and repo URL).
 
         For Parquet registries, this information is not stored in the registry.
@@ -1863,11 +1858,11 @@ class Registry:
 
     def calculate_download_requirements(
         self,
-        tiles: List[Tuple[int, float, float]],
+        tiles: list[tuple[int, float, float]],
         output_dir: Path,
         format_type: str,
         check_existing: bool = True,
-    ) -> Tuple[int, int, Dict[str, int]]:
+    ) -> tuple[int, int, dict[str, int]]:
         """Calculate download requirements for a set of tiles.
 
         Args:

@@ -30,6 +30,8 @@ from urllib.parse import urlparse
 import numpy as np
 import xarray as xr
 
+from ._typing import ProgressCallback
+
 log = logging.getLogger(__name__)
 
 # Northing of the equator in a southern UTM CRS.
@@ -555,7 +557,7 @@ class TileRegistry:
         self,
         bbox: tuple[float, float, float, float] | None = None,
         year: int | None = None,
-        progress_callback=None,
+        progress_callback: ProgressCallback | None = None,
     ):
         """Registry rows intersecting *bbox* in *year*, latest run only.
 

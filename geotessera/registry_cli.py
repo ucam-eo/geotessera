@@ -21,7 +21,8 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Callable, Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
+from collections.abc import Callable, Iterator
 
 from rich.console import Console
 from rich.panel import Panel
@@ -37,6 +38,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from ._typing import ProgressCallback
 from .registry import (
     TESSERA_MIRROR_ENDPOINT,
     _DATASET_DIR_RE,
@@ -84,8 +86,8 @@ class TileInfo:
     embedding_path: str
     scales_path: str
     directory_path: str
-    embedding_hash: Optional[str]
-    scales_hash: Optional[str]
+    embedding_hash: str | None
+    scales_hash: str | None
     embedding_mtime: float
     scales_mtime: float
     embedding_size: int
@@ -203,8 +205,8 @@ def process_grid_directory(args):
 def iterate_tessera_tiles(
     base_dir: str,
     callback: Callable[[TileInfo], Any],
-    progress_callback: Optional[Callable] = None,
-) -> tuple[List[Any], List[tuple[str, str]]]:
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[Any], list[tuple[str, str]]]:
     """
     Single-pass iterator through Tessera embedding filesystem structure.
 
@@ -784,7 +786,7 @@ def check_command(args):
 
     truncated_files: list = []
 
-    def _check_npy_integrity(path: str) -> Optional[str]:
+    def _check_npy_integrity(path: str) -> str | None:
         """Verify a .npy file header matches its file size.
 
         Returns an error message if truncated, None if OK.
@@ -2416,7 +2418,7 @@ def file_scan_command(args):
 S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 
 
-def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse an s3://bucket/prefix URI into (bucket, prefix).
 
     The prefix is normalised to have no leading slash and a single trailing
@@ -2438,8 +2440,8 @@ def _s3_list(
     bucket: str,
     prefix: str,
     endpoint_url: str,
-    delimiter: Optional[str] = None,
-) -> Iterator[Tuple[str, int, str]]:
+    delimiter: str | None = None,
+) -> Iterator[tuple[str, int, str]]:
     """Yield (key, size, last_modified) for every object under prefix.
 
     Issues anonymous path-style HTTPS calls to the S3-compatible
@@ -2458,7 +2460,7 @@ def _s3_list(
     from .registry import _http
 
     base = f"{endpoint_url.rstrip('/')}/{bucket}/"
-    token: Optional[str] = None
+    token: str | None = None
     while True:
         params = {"list-type": "2", "prefix": prefix}
         if delimiter is not None:
@@ -2520,8 +2522,8 @@ def _discover_scan_units(
     root_prefix: str,
     endpoint_url: str,
     console: "Console",
-    flat_variant: Optional[str] = None,
-) -> List[Tuple[str, str, int, str]]:
+    flat_variant: str | None = None,
+) -> list[tuple[str, str, int, str]]:
     """Walk an S3 prefix and return a list of (version, variant, year, year_prefix).
 
     Auto-detects the level of ``root_prefix``: tree root, dataset dir, or
@@ -2558,9 +2560,9 @@ def _discover_scan_units(
         if m:
             pre_variant = m.group(1) or _DEFAULT_VARIANT
 
-    units: List[Tuple[str, str, int, str]] = []
+    units: list[tuple[str, str, int, str]] = []
 
-    def walk(prefix: str, version: Optional[str], variant: Optional[str], indent: int):
+    def walk(prefix: str, version: str | None, variant: str | None, indent: int):
         pad = "  " * indent
         for sp, _, _ in _s3_list(bucket, prefix, endpoint_url, delimiter="/"):
             tail = sp[len(prefix) :].rstrip("/")
@@ -2606,7 +2608,7 @@ def _discover_landmask_prefixes(
     root_prefix: str,
     endpoint_url: str,
     console: "Console",
-) -> List[Tuple[str, str, str]]:
+) -> list[tuple[str, str, str]]:
     """Return ``(version_norm, version_path, landmask_prefix)`` per version.
 
     Supports both layouts: TIFFs under ``{version}/global_0.1_degree_tiff_all/``
@@ -2615,7 +2617,7 @@ def _discover_landmask_prefixes(
     are skipped. When ``root_prefix`` already points at or inside a version
     dir, only that version is probed.
     """
-    candidates: List[Tuple[str, str]] = []  # (version_norm, version_prefix)
+    candidates: list[tuple[str, str]] = []  # (version_norm, version_prefix)
 
     pre_version = None
     pre_version_path = None
@@ -2645,7 +2647,7 @@ def _discover_landmask_prefixes(
 
     from itertools import islice
 
-    out: List[Tuple[str, str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for version_norm, version_prefix in candidates:
         version_path = _version_path_from_norm(version_norm)
         # Probe a few keys at each candidate location. TIFF keys sort before
@@ -2713,7 +2715,7 @@ def s3scan_command(args):
     # when the embeddings prefix yields nothing (a landmasks-only run).
     landmasks_only_ok = not args.no_landmasks and args.landmasks_uri is not None
 
-    scan_units: List[Tuple[str, str, int, str]] = []
+    scan_units: list[tuple[str, str, int, str]] = []
     if landmasks_only_ok and args.landmasks_uri == args.s3_uri:
         # A pure landmasks run. Skip embedding discovery: walking a flat
         # landmask tree pages through every TIFF key to find no year dirs.
@@ -2746,7 +2748,7 @@ def s3scan_command(args):
     # on ``grid_{int_lon}.`` gives 360 independent prefixes per year (~5k objs
     # each) that can be listed in parallel. The trailing dot disambiguates
     # ``grid_1.`` from ``grid_10.``, ``grid_100.``, etc.
-    shard_prefixes: List[str] = (
+    shard_prefixes: list[str] = (
         [f"grid_-{n}." for n in range(1, 180)]
         + ["grid_-0."]
         + [f"grid_{n}." for n in range(0, 180)]
@@ -2762,7 +2764,7 @@ def s3scan_command(args):
         task_id,
     ):
         """List one (version, variant, year, lon-shard) and return tile records."""
-        tiles: Dict[Tuple[float, float], Dict[str, Tuple[str, int, str]]] = {}
+        tiles: dict[tuple[float, float], dict[str, tuple[str, int, str]]] = {}
         listed = 0
         for key, size, lm in _s3_list(bucket, year_prefix + shard, endpoint):
             listed += 1
@@ -2814,16 +2816,16 @@ def s3scan_command(args):
         f"({args.workers} workers)...[/cyan]"
     )
 
-    records: List[Dict] = []
+    records: list[dict] = []
     units_found = set()
     # (version, variant) datasets that lost one or more shards even after
     # _s3_list's built-in retries. Their manifests would be silently
     # incomplete, so they are not written.
     failed_datasets: set = set()
-    tile_counts: Dict[Tuple[str, str, int], int] = {
+    tile_counts: dict[tuple[str, str, int], int] = {
         (v, var, y): 0 for v, var, y, _ in scan_units
     }
-    shards_left: Dict[Tuple[str, str, int], int] = {
+    shards_left: dict[tuple[str, str, int], int] = {
         (v, var, y): n_shards_per_year for v, var, y, _ in scan_units
     }
 
@@ -2837,7 +2839,7 @@ def s3scan_command(args):
         console=console,
         transient=False,
     ) as progress:
-        unit_tasks: Dict[Tuple[str, str, int], int] = {
+        unit_tasks: dict[tuple[str, str, int], int] = {
             (v, var, y): progress.add_task(f"[cyan]{v}/{var}/{y}[/cyan]", total=None)
             for v, var, y, _ in sorted(scan_units)
         }
@@ -2899,7 +2901,7 @@ def s3scan_command(args):
     # One parquet per dataset version. Layout mirrors the remote tree so the
     # whole output can be uploaded with
     # ``aws s3 cp --recursive <output_dir>/ s3://<bucket>/``.
-    written_files: List[Path] = []
+    written_files: list[Path] = []
     # Set when a landmask scan loses shards; embedding-side losses are
     # tracked in failed_datasets. Either makes the run exit non-zero.
     scan_had_failures = False
@@ -2953,7 +2955,7 @@ def s3scan_command(args):
                 written_files.append(out_file)
 
         # Landmask scan: one parquet per version that has landmask TIFFs.
-        landmask_files_by_version: Dict[str, Path] = {}
+        landmask_files_by_version: dict[str, Path] = {}
         if not args.no_landmasks:
             # The landmask tree may live outside the embeddings prefix (on
             # data.source.coop it is the sibling landmasks/ tree);
@@ -2976,7 +2978,7 @@ def s3scan_command(args):
                     f"\n[cyan]Scanning landmasks for {version_path} "
                     f"({len(shard_prefixes)} shards)...[/cyan]"
                 )
-                lm_records: List[Dict] = []
+                lm_records: list[dict] = []
 
                 def _scan_lm_shard(shard: str):
                     out_local = []
@@ -3088,7 +3090,7 @@ def s3scan_command(args):
         # Summary grouped by (version, variant)
         from collections import defaultdict
 
-        summary: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+        summary: dict[tuple[str, str], list[int]] = defaultdict(list)
         for v, var, y in sorted(units_found):
             summary[(v, var)].append(y)
         if scan_had_failures or failed_datasets:
@@ -3163,11 +3165,11 @@ def s3scan_command(args):
 
 
 def compute_sync_plan(
-    fresh: "pd.DataFrame",
-    synced: Optional["pd.DataFrame"],
-    store_years: Optional[List[int]],
+    fresh: pd.DataFrame,
+    synced: pd.DataFrame | None,
+    store_years: list[int] | None,
     preview_year: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Diff a fresh tile scan against the manifest as of the last sync.
 
     Pure planning: no I/O. *synced* is None when there is no baseline (first
@@ -3222,7 +3224,7 @@ def compute_sync_plan(
             for lon, y in zip(in_scope["lon"], in_scope["year"])
         }
     )
-    zone_years: Dict[int, List[int]] = {}
+    zone_years: dict[int, list[int]] = {}
     for z, y in pairs:
         zone_years.setdefault(z, []).append(y)
 
@@ -3239,7 +3241,7 @@ def compute_sync_plan(
     }
 
 
-def _storage_flag_args(args, prefix: str, out_prefix: Optional[str] = None) -> List[str]:
+def _storage_flag_args(args, prefix: str, out_prefix: str | None = None) -> list[str]:
     """Re-emit ``--{prefix}-*`` storage flags for a child subcommand.
 
     *out_prefix* renames the prefix for children whose read/write sides are
@@ -3249,7 +3251,7 @@ def _storage_flag_args(args, prefix: str, out_prefix: Optional[str] = None) -> L
     flags its ``output`` flags.
     """
     out_prefix = out_prefix or prefix
-    flags: List[str] = []
+    flags: list[str] = []
     for name in ("endpoint-url", "region", "profile", "acl"):
         value = getattr(args, f"{prefix}_{name.replace('-', '_')}", None)
         if value:
@@ -3261,7 +3263,7 @@ def _storage_flag_args(args, prefix: str, out_prefix: Optional[str] = None) -> L
 
 
 def _run_child(
-    cmd: List[str],
+    cmd: list[str],
     log_path: Path,
     console: "Console",
     label: str,
@@ -3293,12 +3295,12 @@ def _run_child(
 
 
 def _zone_pool(
-    tasks: List[Tuple[int, Any]],
+    tasks: list[tuple[int, Any]],
     jobs: int,
     run_task: Callable[[int, Any], bool],
     console: "Console",
     exclusive_neighbours: bool = False,
-) -> List[int]:
+) -> list[int]:
     """Run per-zone tasks with at most *jobs* in flight; return failed zones.
 
     With *exclusive_neighbours*, a zone never starts while an adjacent zone
@@ -3313,8 +3315,8 @@ def _zone_pool(
     from concurrent.futures import wait as futures_wait
 
     pending = list(tasks)
-    running: Dict[Any, int] = {}
-    failed: List[int] = []
+    running: dict[Any, int] = {}
+    failed: list[int] = []
 
     def blocked(zone: int) -> bool:
         if not exclusive_neighbours:
@@ -3497,7 +3499,7 @@ def s3sync_command(args):
         return _report_store_error(e, console)
 
     # -- 4. Fill the changed (zone, year) pairs ------------------------------
-    fill_extra: List[str] = []
+    fill_extra: list[str] = []
     if rewrite:
         # A tile added since the last sync can fall inside a shard that
         # already exists, which the default skip-existing resume would skip.
@@ -3529,7 +3531,7 @@ def s3sync_command(args):
     else:
         console.print("[bold]==> [4/6] Filling[/bold]")
 
-    def fill_zone(zone: int, years: List[int]) -> bool:
+    def fill_zone(zone: int, years: list[int]) -> bool:
         log = logs / f"fill-z{zone}.log"
         for year in years:
             cmd = cli + [
@@ -3884,8 +3886,8 @@ def _parse_int_range(s: str) -> list[int]:
 
 
 def _find_registry(
-    base_dir: str, registry_dir: Optional[str] = None
-) -> Tuple[str, str]:
+    base_dir: str, registry_dir: str | None = None
+) -> tuple[str, str]:
     """Find the registry directory from base_dir. Returns (base_dir, registry_dir).
 
     Looks for either ``manifest.parquet`` (current per-version format) or the
@@ -3904,9 +3906,9 @@ def _find_registry(
 
 def _detect_dataset_metadata(
     base_dir: str,
-    explicit_version: Optional[str],
-    explicit_variant: Optional[str],
-) -> Tuple[str, str]:
+    explicit_version: str | None,
+    explicit_variant: str | None,
+) -> tuple[str, str]:
     """Resolve the (dataset_version, dataset_variant) for a local mirror.
 
     If the user passes the flags explicitly we honour them; otherwise we look
@@ -4060,7 +4062,7 @@ def _add_storage_args(parser, prefix: str, label: str, writable: bool = False) -
         )
 
 
-def _object_store_errors() -> Tuple[type, ...]:
+def _object_store_errors() -> tuple[type, ...]:
     """Exception types worth reporting as a message rather than a traceback.
 
     fsspec translates most S3 failures into builtin OSErrors — a 403 arrives
@@ -4070,7 +4072,7 @@ def _object_store_errors() -> Tuple[type, ...]:
     endpoint, unresolvable credentials); the tuple is short when the s3
     extra is not installed.
     """
-    types: Tuple[type, ...] = (PermissionError, OSError)
+    types: tuple[type, ...] = (PermissionError, OSError)
     try:
         from botocore.exceptions import BotoCoreError, ClientError
 
@@ -4109,7 +4111,7 @@ def _report_store_error(e: Exception, console: "Console") -> int:
 
 def _storage_options_for(
     args, prefix: str, location: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Build fsspec storage options from ``--{prefix}-*`` flags.
 
     Returns None for local paths so plain filesystem access never picks up
@@ -4151,10 +4153,10 @@ def _remote_registry_cache_dir(root: str, version_path: str) -> Path:
 def _sync_remote_file(
     loc: str,
     dest: Path,
-    storage_options: Optional[Dict[str, Any]],
+    storage_options: dict[str, Any] | None,
     console: "Console",
     optional: bool = False,
-) -> Optional[Path]:
+) -> Path | None:
     """Download *loc* to *dest* unless the cached copy already matches.
 
     Freshness is judged on the object's size and last-modified stamp, which
@@ -4532,7 +4534,7 @@ def zarr_fill_command(args):
     return 0
 
 
-def _stats_batch_kwarg(args, name: str) -> Dict[str, int]:
+def _stats_batch_kwarg(args, name: str) -> dict[str, int]:
     """``--stats-batch-size`` as a keyword, or nothing to keep the default."""
     value = getattr(args, "stats_batch_size", None)
     return {name: value} if value else {}

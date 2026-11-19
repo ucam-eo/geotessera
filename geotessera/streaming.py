@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 
+from ._typing import ProgressCallback
 from .inputs import parse_bbox
 from .registry import check_dataset_dir, dataset_tags, write_tessera_metadata
 from .remote import atomic_output
@@ -46,7 +47,7 @@ def export_region(
     depth=None,
     strip_rows=128,
     compress="lzw",
-    progress_callback=None,
+    progress_callback: ProgressCallback | None = None,
     dry_run=False,
 ):
     """Write one float32 GeoTIFF per intersecting UTM zone, in row strips.

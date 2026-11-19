@@ -53,7 +53,7 @@ from datetime import timedelta
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Union
+from collections.abc import Iterator
 
 import numpy as np
 import rasterio.transform
@@ -125,7 +125,7 @@ def _store_cache_key(location: str) -> str:
 GATEWAY_ENV = "GEOTESSERA_VIA_GATEWAY"
 
 
-def _via_gateway(explicit: Optional[bool]) -> bool:
+def _via_gateway(explicit: bool | None) -> bool:
     """Whether to read Source Cooperative through its gateway rather than S3.
 
     *explicit* wins; otherwise the :data:`GATEWAY_ENV` environment variable
@@ -136,7 +136,7 @@ def _via_gateway(explicit: Optional[bool]) -> bool:
     return os.environ.get(GATEWAY_ENV, "").strip().lower() not in ("", "0", "false")
 
 
-def _s3_mirror_location(location: str) -> Optional[str]:
+def _s3_mirror_location(location: str) -> str | None:
     """Rewrite a Source Cooperative gateway URL to the bucket's own endpoint.
 
     ``data.source.coop`` is a Cloudflare-fronted gateway that can choke under
@@ -154,7 +154,7 @@ def _s3_mirror_location(location: str) -> Optional[str]:
 PROXY_ENV = "GEOTESSERA_PROXY"
 
 
-def _proxy_location(location: str, proxy: Optional[str]) -> Optional[str]:
+def _proxy_location(location: str, proxy: str | None) -> str | None:
     """Rewrite a public mirror URL to the same path under a caching proxy.
 
     *proxy* stands in for the mirror root, so the store
@@ -177,11 +177,11 @@ def _proxy_location(location: str, proxy: Optional[str]) -> Optional[str]:
 
 
 def zarr_store(
-    location: Union[str, os.PathLike[str], ZarrStore],
-    cache_dir: Optional[Union[str, Path]] = None,
-    cache_max_size: Optional[int] = None,
-    via_gateway: Optional[bool] = None,
-    proxy: Optional[str] = None,
+    location: str | os.PathLike[str] | ZarrStore,
+    cache_dir: str | Path | None = None,
+    cache_max_size: int | None = None,
+    via_gateway: bool | None = None,
+    proxy: str | None = None,
 ) -> ZarrStore:
     """Open *location* as a ``zarr.abc.store.Store``.
 
@@ -349,7 +349,7 @@ def _prefetched(load, tops):
             yield ready
 
 
-def _progress_iter(items, label: str, total: Optional[int] = None):
+def _progress_iter(items, label: str, total: int | None = None):
     """Yield *items*, logging progress at INFO every few seconds.
 
     Short runs stay silent.  Pass ``total`` when *items* is lazy and must
@@ -459,7 +459,7 @@ def _bulk_sample(
     year: int,
     read=None,
     array: str = "embeddings",
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Nearest-pixel embeddings for arrays of zone-CRS points, in one read.
 
     Returns ``(values, cause)``: ``(N, B)`` float32, NaN wherever cause
@@ -519,9 +519,9 @@ def _bulk_sample(
 
 
 def _resolve_zone(
-    zone: Optional[int],
-    lon: Optional[float],
-    bbox: Optional[Tuple[float, float, float, float]],
+    zone: int | None,
+    lon: float | None,
+    bbox: tuple[float, float, float, float] | None,
 ) -> int:
     """UTM zone from exactly one of ``zone``, ``lon`` or ``bbox``.
 
@@ -545,11 +545,11 @@ def _resolve_zone(
     return _zone_for_lon((bbox[0] + bbox[2]) / 2)
 
 
-def _seam_neighbours(lon: float) -> List[int]:
+def _seam_neighbours(lon: float) -> list[int]:
     """Zones to try after the one containing *lon*.  Empty away from a seam."""
     z = _zone_for_lon(lon)
     frac = (lon + 180.0) % 6.0
-    out: List[int] = []
+    out: list[int] = []
     if frac <= SEAM_DEGREES:
         out.append(60 if z == 1 else z - 1)
     if frac >= 6.0 - SEAM_DEGREES:
@@ -577,7 +577,7 @@ def _patch_crs(lon: float, lat: float) -> str:
     return CRS.from_json_dict(named).to_wkt()
 
 
-def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
+def _zones_spanned(lons: list[float], centre_lon: float) -> list[int]:
     """The contiguous run of UTM zones covering *lons*, walked the short
     way round the ring so a patch on the antimeridian gets ``[60, 1]``."""
     zc = _zone_for_lon(centre_lon)
@@ -591,8 +591,8 @@ def _zones_spanned(lons: List[float], centre_lon: float) -> List[int]:
 
 
 def _utm_envelope(
-    bbox: Tuple[float, float, float, float], crs: str
-) -> Tuple[float, float, float, float]:
+    bbox: tuple[float, float, float, float], crs: str
+) -> tuple[float, float, float, float]:
     """The UTM extent enclosing a lon/lat bbox, including curved edges.
 
     Northing extremes can fall between the corners as the grid curves away
@@ -604,9 +604,9 @@ def _utm_envelope(
 def open_zone(
     store_url: str = DEFAULT_STORE,
     *,
-    zone: Optional[int] = None,
-    lon: Optional[float] = None,
-    bbox: Optional[Tuple[float, float, float, float]] = None,
+    zone: int | None = None,
+    lon: float | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
     **kwargs,
 ) -> xr.Dataset:
     """Open a tessera zone as an xarray Dataset.
@@ -747,7 +747,7 @@ class TesseraAccessor:
         year: int,
         *,
         search_px: int = SEAM_SEARCH_PX,
-    ) -> Tuple[Optional[np.ndarray], str]:
+    ) -> tuple[np.ndarray | None, str]:
         """Sample at UTM ``(e, n)``, reporting why when there is no value.
 
         Returns ``(embedding, status)``, the status one of ``valid``,
@@ -794,7 +794,7 @@ class TesseraAccessor:
 
     def sample_points(
         self,
-        coords: List[Tuple[float, float]],
+        coords: list[tuple[float, float]],
         year: int,
         *,
         progress: bool = True,
@@ -849,12 +849,12 @@ class TesseraAccessor:
 
     def read_region(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int,
         *,
         array: str = "embeddings",
         progress: bool = False,
-    ) -> Tuple[np.ndarray, rasterio.transform.Affine]:
+    ) -> tuple[np.ndarray, rasterio.transform.Affine]:
         """Read and dequantise a bbox region.
 
         Args:
@@ -872,12 +872,12 @@ class TesseraAccessor:
 
     def read_region_quantized(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int,
         *,
         array: str = "embeddings",
         progress: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray, rasterio.transform.Affine]:
+    ) -> tuple[np.ndarray, np.ndarray, rasterio.transform.Affine]:
         """Read a bbox region without dequantising.
 
         Returns ``(embeddings, scales, transform)`` with embeddings int8
@@ -892,13 +892,13 @@ class TesseraAccessor:
 
     def iter_region(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int,
         *,
         array: str = "embeddings",
         strip_rows: int = 512,
         progress: bool = False,
-    ) -> Iterator[Tuple[np.ndarray, rasterio.transform.Affine]]:
+    ) -> Iterator[tuple[np.ndarray, rasterio.transform.Affine]]:
         """:meth:`read_region` as a stream of row strips.
 
         Yields ``(block, transform)`` top to bottom, each block a
@@ -993,11 +993,11 @@ class GeoTesseraZarr:
 
     def __init__(
         self,
-        store_url: Union[str, os.PathLike[str], ZarrStore] = DEFAULT_STORE,
-        cache_dir: Optional[Union[str, Path]] = None,
-        cache_max_size: Optional[int] = None,
-        via_gateway: Optional[bool] = None,
-        proxy: Optional[str] = None,
+        store_url: str | os.PathLike[str] | ZarrStore = DEFAULT_STORE,
+        cache_dir: str | Path | None = None,
+        cache_max_size: int | None = None,
+        via_gateway: bool | None = None,
+        proxy: str | None = None,
     ):
         from .icechunk import IcechunkStore, is_icechunk_location
 
@@ -1116,9 +1116,9 @@ class GeoTesseraZarr:
     def open_zone(
         self,
         *,
-        zone: Optional[int] = None,
-        lon: Optional[float] = None,
-        bbox: Optional[Tuple[float, float, float, float]] = None,
+        zone: int | None = None,
+        lon: float | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
     ) -> xr.Dataset:
         """Open a zone Dataset with the ``.tessera`` accessor.
 
@@ -1176,7 +1176,7 @@ class GeoTesseraZarr:
         *,
         cross_zone: bool = True,
         search_px: int = SEAM_SEARCH_PX,
-    ) -> Tuple[Optional[np.ndarray], str]:
+    ) -> tuple[np.ndarray | None, str]:
         """:meth:`sample_at`, reporting why when there is no value.
 
         Returns ``(embedding, status)``; see :meth:`TesseraAccessor.probe`.
@@ -1218,13 +1218,13 @@ class GeoTesseraZarr:
 
     def sample_points(
         self,
-        coords: List[Tuple[float, float]],
+        coords: list[tuple[float, float]],
         year: int,
         *,
         progress: bool = True,
         cross_zone: bool = True,
         search_px: int = SEAM_SEARCH_PX,
-        depth: Optional[int] = None,
+        depth: int | None = None,
     ) -> np.ndarray:
         """Sample embeddings at points, routing each to its zone.
 
@@ -1289,7 +1289,7 @@ class GeoTesseraZarr:
             )[:n_bands]
         return values
 
-    def _embeddings_array(self, depth: Optional[int]) -> Tuple[str, int]:
+    def _embeddings_array(self, depth: int | None) -> tuple[str, int]:
         """Array name and band count for *depth*; None selects the full array."""
         if depth is None:
             return "embeddings", self.n_bands
@@ -1320,12 +1320,12 @@ class GeoTesseraZarr:
 
     def read_region(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int,
         *,
-        depth: Optional[int] = None,
+        depth: int | None = None,
         progress: bool = False,
-    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+    ) -> tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Read and dequantise a bbox region.
 
         Args:
@@ -1362,12 +1362,12 @@ class GeoTesseraZarr:
 
     def read_region_quantized(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int,
         *,
-        depth: Optional[int] = None,
+        depth: int | None = None,
         progress: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray, rasterio.transform.Affine, str]:
+    ) -> tuple[np.ndarray, np.ndarray, rasterio.transform.Affine, str]:
         """:meth:`read_region` without dequantising.
 
         Returns ``(embeddings, scales, transform, crs)`` with embeddings
@@ -1389,13 +1389,13 @@ class GeoTesseraZarr:
 
     def iter_region(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int,
         *,
-        depth: Optional[int] = None,
+        depth: int | None = None,
         strip_rows: int = 512,
         progress: bool = False,
-    ) -> Iterator[Tuple[np.ndarray, rasterio.transform.Affine, str]]:
+    ) -> Iterator[tuple[np.ndarray, rasterio.transform.Affine, str]]:
         """:meth:`read_region` as a stream of row strips.
 
         Yields ``(block, transform, crs)`` top to bottom; see
@@ -1445,11 +1445,11 @@ class GeoTesseraZarr:
         year: int,
         size_px: int,
         *,
-        depth: Optional[int] = None,
-        dst_crs: Optional[str] = None,
+        depth: int | None = None,
+        dst_crs: str | None = None,
         resampling: str = "nearest",
         progress: bool = False,
-    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+    ) -> tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Read a fixed-size square patch centred on a point.
 
         Returns ``(patch, transform, crs)``.  The patch is exactly
@@ -1534,7 +1534,7 @@ class GeoTesseraZarr:
         year: int,
         size_px: int,
         array: str,
-    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+    ) -> tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Slice a patch straight off one zone's grid, NaN-padded at edges.
 
         One getitem through zarr's own pipeline; reading through dask
@@ -1570,7 +1570,7 @@ class GeoTesseraZarr:
 
     def _read_patch_merged(
         self,
-        zones: List[int],
+        zones: list[int],
         target_crs: str,
         lon: float,
         lat: float,
@@ -1580,7 +1580,7 @@ class GeoTesseraZarr:
         array: str,
         n_bands: int,
         resampling: str,
-    ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
+    ) -> tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Merge each zone's native pixels onto one patch-centred grid."""
         ce, cn = _project(lon, lat, "EPSG:4326", target_crs)
         # The point lands on the centre of pixel [size_px // 2, size_px // 2].

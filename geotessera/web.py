@@ -5,8 +5,9 @@ visualizations using Leaflet and other web technologies.
 """
 
 from pathlib import Path
-from typing import List, Tuple, Optional, Callable
 import logging
+
+from ._typing import ProgressCallback
 
 # Module-level logger
 logger = logging.getLogger(__name__)
@@ -16,7 +17,7 @@ def prepare_mosaic_for_web(
     input_mosaic: str,
     output_path: str,
     target_crs: str = "EPSG:3857",
-    progress_callback: Optional[Callable] = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Prepare an RGB mosaic for web visualization by reprojecting if needed.
 
@@ -62,7 +63,7 @@ def prepare_mosaic_for_web(
 def geotiff_to_web_tiles(
     geotiff_path: str,
     output_dir: str,
-    zoom_levels: Tuple[int, int] = (8, 15),
+    zoom_levels: tuple[int, int] = (8, 15),
     use_gdal_raster: bool = False,
 ) -> str:
     """Convert GeoTIFF to web tiles for interactive display.
@@ -199,7 +200,7 @@ def create_simple_web_viewer(
     center_lat: float = 0,
     zoom: int = 10,
     title: str = "GeoTessera Visualization",
-    region_file: str = None,
+    region_file: str | None = None,
 ) -> str:
     """Create a simple HTML viewer for web tiles.
 
@@ -261,7 +262,7 @@ def create_simple_web_viewer(
 
 
 def create_coverage_summary_map(
-    geotiff_paths: List[str], output_html: str, title: str = "GeoTessera Coverage Map"
+    geotiff_paths: list[str], output_html: str, title: str = "GeoTessera Coverage Map"
 ) -> str:
     """Create an HTML map showing tile coverage.
 

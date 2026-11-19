@@ -1,10 +1,11 @@
 """Country lookup functionality using Natural Earth data."""
 
-from typing import Tuple, Optional, List, Dict, Callable
 import geopandas as gpd
 import pooch
 from pathlib import Path
 import difflib
+
+from ._typing import ProgressCallback
 
 
 class CountryLookup:
@@ -12,8 +13,8 @@ class CountryLookup:
 
     def __init__(
         self,
-        cache_dir: Optional[Path] = None,
-        progress_callback: Optional[Callable] = None,
+        cache_dir: Path | None = None,
+        progress_callback: ProgressCallback | None = None,
     ):
         """Initialize with optional cache directory for Natural Earth data.
 
@@ -27,8 +28,8 @@ class CountryLookup:
             self._cache_dir = Path(pooch.os_cache("geotessera"))
 
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._countries_gdf: Optional[gpd.GeoDataFrame] = None
-        self._name_lookup: Optional[Dict[str, str]] = None
+        self._countries_gdf: gpd.GeoDataFrame | None = None
+        self._name_lookup: dict[str, str] | None = None
         self._progress_callback = progress_callback
 
     def _get_countries_data_path(self) -> Path:
@@ -53,7 +54,7 @@ class CountryLookup:
             self._countries_gdf = gpd.read_file(geojson_path)
         return self._countries_gdf
 
-    def _build_name_lookup(self) -> Dict[str, str]:
+    def _build_name_lookup(self) -> dict[str, str]:
         """Build lookup dictionary for country name variations."""
         if self._name_lookup is not None:
             return self._name_lookup
@@ -119,7 +120,7 @@ class CountryLookup:
             f"Country '{country_name}' not found. Use list_countries() to see available options."
         )
 
-    def get_bbox(self, country_name: str) -> Tuple[float, float, float, float]:
+    def get_bbox(self, country_name: str) -> tuple[float, float, float, float]:
         """Get bounding box for country as (west, south, east, north)."""
         canonical_name = self._resolve_country_name(country_name)
         countries = self._load_countries_data()
@@ -142,7 +143,7 @@ class CountryLookup:
 
         return country_gdf
 
-    def list_countries(self) -> List[str]:
+    def list_countries(self) -> list[str]:
         """List all available country names."""
         countries = self._load_countries_data()
         return sorted(countries["NAME_EN"].dropna().tolist())
@@ -152,7 +153,9 @@ class CountryLookup:
 _country_lookup = None
 
 
-def get_country_lookup(progress_callback: Optional[Callable] = None) -> CountryLookup:
+def get_country_lookup(
+    progress_callback: ProgressCallback | None = None,
+) -> CountryLookup:
     """Get global CountryLookup instance.
 
     Args:
@@ -165,8 +168,8 @@ def get_country_lookup(progress_callback: Optional[Callable] = None) -> CountryL
 
 
 def get_country_bbox(
-    country_name: str, progress_callback: Optional[Callable] = None
-) -> Tuple[float, float, float, float]:
+    country_name: str, progress_callback: ProgressCallback | None = None
+) -> tuple[float, float, float, float]:
     """Simple function to get country bounding box.
 
     Args:

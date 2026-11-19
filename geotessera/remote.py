@@ -31,7 +31,8 @@ import tempfile
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any
+from collections.abc import Iterator
 
 import numpy as np
 
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def atomic_output(dest: Optional[str | Path], suffix: str = "") -> Iterator[Path]:
+def atomic_output(dest: str | Path | None, suffix: str = "") -> Iterator[Path]:
     """Yield a temporary path that atomically becomes *dest* on success.
 
     The temp file is created in *dest*'s directory (created if needed) so the
@@ -207,15 +208,15 @@ OBJECT_ACLS = (
 
 
 def build_storage_options(
-    endpoint_url: Optional[str] = None,
+    endpoint_url: str | None = None,
     anon: bool = False,
-    region: Optional[str] = None,
-    profile: Optional[str] = None,
+    region: str | None = None,
+    profile: str | None = None,
     requester_pays: bool = False,
-    acl: Optional[str] = None,
+    acl: str | None = None,
     path_style: bool = False,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Assemble an fsspec storage-options dict for an S3-compatible endpoint.
 
     Unset arguments fall back to the conventional environment variables
@@ -238,7 +239,7 @@ def build_storage_options(
     Returns ``None`` when nothing needs configuring, so callers can pass the
     result through to zarr unchanged.
     """
-    options: Dict[str, Any] = {}
+    options: dict[str, Any] = {}
 
     endpoint_url = endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or None
     if endpoint_url:
@@ -280,7 +281,7 @@ def build_storage_options(
     return options or None
 
 
-def _options_key(storage_options: Optional[Dict[str, Any]]) -> str:
+def _options_key(storage_options: dict[str, Any] | None) -> str:
     """Stable hashable key for a storage-options dict."""
     if not storage_options:
         return ""
@@ -353,7 +354,7 @@ def _filesystem_cached(protocol: str, options_key: str):
         ) from e
 
 
-def get_fs(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None):
+def get_fs(loc: str | Path, storage_options: dict[str, Any] | None = None):
     """Return an fsspec filesystem for *loc*, or ``None`` for local paths."""
     if not is_url(loc):
         return None
@@ -362,8 +363,8 @@ def get_fs(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None):
 
 def exists(
     loc: str | Path,
-    storage_options: Optional[Dict[str, Any]] = None,
-    on_denied: Optional[bool] = None,
+    storage_options: dict[str, Any] | None = None,
+    on_denied: bool | None = None,
 ) -> bool:
     """True if *loc* exists, locally or remotely.
 
@@ -392,9 +393,7 @@ def exists(
         return on_denied
 
 
-def read_bytes(
-    loc: str | Path, storage_options: Optional[Dict[str, Any]] = None
-) -> bytes:
+def read_bytes(loc: str | Path, storage_options: dict[str, Any] | None = None) -> bytes:
     """Read a whole object/file into memory."""
     fs = get_fs(loc, storage_options)
     if fs is None:
@@ -405,7 +404,7 @@ def read_bytes(
 def write_bytes(
     loc: str | Path,
     data: bytes,
-    storage_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, Any] | None = None,
 ) -> None:
     """Write *data* to *loc*, creating parent directories for local paths."""
     fs = get_fs(loc, storage_options)
@@ -418,7 +417,7 @@ def write_bytes(
         f.write(data)
 
 
-def remove(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None) -> None:
+def remove(loc: str | Path, storage_options: dict[str, Any] | None = None) -> None:
     """Delete *loc*, ignoring a missing target."""
     fs = get_fs(loc, storage_options)
     try:
@@ -434,8 +433,8 @@ def remove(loc: str | Path, storage_options: Optional[Dict[str, Any]] = None) ->
 
 def listdir(
     loc: str | Path,
-    storage_options: Optional[Dict[str, Any]] = None,
-    on_denied: Optional[list] = None,
+    storage_options: dict[str, Any] | None = None,
+    on_denied: list | None = None,
 ) -> list[str]:
     """List the immediate children of a directory/prefix, as full locations.
 
@@ -478,7 +477,7 @@ def listdir(
 def download(
     loc: str | Path,
     dest: Path,
-    storage_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, Any] | None = None,
 ) -> Path:
     """Copy a remote object to a local file, writing atomically."""
     dest = Path(dest)
@@ -494,14 +493,14 @@ def download(
 # Per-process memo of parsed .npy headers: loc -> (shape, dtype, data_offset).
 # Each tile is read once per shard it overlaps, so this saves a small ranged
 # GET on the second and subsequent reads.
-_npy_header_cache: Dict[str, Tuple[Tuple[int, ...], np.dtype, int]] = {}
+_npy_header_cache: dict[str, tuple[tuple[int, ...], np.dtype, int]] = {}
 
 # Enough for any 1.0/2.0 header; the spec pads them to a 64-byte boundary and
 # real Tessera tiles use 128 bytes.
 _HEADER_PROBE_BYTES = 4096
 
 
-def _parse_npy_header(head: bytes) -> Tuple[Tuple[int, ...], np.dtype, int]:
+def _parse_npy_header(head: bytes) -> tuple[tuple[int, ...], np.dtype, int]:
     """Parse a .npy header prefix into (shape, dtype, data_offset).
 
     Raises ValueError for Fortran-ordered arrays, whose rows are not
@@ -520,7 +519,7 @@ def _parse_npy_header(head: bytes) -> Tuple[Tuple[int, ...], np.dtype, int]:
     return tuple(shape), dtype, f.tell()
 
 
-def _npy_header(loc: str, storage_options: Optional[Dict[str, Any]]):
+def _npy_header(loc: str, storage_options: dict[str, Any] | None):
     """Fetch and memoise the header of a remote .npy file."""
     cached = _npy_header_cache.get(loc)
     if cached is not None:
@@ -542,7 +541,7 @@ def read_npy_window(
     row_end: int,
     col_start: int,
     col_end: int,
-    storage_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Read ``arr[row_start:row_end, col_start:col_end, ...]`` from a .npy file.
 
@@ -588,7 +587,7 @@ def read_tiff_window(
     col_start: int,
     col_end: int,
     band: int = 1,
-    storage_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Read a window from a single-band GeoTIFF, locally or remotely.
 

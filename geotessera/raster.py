@@ -10,6 +10,7 @@ from rasterio.merge import merge
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform
 
+from ._typing import ProgressCallback
 from .remote import atomic_output
 
 
@@ -38,7 +39,7 @@ def merge_geotiffs(
     output_path,
     target_crs="EPSG:3857",
     compress="lzw",
-    progress_callback=None,
+    progress_callback: ProgressCallback | None = None,
     *,
     bands=None,
     bounds=None,
@@ -144,7 +145,11 @@ def merge_geotiffs(
 
 
 def create_rgb(
-    paths, output_path, bands=(0, 1, 2), target_crs="EPSG:3857", progress_callback=None
+    paths,
+    output_path,
+    bands=(0, 1, 2),
+    target_crs="EPSG:3857",
+    progress_callback: ProgressCallback | None = None,
 ):
     """Select bands before merging, then normalize and write RGB by window."""
     if len(bands) != 3:
