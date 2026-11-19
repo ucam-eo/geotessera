@@ -5,18 +5,19 @@ and mosaic creation. Web/tile generation functions are in the web submodule.
 """
 
 from pathlib import Path
-from typing import Union, List, Tuple, Optional, Dict, Callable
 import logging
 
 import numpy as np
 import geopandas as gpd
 import pandas as pd
 
+from ._typing import ProgressCallback
+
 # Module-level logger
 logger = logging.getLogger(__name__)
 
 
-def analyze_geotiff_coverage(geotiff_paths: List[str]) -> Dict:
+def analyze_geotiff_coverage(geotiff_paths: list[str]) -> dict:
     """Analyze coverage and metadata of GeoTIFF files.
 
     Args:
@@ -123,18 +124,18 @@ def analyze_geotiff_coverage(geotiff_paths: List[str]) -> Dict:
 
 
 def visualize_sources_coverage(
-    manifest_path: Union[str, Path, List[Union[str, Path]]],
+    manifest_path: str | Path | list[str | Path],
     output_path: str = "tessera_sources.png",
-    year: Optional[int] = None,
+    year: int | None = None,
     width_pixels: int = 2000,
     show_countries: bool = True,
     tile_alpha: float = 0.6,
     tile_size: float = 1.0,
-    versions: Optional[List[str]] = None,
-    variants: Optional[List[str]] = None,
-    region_bbox: Optional[Tuple[float, float, float, float]] = None,
-    region_file: Optional[str] = None,
-    progress_callback: Optional[Callable] = None,
+    versions: list[str] | None = None,
+    variants: list[str] | None = None,
+    region_bbox: tuple[float, float, float, float] | None = None,
+    region_file: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Render coverage colored by ``(version, variant)`` source from a manifest.
 
@@ -177,7 +178,7 @@ def visualize_sources_coverage(
     if progress_callback:
         progress_callback(0, 100, "Loading manifest(s)...")
     if isinstance(manifest_path, (str, Path)):
-        manifest_paths: List[Union[str, Path]] = [manifest_path]
+        manifest_paths: list[str | Path] = [manifest_path]
     else:
         manifest_paths = list(manifest_path)
     # Manifests carry per-file columns (paths, hashes, sizes) that a coverage
@@ -375,16 +376,16 @@ def visualize_sources_coverage(
 def visualize_global_coverage(
     tessera_client,
     output_path: str = "tessera_coverage.png",
-    year: Optional[int] = None,
+    year: int | None = None,
     width_pixels: int = 2000,
     show_countries: bool = True,
     tile_color: str = "red",
     tile_alpha: float = 0.6,
     tile_size: float = 1.0,
-    progress_callback: Optional[Callable] = None,
+    progress_callback: ProgressCallback | None = None,
     multi_year_colors: bool = True,
-    region_bbox: Optional[Tuple[float, float, float, float]] = None,
-    region_file: Optional[str] = None,
+    region_bbox: tuple[float, float, float, float] | None = None,
+    region_file: str | None = None,
 ) -> str:
     """Create a world map visualization showing Tessera embedding coverage.
 
@@ -757,11 +758,11 @@ def visualize_global_coverage(
 def visualize_tile_registry_coverage(
     tiles: pd.DataFrame,
     output_path: str = "tessera_coverage.png",
-    year: Optional[int] = None,
+    year: int | None = None,
     width_pixels: int = 2000,
     show_countries: bool = True,
     tile_alpha: float = 0.6,
-    region_bbox: Optional[Tuple[float, float, float, float]] = None,
+    region_bbox: tuple[float, float, float, float] | None = None,
     region_file=None,
     title: str = "Tessera Embedding Coverage",
 ) -> str:
@@ -878,11 +879,11 @@ def visualize_tile_registry_coverage(
 
 
 def create_rgb_mosaic(
-    geotiff_paths: List[str],
+    geotiff_paths: list[str],
     output_path: str,
-    bands: Tuple[int, int, int] = (0, 1, 2),
+    bands: tuple[int, int, int] = (0, 1, 2),
     target_crs: str = "EPSG:3857",
-    progress_callback: Optional[Callable] = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Create an RGB visualization mosaic from multiple GeoTIFF files.
 
@@ -904,8 +905,8 @@ def create_rgb_mosaic(
 
 
 def calculate_bbox_from_file(
-    filepath: Union[str, Path],
-) -> Tuple[float, float, float, float]:
+    filepath: str | Path,
+) -> tuple[float, float, float, float]:
     """Calculate bounding box from a geometry file.
 
     Args:
@@ -920,8 +921,8 @@ def calculate_bbox_from_file(
 
 
 def calculate_bbox_from_points(
-    points: Union[List[Dict], pd.DataFrame], buffer_degrees: float = 0.1
-) -> Tuple[float, float, float, float]:
+    points: list[dict] | pd.DataFrame, buffer_degrees: float = 0.1
+) -> tuple[float, float, float, float]:
     """Calculate bounding box from point data.
 
     Args:
@@ -948,13 +949,13 @@ def calculate_bbox_from_points(
 
 
 def create_pca_mosaic(
-    tiles_data: List[Dict],
+    tiles_data: list[dict],
     output_path: str,
     n_components: int = 3,
     target_crs: str = "EPSG:3857",
-    progress_callback: Optional[Callable] = None,
+    progress_callback: ProgressCallback | None = None,
     balance_method: str = "histogram",
-    percentile_range: Tuple[float, float] = (2, 98),
+    percentile_range: tuple[float, float] = (2, 98),
 ) -> str:
     """Create a PCA mosaic with shared fitting and windowed transformation.
 

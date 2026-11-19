@@ -13,8 +13,7 @@ import urllib.parse
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Optional, Callable
-from typing_extensions import Annotated
+from typing import Annotated
 
 import typer
 from rich.logging import RichHandler
@@ -34,6 +33,7 @@ from rich.table import Table
 from rich.text import Text
 from rich import print as rprint
 
+from ._typing import ProgressCallback
 from .core import GeoTessera
 from .visualization import (
     create_pca_mosaic,
@@ -117,7 +117,7 @@ def global_options(
         "Zarr reads use direct AWS HTTPS by default. Place this flag before "
         "the command, or set GEOTESSERA_VIA_GATEWAY=1.",
     ),
-    proxy: Optional[str] = typer.Option(
+    proxy: str | None = typer.Option(
         None,
         "--proxy",
         metavar="URL",
@@ -208,10 +208,10 @@ def create_progress(*args, **kwargs):
         return Progress(*args, **kwargs)
 
 
-def create_progress_callback(progress: Progress, task_id: TaskID) -> Callable:
+def create_progress_callback(progress: Progress, task_id: TaskID) -> ProgressCallback:
     """Create a progress callback for core library operations."""
 
-    def progress_callback(current: int, total: int, status: str = None):
+    def progress_callback(current: int, total: int, status: str | None = None) -> None:
         if status:
             progress.update(task_id, completed=current, total=total, status=status)
         else:
@@ -223,13 +223,13 @@ def create_progress_callback(progress: Progress, task_id: TaskID) -> Callable:
 @app.command()
 def info(
     tiles_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--tiles", help="Inspect a local GeoTIFF or NPY file or directory."
         ),
     ] = None,
     geotiffs: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--geotiffs",
             help="Use the deprecated alias for --tiles.",
@@ -243,7 +243,7 @@ def info(
         ),
     ] = "v1.1",
     dataset_variant: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--dataset-variant",
             help="Select the dataset variant. If omitted, use the version's default in the chosen format. Run geotessera info to list them.",
@@ -562,35 +562,35 @@ def coverage(
         ),
     ] = Path("tessera_coverage.png"),
     year: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             "--year",
             help="Show one year. If omitted, show all available years.",
         ),
     ] = None,
     region_file: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--region-file",
             help="Limit the PNG map to a vector region from a file or URL.",
         ),
     ] = None,
     country: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--country",
             help="Select a country by name or code, such as United Kingdom or GB.",
         ),
     ] = None,
     bbox: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--bbox",
             help="Select WGS84 bounds as west,south,east,north, or one tile as lon,lat.",
         ),
     ] = None,
     tile: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("--tile", help="Select the 0.1-degree tile containing lon,lat."),
     ] = None,
     tile_color: Annotated[
@@ -628,27 +628,27 @@ def coverage(
         ),
     ] = False,
     dataset_version: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--dataset-version",
             help="Select a version, or all. The default is v1.1, or all with --by-source.",
         ),
     ] = None,
     dataset_variant: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--dataset-variant",
             help="Select a variant, or all. The default is the version's default variant, or all with --by-source.",
         ),
     ] = None,
     cache_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--cache-dir", help="Cache downloaded manifests in this directory."
         ),
     ] = None,
     registry_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--registry-dir",
             help="Read manifest.parquet and landmasks.parquet from this directory.",
@@ -1082,7 +1082,7 @@ def coverage(
 @app.command()
 def download(
     output: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--output",
             "-o",
@@ -1090,25 +1090,25 @@ def download(
         ),
     ] = None,
     bbox: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--bbox",
             help="Select WGS84 bounds as west,south,east,north, or one tile as lon,lat.",
         ),
     ] = None,
     tile: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("--tile", help="Select the 0.1-degree tile containing lon,lat."),
     ] = None,
     region_file: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--region-file",
             help="Select a vector region from a file or URL. Zarr uses its bounding box.",
         ),
     ] = None,
     country: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--country",
             help="Select a country by name or code, such as United Kingdom or GB.",
@@ -1126,7 +1126,7 @@ def download(
         int, typer.Option("--year", help="Select the embedding year.")
     ] = 2024,
     bands: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--bands",
             help="Select comma-separated, zero-based bands for TIFF output. The default is all bands at the selected depth.",
@@ -1147,21 +1147,21 @@ def download(
         ),
     ] = "v1.1",
     dataset_variant: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--dataset-variant",
             help="Select the dataset variant. If omitted, use the version's default in the chosen format. Run geotessera info to list them.",
         ),
     ] = None,
     cache_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--cache-dir",
             help="Set the metadata cache directory. Zarr byte-range reads are cached within the process.",
         ),
     ] = None,
     registry_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--registry-dir",
             help="Read local manifests from this directory. This selects tiles in auto mode.",
@@ -1185,14 +1185,14 @@ def download(
         ),
     ] = DownloadSource.auto,
     store_url: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--store-url",
             help="Read Zarr from this URL or local path, overriding the dataset options.",
         ),
     ] = None,
     depth: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             "--depth",
             help="Read a published Zarr embedding prefix. If omitted, read the full embedding.",
@@ -1839,8 +1839,8 @@ def visualize(
         try:
             # Create a progress callback that maps to our 5-step progress
             def visualization_progress_callback(
-                current: float, total: float, status: str = None
-            ):
+                current: float, total: float, status: str | None = None
+            ) -> None:
                 progress.update(
                     task,
                     completed=current,
@@ -1879,11 +1879,11 @@ def visualize(
 @app.command()
 def webmap(
     rgb_mosaic: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Argument(help="Read this RGB GeoTIFF. Omit it to stream a Zarr region."),
     ] = None,
     output: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--output",
             "-o",
@@ -1928,7 +1928,7 @@ def webmap(
         ),
     ] = 8000,
     region_file: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--region-file",
             help="Overlay a vector boundary from a file or URL. In Zarr mode, also select its bounding box.",
@@ -1942,18 +1942,18 @@ def webmap(
         ),
     ] = False,
     bbox: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--bbox",
             help="Select WGS84 bounds as west,south,east,north, or one tile as lon,lat.",
         ),
     ] = None,
     tile: Annotated[
-        Optional[str],
+        str | None,
         typer.Option("--tile", help="Select the 0.1-degree tile containing lon,lat."),
     ] = None,
     country: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--country",
             help="Select a country by name or code, such as United Kingdom or GB.",
@@ -1970,21 +1970,21 @@ def webmap(
         ),
     ] = "v1.1",
     dataset_variant: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--dataset-variant",
             help="Select the dataset variant. If omitted, use the version's default in the chosen format. Run geotessera info to list them.",
         ),
     ] = None,
     store_url: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--store-url",
             help="Read Zarr from this URL or local path, overriding the dataset options.",
         ),
     ] = None,
     cache_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
             "--cache-dir",
             help="Set the metadata cache directory. Zarr byte-range reads are cached within the process.",
@@ -1998,7 +1998,7 @@ def webmap(
         ),
     ] = "0,1,2",
     depth: Annotated[
-        Optional[int],
+        int | None,
         typer.Option(
             "--depth",
             help="Read a published Zarr embedding prefix. If omitted, read the full embedding.",
@@ -2264,7 +2264,7 @@ def serve(
         bool, typer.Option("--open/--no-open", help="Open the viewer in a browser.")
     ] = True,
     html_file: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--html", help="Open this HTML file relative to the served directory."
         ),

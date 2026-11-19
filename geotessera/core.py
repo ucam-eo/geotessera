@@ -6,12 +6,13 @@ The library focusses on:
 """
 
 from pathlib import Path
-from typing import Union, List, Tuple, Optional, Dict, Generator, Iterable
+from collections.abc import Generator, Iterable
 import json
 import logging
 import numpy as np
 import geopandas as gpd
 
+from ._typing import ProgressCallback
 from .registry import (
     Registry,
     EMBEDDINGS_DIR_NAME,
@@ -95,13 +96,13 @@ class GeoTessera:
     def __init__(
         self,
         dataset_version: str = "v1.1",
-        dataset_variant: Optional[str] = None,
-        cache_dir: Optional[Union[str, Path]] = None,
-        embeddings_dir: Optional[Union[str, Path]] = None,
-        registry_url: Optional[str] = None,
-        registry_path: Optional[Union[str, Path]] = None,
-        registry_dir: Optional[Union[str, Path]] = None,
-        bbox: Optional[Tuple[float, float, float, float]] = None,
+        dataset_variant: str | None = None,
+        cache_dir: str | Path | None = None,
+        embeddings_dir: str | Path | None = None,
+        registry_url: str | None = None,
+        registry_path: str | Path | None = None,
+        registry_dir: str | Path | None = None,
+        bbox: tuple[float, float, float, float] | None = None,
         bbox_margin_deg: float = 0.15,
     ):
         """Initialize a client for downloading and reading individual tiles.
@@ -168,7 +169,7 @@ class GeoTessera:
         return self.registry.embeddings_subdir
 
     def embeddings_count(
-        self, bbox: Tuple[float, float, float, float], year: int = 2024
+        self, bbox: tuple[float, float, float, float], year: int = 2024
     ) -> int:
         """Get total number of embedding tiles within a bounding box.
 
@@ -184,9 +185,9 @@ class GeoTessera:
 
     def export_coverage_map(
         self,
-        output_file: Optional[str] = None,
-        dataset_id: Optional[str] = None,
-    ) -> Dict:
+        output_file: str | None = None,
+        dataset_id: str | None = None,
+    ) -> dict:
         """Generate global coverage map showing which tiles have embeddings for which years.
 
         This method loads all registry data and creates a coverage map that can be used
@@ -294,9 +295,9 @@ class GeoTessera:
 
     def generate_coverage_texture(
         self,
-        coverage_data: Dict,
-        output_file: Optional[str] = None,
-        tint_color: Optional[Tuple[int, int, int]] = None,
+        coverage_data: dict,
+        output_file: str | None = None,
+        tint_color: tuple[int, int, int] | None = None,
     ) -> str:
         """Generate coverage texture image for globe visualization.
 
@@ -380,7 +381,7 @@ class GeoTessera:
     def _get_tile_color(
         self,
         key: str,
-        tiles_dict: Dict,
+        tiles_dict: dict,
         no_coverage_set: set,
         all_years: list,
         max_years: int,
@@ -420,9 +421,9 @@ class GeoTessera:
     # returns a generator
     def fetch_embeddings(
         self,
-        tiles_to_fetch: Iterable[Tuple[int, float, float]],
-        progress_callback: Optional[callable] = None,
-    ) -> Generator[Tuple[int, float, float, np.ndarray, object, object], None, None]:
+        tiles_to_fetch: Iterable[tuple[int, float, float]],
+        progress_callback: ProgressCallback | None = None,
+    ) -> Generator[tuple[int, float, float, np.ndarray, object, object], None, None]:
         """Yield requested tiles with their CRS and transform.
 
         Process one tile at a time. A failed fetch raises ``RuntimeError``
@@ -431,7 +432,7 @@ class GeoTessera:
 
         Args:
             tiles_to_fetch: List of tiles to fetch as (year, tile_lon, tile_lat) tuples
-            progress_callback: Optional callback function(current, total) for progress tracking
+            progress_callback: Optional callback function(current, total, status) for progress tracking
 
         Returns:
             Generator of (year, tile_lon, tile_lat, embedding_array, crs, transform) tuples where:
@@ -451,8 +452,8 @@ class GeoTessera:
             try:
                 # Create a sub-progress callback for this tile's downloads
                 def tile_progress_callback(
-                    current: int, total: int, status: str = None
-                ):
+                    current: int, total: int, status: str | None = None
+                ) -> None:
                     if progress_callback:
                         # Map individual file progress to overall tile progress
                         tile_progress = (
@@ -489,10 +490,10 @@ class GeoTessera:
         required_coords: set,
         year: int,
         auto_download: bool,
-        bbox: Optional[Tuple[float, float, float, float]] = None,
-        progress_callback: Optional[callable] = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        progress_callback: ProgressCallback | None = None,
         progress_offset: int = 0,
-        progress_total: Optional[int] = None,
+        progress_total: int | None = None,
     ) -> dict:
         """Ensure required tiles are available locally, downloading if needed.
 
@@ -602,12 +603,12 @@ class GeoTessera:
 
     def fetch_mosaic_for_region(
         self,
-        bbox: Tuple[float, float, float, float],
+        bbox: tuple[float, float, float, float],
         year: int = 2024,
         target_crs: str = "EPSG:4326",
         auto_download: bool = True,
-        progress_callback: Optional[callable] = None,
-    ) -> Tuple[np.ndarray, object, str]:
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[np.ndarray, object, str]:
         """Fetch and merge all embedding tiles within a bounding box into a single mosaic.
 
         This method is optimized for dense raster operations like classification, where you
@@ -727,14 +728,14 @@ class GeoTessera:
 
     def sample_embeddings_at_points(
         self,
-        points: Union[List[Tuple[float, float]], Dict, "gpd.GeoDataFrame"],
+        points: list[tuple[float, float]] | dict | gpd.GeoDataFrame,
         year: int = 2024,
         include_metadata: bool = False,
         auto_download: bool = True,
-        progress_callback: Optional[callable] = None,
+        progress_callback: ProgressCallback | None = None,
         *,
         errors: str = "raise",
-    ) -> Union[np.ndarray, Tuple[np.ndarray, List[Dict]]]:
+    ) -> np.ndarray | tuple[np.ndarray, list[dict]]:
         """Sample embedding values at specified point locations from local tiles.
 
         Read selected pixels from local GeoTIFF or NPY tiles and return
@@ -952,8 +953,8 @@ class GeoTessera:
         return result_embeddings
 
     def _parse_points_input(
-        self, points: Union[List[Tuple[float, float]], Dict, "gpd.GeoDataFrame"]
-    ) -> List[Tuple[float, float]]:
+        self, points: list[tuple[float, float]] | dict | gpd.GeoDataFrame
+    ) -> list[tuple[float, float]]:
         """Parse various point input formats to list of (lon, lat) tuples.
 
         Args:
@@ -967,8 +968,8 @@ class GeoTessera:
         return parse_points(points)
 
     def _group_points_by_tile(
-        self, points: List[Tuple[float, float]], year: int
-    ) -> Dict[Tuple[float, float], List[int]]:
+        self, points: list[tuple[float, float]], year: int
+    ) -> dict[tuple[float, float], list[int]]:
         """Group points by which 0.1-degree tile they belong to.
 
         Args:
@@ -1025,9 +1026,9 @@ class GeoTessera:
         lon: float,
         lat: float,
         year: int,
-        progress_callback: Optional[callable] = None,
+        progress_callback: ProgressCallback | None = None,
         refresh: bool = False,
-    ) -> Tuple[np.ndarray, object, object]:
+    ) -> tuple[np.ndarray, object, object]:
         """Fetch and dequantize a single embedding tile with CRS information.
 
         Coordinates are automatically snapped to valid tile centers. Tiles are
@@ -1090,7 +1091,7 @@ class GeoTessera:
         lon: float,
         lat: float,
         year: int,
-        progress_callback: Optional[callable] = None,
+        progress_callback: ProgressCallback | None = None,
         refresh: bool = False,
     ) -> bool:
         """Download a single tile and save it to embeddings_dir.
@@ -1159,10 +1160,10 @@ class GeoTessera:
 
     def download_tiles_for_points(
         self,
-        points: Union[List[Tuple[float, float]], Dict, "gpd.GeoDataFrame"],
+        points: list[tuple[float, float]] | dict | gpd.GeoDataFrame,
         year: int = 2024,
-        progress_callback: Optional[callable] = None,
-    ) -> Dict[str, bool]:
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, bool]:
         """Download all tiles needed for the specified points to embeddings_dir.
 
         Args:
@@ -1217,9 +1218,9 @@ class GeoTessera:
 
     def check_tiles_present(
         self,
-        points: Union[List[Tuple[float, float]], Dict, "gpd.GeoDataFrame"],
+        points: list[tuple[float, float]] | dict | gpd.GeoDataFrame,
         year: int = 2024,
-    ) -> Dict[str, bool]:
+    ) -> dict[str, bool]:
         """Check which tiles needed for the points are present in embeddings_dir.
 
         Args:
@@ -1378,9 +1379,9 @@ class GeoTessera:
         self,
         lon: float,
         lat: float,
-        output_path: Union[str, Path],
+        output_path: str | Path,
         year: int = 2024,
-        bands: Optional[List[int]] = None,
+        bands: list[int] | None = None,
         compress: str = "lzw",
     ) -> str:
         """Export a single embedding tile as a GeoTIFF file with native UTM projection.
@@ -1414,12 +1415,12 @@ class GeoTessera:
 
     def export_embedding_geotiffs(
         self,
-        tiles_to_fetch: Iterable[Tuple[int, float, float]],
-        output_dir: Union[str, Path],
-        bands: Optional[List[int]] = None,
+        tiles_to_fetch: Iterable[tuple[int, float, float]],
+        output_dir: str | Path,
+        bands: list[int] | None = None,
         compress: str = "lzw",
-        progress_callback: Optional[callable] = None,
-    ) -> List[str]:
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[str]:
         """Export all embedding tiles in bounding box as individual GeoTIFF files with native UTM projections.
         The list of tiles to fetch can be obtained by registry.load_blocks_for_region().
 
@@ -1428,7 +1429,7 @@ class GeoTessera:
             output_dir: Directory to save GeoTIFF files
             bands: List of band indices to export (None = all 128 bands)
             compress: Compression method for GeoTIFF
-            progress_callback: Optional callback function(current, total) for progress tracking
+            progress_callback: Optional callback function(current, total, status) for progress tracking
 
         Returns:
             List of paths to created GeoTIFF files
@@ -1503,11 +1504,11 @@ class GeoTessera:
 
     def merge_geotiffs_to_mosaic(
         self,
-        geotiff_paths: List[str],
-        output_path: Union[str, Path],
+        geotiff_paths: list[str],
+        output_path: str | Path,
         target_crs: str = "EPSG:3857",
         compress: str = "lzw",
-        progress_callback: Optional[callable] = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> str:
         """Merge a list of GeoTIFF files into a single mosaic in the target CRS.
 
@@ -1533,11 +1534,11 @@ class GeoTessera:
 
     def apply_pca_to_embeddings(
         self,
-        embeddings: List[Tuple[int, float, float, np.ndarray, object, object]],
+        embeddings: list[tuple[int, float, float, np.ndarray, object, object]],
         n_components: int = 3,
         standardize: bool = True,
-        progress_callback: Optional[callable] = None,
-    ) -> List[Tuple[int, float, float, np.ndarray, object, object, Dict]]:
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[tuple[int, float, float, np.ndarray, object, object, dict]]:
         """Apply one sampled PCA model to a collection of embedding tiles.
 
         Missing pixels remain NaN. The returned arrays contain float32
@@ -1594,14 +1595,14 @@ class GeoTessera:
 
     def export_pca_geotiffs(
         self,
-        tiles_to_fetch: Iterable[Tuple[int, float, float]],
-        output_dir: Union[str, Path],
+        tiles_to_fetch: Iterable[tuple[int, float, float]],
+        output_dir: str | Path,
         n_components: int = 3,
         standardize: bool = True,
         compress: str = "lzw",
         normalize: bool = True,
-        progress_callback: Optional[callable] = None,
-    ) -> List[str]:
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[str]:
         """Export PCA-transformed embeddings as GeoTIFF files.
 
         Fit one PCA model to a reproducible sample across the requested

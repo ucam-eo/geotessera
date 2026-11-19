@@ -1,7 +1,7 @@
 """Tile abstraction for format-agnostic embedding access."""
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 import numpy as np
 import re
 from .registry import (
@@ -323,7 +323,7 @@ class Tile:
         result[idx] = dequantize_embedding(quantized[rows, cols], factors)
         return result
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Convert to dictionary format (for compatibility with visualization code).
 
         Returns:
@@ -354,7 +354,7 @@ class Tile:
 # ============================================================================
 
 
-def discover_tiles(directory: Path) -> List[Tile]:
+def discover_tiles(directory: Path) -> list[Tile]:
     """Auto-detect format and discover all tiles.
 
     Prefers NPY format when both NPY and GeoTIFF formats are present.
@@ -377,7 +377,7 @@ def discover_tiles(directory: Path) -> List[Tile]:
     )
 
 
-def tile_for_coord(base_dir: Path, lon: float, lat: float, year: int) -> Optional[Tile]:
+def tile_for_coord(base_dir: Path, lon: float, lat: float, year: int) -> Tile | None:
     """Resolve a single tile from its coordinates, without listing the directory.
 
     A tile's location under *base_dir* follows from ``(lon, lat, year)``
@@ -427,8 +427,8 @@ def tile_for_coord(base_dir: Path, lon: float, lat: float, year: int) -> Optiona
 
 
 def tiles_for_coords(
-    base_dir: Path, coords: Iterable[Tuple[float, float]], year: int
-) -> Dict[Tuple[float, float], Tile]:
+    base_dir: Path, coords: Iterable[tuple[float, float]], year: int
+) -> dict[tuple[float, float], Tile]:
     """Resolve the tiles for *coords*, omitting any that are absent.
 
     Args:
@@ -447,7 +447,7 @@ def tiles_for_coords(
     return found
 
 
-def discover_npy_tiles(base_dir: Path) -> List[Tile]:
+def discover_npy_tiles(base_dir: Path) -> list[Tile]:
     """Discover NPY format tiles.
 
     Args:
@@ -488,7 +488,7 @@ def discover_npy_tiles(base_dir: Path) -> List[Tile]:
     return sorted(tiles, key=lambda t: (t.year, t.lat, t.lon))
 
 
-def discover_geotiff_tiles(directory: Path) -> List[Tile]:
+def discover_geotiff_tiles(directory: Path) -> list[Tile]:
     """Discover GeoTIFF tiles.
 
     Args:
@@ -520,7 +520,7 @@ def discover_geotiff_tiles(directory: Path) -> List[Tile]:
     return sorted(tiles, key=lambda t: (t.year, t.lat, t.lon))
 
 
-def discover_formats(directory: Path) -> Dict[str, List[Tile]]:
+def discover_formats(directory: Path) -> dict[str, list[Tile]]:
     """Discover tiles in all available formats.
 
     Args:
@@ -551,7 +551,7 @@ def discover_formats(directory: Path) -> Dict[str, List[Tile]]:
 # ============================================================================
 
 
-def _parse_npy_filename(path: Path) -> Tuple[float, float, int]:
+def _parse_npy_filename(path: Path) -> tuple[float, float, int]:
     """Parse lon, lat, year from NPY filename.
 
     Example: embeddings/2024/grid_0.15_52.05.npy -> (0.15, 52.05, 2024)
@@ -583,7 +583,7 @@ def _parse_npy_filename(path: Path) -> Tuple[float, float, int]:
     return lon, lat, year
 
 
-def _parse_geotiff_filename(path: Path) -> Tuple[float, float, int]:
+def _parse_geotiff_filename(path: Path) -> tuple[float, float, int]:
     """Parse lon, lat, year from GeoTIFF filename.
 
     Tries multiple patterns. If parsing fails, raises ValueError.

@@ -7,6 +7,7 @@ import rasterio
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+from ._typing import ProgressCallback
 from .remote import atomic_output
 
 
@@ -85,7 +86,7 @@ def write_pca_tiles(
     balance_method="percentile",
     percentile_range=(2, 98),
     compress="lzw",
-    progress_callback=None,
+    progress_callback: ProgressCallback | None = None,
     local_scaling=False,
 ):
     """Render inputs through one sampled PCA and one shared color mapping."""

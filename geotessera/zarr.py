@@ -55,16 +55,8 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -127,14 +119,14 @@ MULTISCALES_REVISION = "r2"
 
 
 def _geo_convention_attrs(
-    dimensions: List[str],
+    dimensions: list[str],
     crs: str,
-    bbox: List[float],
-    transform: Optional[List[float]] = None,
-    shape: Optional[List[int]] = None,
+    bbox: list[float],
+    transform: list[float] | None = None,
+    shape: list[int] | None = None,
     registration: str = "pixel",
-    extra_conventions: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    extra_conventions: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build ``spatial:`` and ``proj:`` attrs plus their registrations.
 
     Arguments left as None are omitted rather than written as nulls, so a
@@ -212,7 +204,7 @@ class ShardSpec:
     sc: int  # shard col index
     row_px: int  # pixel row in zone grid (sr * SHARD_SIZE)
     col_px: int  # pixel col in zone grid (sc * SHARD_SIZE)
-    tiles: List[ShardTileOverlap]
+    tiles: list[ShardTileOverlap]
     time_index: int = 0
 
 
@@ -231,25 +223,25 @@ class StoreLocation:
     """
 
     url: str
-    storage_options: Optional[Dict[str, Any]] = None
-    state_url: Optional[str] = None
-    state_storage_options: Optional[Dict[str, Any]] = None
+    storage_options: dict[str, Any] | None = None
+    state_url: str | None = None
+    state_storage_options: dict[str, Any] | None = None
 
     @classmethod
     def resolve(
         cls,
-        store: "str | Path | StoreLocation",
-        storage_options: Optional[Dict[str, Any]] = None,
-        state_url: Optional[str] = None,
-        state_storage_options: Optional[Dict[str, Any]] = None,
-    ) -> "StoreLocation":
+        store: str | Path | StoreLocation,
+        storage_options: dict[str, Any] | None = None,
+        state_url: str | None = None,
+        state_storage_options: dict[str, Any] | None = None,
+    ) -> StoreLocation:
         """Coerce a path, URL, or existing location into a StoreLocation."""
         if isinstance(store, StoreLocation):
             return store
         return cls(str(store), storage_options, state_url, state_storage_options)
 
     @property
-    def state(self) -> "StoreLocation":
+    def state(self) -> StoreLocation:
         """Where build-time state lives — a sibling of the store, not inside it.
 
         The ingestion registry and fill locks are the builder's bookkeeping,
@@ -276,7 +268,7 @@ class StoreLocation:
 
         return remote.join(self.url, *parts)
 
-    def exists(self, *parts: str, on_denied: Optional[bool] = None) -> bool:
+    def exists(self, *parts: str, on_denied: bool | None = None) -> bool:
         from . import remote
 
         return remote.exists(
@@ -298,7 +290,7 @@ class StoreLocation:
 
         remote.remove(self.join(*parts), self.storage_options)
 
-    def listdir(self, *parts: str, on_denied: Optional[List[str]] = None) -> List[str]:
+    def listdir(self, *parts: str, on_denied: list[str] | None = None) -> list[str]:
         from . import remote
 
         return remote.listdir(
@@ -339,14 +331,14 @@ class StoreLocation:
     def open_group(
         self,
         mode: str = "r",
-        path: Optional[str] = None,
-        zarr_format: Optional[int] = None,
-        use_consolidated: Optional[bool] = False,
-    ) -> "zarr.Group":
+        path: str | None = None,
+        zarr_format: int | None = None,
+        use_consolidated: bool | None = False,
+    ) -> zarr.Group:
         """Open the store (or a group within it) with the right backend."""
         import zarr
 
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "mode": mode,
             "use_consolidated": use_consolidated,
         }
@@ -372,7 +364,7 @@ class TileSource:
 
     embeddings_root: str
     landmasks_root: str
-    storage_options: Optional[Dict[str, Any]] = None
+    storage_options: dict[str, Any] | None = None
 
     @property
     def is_remote(self) -> bool:
@@ -380,7 +372,7 @@ class TileSource:
 
         return remote.is_url(self.embeddings_root)
 
-    def embedding_locations(self, lon: float, lat: float, year: int) -> Tuple[str, str]:
+    def embedding_locations(self, lon: float, lat: float, year: int) -> tuple[str, str]:
         """Return (embedding, scales) locations for a tile."""
         from . import remote
         from .registry import tile_to_embedding_paths
@@ -403,9 +395,9 @@ class TileSource:
         cls,
         root: str,
         version_path: str,
-        storage_options: Optional[Dict[str, Any]] = None,
-        dataset_dir: Optional[str] = None,
-    ) -> "TileSource":
+        storage_options: dict[str, Any] | None = None,
+        dataset_dir: str | None = None,
+    ) -> TileSource:
         """Build a source from a repository root in the published layout.
 
         The Source Cooperative repository — and any mirror of it — lays tiles
@@ -431,7 +423,7 @@ class TileSource:
         )
 
     @classmethod
-    def for_local_mirror(cls, registry: "Registry") -> "TileSource":
+    def for_local_mirror(cls, registry: Registry) -> TileSource:
         """Build a source from a registry's local ``embeddings_dir``.
 
         The local mirror can be in two shapes:
@@ -537,7 +529,7 @@ def project_tile(
     lon: float,
     lat: float,
     year: int = 0,
-    transformer_cache: Optional[Dict[int, Any]] = None,
+    transformer_cache: dict[int, Any] | None = None,
     landmask_path: str = "",
     embedding_path: str = "",
     scales_path: str = "",
@@ -598,7 +590,7 @@ def _load_landmask_slice(
     row_end: int,
     col_start: int,
     col_end: int,
-    storage_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Load a sub-region of a landmask GeoTIFF, locally or from a remote store.
 
@@ -628,12 +620,12 @@ def _load_landmask_slice(
 
 
 def gather_tile_infos(
-    registry: "Registry",
+    registry: Registry,
     year: int,
-    zones: Optional[List[int]] = None,
-    console: Optional["rich.console.Console"] = None,
-    source: Optional[TileSource] = None,
-) -> Dict[int, List[TileInfo]]:
+    zones: list[int] | None = None,
+    console: rich.console.Console | None = None,
+    source: TileSource | None = None,
+) -> dict[int, list[TileInfo]]:
     """Gather tile metadata and group by UTM zone.
 
     Computes grid info deterministically from coordinates (no file I/O).
@@ -683,8 +675,8 @@ def gather_tile_infos(
     if source is None:
         source = TileSource.for_local_mirror(registry)
 
-    zones_dict: Dict[int, List[TileInfo]] = {}
-    transformer_cache: Dict[int, Any] = {}
+    zones_dict: dict[int, list[TileInfo]] = {}
+    transformer_cache: dict[int, Any] = {}
 
     for tile_year, tile_lon, tile_lat in tiles:
         zone_num = tile_zone(tile_lon)
@@ -803,7 +795,7 @@ def _run_parallel(fn, items, workers, label="Processing"):
 # ---------------------------------------------------------------------------
 
 
-def _preview_marker_parts(zone_num: int) -> Tuple[str, str]:
+def _preview_marker_parts(zone_num: int) -> tuple[str, str]:
     """Key of a zone's global-preview resume marker within the state area.
 
     Markers live in the state sibling (``<store>.build/_preview/``) rather
@@ -820,7 +812,7 @@ def _chunks_for_shards(
     zone_epsg: int,
     zone_transform: list,
     zone_shape: tuple,
-) -> Tuple[set, List[Tuple[int, int, int, int]]]:
+) -> tuple[set, list[tuple[int, int, int, int]]]:
     """Output chunks that can actually receive data, from present shards.
 
     A zone's *bounding rectangle* back-projected to lon/lat is hopeless as a
@@ -925,7 +917,7 @@ def _chunks_for_shards(
 TILE_SIZE_DEG = 0.1  # a Tessera tile's side, in degrees
 
 
-def chunks_for_tile_centres(centres: "Sequence[Tuple[float, float]]") -> set:
+def chunks_for_tile_centres(centres: Sequence[tuple[float, float]]) -> set:
     """Level-0 chunks that a set of tile footprints can touch.
 
     ``_chunks_for_shards`` narrows the work list from a zone's bounding
@@ -954,14 +946,14 @@ def chunks_for_tile_centres(centres: "Sequence[Tuple[float, float]]") -> set:
 
 
 def tile_centres_by_zone(
-    manifest_path: str, year: int, zones: Optional[List[int]] = None
-) -> Dict[int, List[Tuple[float, float]]]:
+    manifest_path: str, year: int, zones: list[int] | None = None
+) -> dict[int, list[tuple[float, float]]]:
     """Tile centres for *year*, grouped by UTM zone, read from a manifest."""
     import pandas as pd
 
     df = pd.read_parquet(manifest_path, columns=["year", "lon", "lat"])
     df = df[df["year"] == year]
-    out: Dict[int, List[Tuple[float, float]]] = {}
+    out: dict[int, list[tuple[float, float]]] = {}
     for lon, lat in zip(df["lon"], df["lat"]):
         z = tile_zone(lon)
         if zones is None or z in zones:
@@ -969,7 +961,7 @@ def tile_centres_by_zone(
     return out
 
 
-def _regions_for_chunks(chunks: set) -> List[Tuple[int, int, int, int]]:
+def _regions_for_chunks(chunks: set) -> list[tuple[int, int, int, int]]:
     """Chunk-aligned pixel rectangles covering *chunks*, for the coarsening.
 
     Normally one rectangle. A zone straddling the antimeridian holds chunks
@@ -1015,12 +1007,12 @@ def _regions_for_chunks(chunks: set) -> List[Tuple[int, int, int, int]]:
 
 
 def _coarsen_zone_pyramid(
-    dest: "StoreLocation",
+    dest: StoreLocation,
     num_levels: int,
     workers: int,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
     start_level: int = 1,
-    chunks: Optional[set] = None,
+    chunks: set | None = None,
     row_start: int = 0,
     row_end: int = 0,
     col_start: int = 0,
@@ -1248,8 +1240,8 @@ def depth_inner_chunk(depth: int) -> int:
 
 
 def validate_matryoshka_depths(
-    depths: "Sequence[int]", version_norm: Optional[str] = None
-) -> Tuple[int, ...]:
+    depths: Sequence[int], version_norm: str | None = None
+) -> tuple[int, ...]:
     """Normalise and check a requested set of nested depths.
 
     The full depth is implied rather than listed, so entries must be strictly
@@ -1285,7 +1277,7 @@ def validate_matryoshka_depths(
     return tuple(out)
 
 
-def depths_attr_value(depths: "Sequence[int]") -> List[Dict[str, Any]]:
+def depths_attr_value(depths: Sequence[int]) -> list[dict[str, Any]]:
     """The ``geoemb:depths`` root attribute for a set of nested depths.
 
     Always includes the full depth as its own entry, so a client choosing a
@@ -1306,7 +1298,7 @@ _LANDMASK_ATTR = "geoemb:landmask"
 
 
 def preview_source_array(
-    root: "StoreLocation | zarr.Group",
+    root: StoreLocation | zarr.Group,
     band_indices: Sequence[int] = (0, 1, 2),
     mode: str = "bands",
 ) -> str:
@@ -1330,7 +1322,7 @@ def preview_source_array(
     return "embeddings"
 
 
-def store_uses_landmask(store: "StoreLocation | zarr.Group") -> bool:
+def store_uses_landmask(store: StoreLocation | zarr.Group) -> bool:
     """Whether this store's tiles are masked against a landmask.
 
     True unless the root says otherwise, which is every store predating the
@@ -1340,7 +1332,7 @@ def store_uses_landmask(store: "StoreLocation | zarr.Group") -> bool:
     return bool(root.attrs.get(_LANDMASK_ATTR, True))
 
 
-def store_depths(store: "StoreLocation | zarr.Group") -> Tuple[int, ...]:
+def store_depths(store: StoreLocation | zarr.Group) -> tuple[int, ...]:
     """Nested depths declared by a store's root, excluding the full depth.
 
     Empty for a single-depth store, which is every v1/v1.1 store.
@@ -1376,7 +1368,7 @@ WORKER_PEAK_BYTES = 3 * WORKER_BUFFER_BYTES
 WORKER_PEAK_BYTES_SPILLED = WORKER_PEAK_BYTES - WORKER_BUFFER_BYTES
 
 
-def _total_memory_bytes() -> Optional[int]:
+def _total_memory_bytes() -> int | None:
     """Memory a fill can realistically use, or None if undeterminable.
 
     Prefers MemAvailable over physical RAM: these hosts are often shared,
@@ -1443,7 +1435,7 @@ class UnifiedZoneGrid:
     """Describes the pixel grid for a UTM zone spanning all years."""
 
     zone: int
-    years: List[int]
+    years: list[int]
     canonical_epsg: int
     origin_x: float  # UTM easting of top-left corner
     origin_y: float  # UTM northing of top-left corner
@@ -1455,7 +1447,7 @@ class UnifiedZoneGrid:
 def _tile_pixel_offset(
     tile_info: TileInfo,
     grid: UnifiedZoneGrid,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     """Pixel offset of a tile within the unified zone grid.
 
     Floor, because the tile's pixels were laid out by stackstac from
@@ -1476,7 +1468,7 @@ def _tile_pixel_offset(
 
 
 def shard_coords_for_tiles(
-    tile_infos: List[TileInfo],
+    tile_infos: list[TileInfo],
     grid: UnifiedZoneGrid,
 ) -> set:
     """Return the set of (shard_row, shard_col) covered by these tiles."""
@@ -1498,11 +1490,11 @@ def shard_coords_for_tiles(
 
 
 def build_shard_index(
-    tile_infos: List[TileInfo],
+    tile_infos: list[TileInfo],
     grid: UnifiedZoneGrid,
     time_index: int,
-    restrict_to: Optional[set] = None,
-) -> List[ShardSpec]:
+    restrict_to: set | None = None,
+) -> list[ShardSpec]:
     """Build shard index for one year's tiles against a unified zone grid.
 
     Args:
@@ -1513,7 +1505,7 @@ def build_shard_index(
             Callers get that by passing all of the zone's tiles here along with
             the shard coordinates the new tiles touch.
     """
-    shard_map: Dict[Tuple[int, int], List[ShardTileOverlap]] = {}
+    shard_map: dict[tuple[int, int], list[ShardTileOverlap]] = {}
     nrows = grid.height_px // SHARD_SIZE
     ncols = grid.width_px // SHARD_SIZE
 
@@ -1583,9 +1575,9 @@ def build_shard_index(
 
 
 def _gather_landmask_tiles_by_zone(
-    registry: "Registry",
+    registry: Registry,
     from_embeddings: bool = False,
-) -> Dict[int, List[Tuple[float, float]]]:
+) -> dict[int, list[tuple[float, float]]]:
     """Group landmask tile coordinates by UTM zone.
 
     Returns dict mapping zone number to list of (lon, lat) centres.
@@ -1598,7 +1590,7 @@ def _gather_landmask_tiles_by_zone(
         tiles = [(lon_i / 100.0, lat_i / 100.0) for lon_i, lat_i in idx]
     else:
         tiles = registry.available_landmasks  # [(lon, lat), ...]
-    by_zone: Dict[int, List[Tuple[float, float]]] = {}
+    by_zone: dict[int, list[tuple[float, float]]] = {}
     for lon, lat in tiles:
         zone_num = int(math.floor((lon + 180) / 6)) + 1
         zone_num = max(1, min(60, zone_num))
@@ -1608,8 +1600,8 @@ def _gather_landmask_tiles_by_zone(
 
 def _compute_zone_grid_from_landmask(
     zone: int,
-    tile_coords: List[Tuple[float, float]],
-    years: List[int],
+    tile_coords: list[tuple[float, float]],
+    years: list[int],
 ) -> UnifiedZoneGrid:
     """Compute a unified zone grid from landmask tile coordinates.
 
@@ -1666,7 +1658,7 @@ def _compute_zone_grid_from_landmask(
 
 def _compute_zone_grid_deterministic(
     zone: int,
-    years: List[int],
+    years: list[int],
 ) -> UnifiedZoneGrid:
     """Deterministic grid for a UTM zone, sized to the zone's canonical
     footprint rather than to the tiles that happen to be present.
@@ -1736,13 +1728,13 @@ def _compute_zone_grid_deterministic(
 
 
 def init_store(
-    registry: "Registry",
-    output_path: "str | Path | StoreLocation",
-    years: List[int],
+    registry: Registry,
+    output_path: str | Path | StoreLocation,
+    years: list[int],
     geotessera_version: str = "unknown",
     model_version: str = "1.0",
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
     stretch_sample_size: int = STRETCH_SAMPLE_K,
     matryoshka_depths: Sequence[int] = (),
     use_landmask: bool = True,
@@ -1922,7 +1914,7 @@ def _create_zone_group(
     store_location: StoreLocation,
     stretch_sample_size: int = STRETCH_SAMPLE_K,
     depths: Sequence[int] = (),
-) -> "zarr.Group":
+) -> zarr.Group:
     """Create a zone group with empty (T, B, H, W) arrays."""
     from zarr.codecs import BloscCodec
 
@@ -2060,7 +2052,7 @@ STRETCH_ARRAY_NAMES = (
 
 
 def create_stretch_arrays(
-    group: "zarr.Group",
+    group: zarr.Group,
     n_years: int,
     k: int,
     n_shard_rows: int,
@@ -2141,8 +2133,8 @@ def create_stretch_arrays(
 
 
 def ensure_stretch_arrays(
-    group: "zarr.Group",
-    console: Optional["rich.console.Console"] = None,
+    group: zarr.Group,
+    console: rich.console.Console | None = None,
     sample_k: int = STRETCH_SAMPLE_K,
 ) -> None:
     """Create any missing stretch arrays on an existing zone group.
@@ -2251,9 +2243,9 @@ def shard_stretch_stats(
     emb_buf: np.ndarray,
     scales_buf: np.ndarray,
     sample_cap: int,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     block: int = 262_144,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """Exact (n, S, M) sufficient statistics plus a pixel sample for one shard.
 
     Works on the shard buffers the fill already holds: ``emb_buf`` is
@@ -2298,10 +2290,10 @@ def shard_stretch_stats(
 
 
 def merge_stretch_samples(
-    candidates: List[Tuple[np.ndarray, np.ndarray, float]],
+    candidates: list[tuple[np.ndarray, np.ndarray, float]],
     k: int,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Draw K rows from weighted candidate pools (Efraimidis–Spirakis).
 
     ``candidates`` is a list of ``(emb (n, B) int8, scales (n,) f32, weight
@@ -2343,14 +2335,14 @@ def weighted_percentile(
 
 
 def update_zone_stretch_stats(
-    zone_group: "zarr.Group",
+    zone_group: zarr.Group,
     time_index: int,
     n: int,
     s: np.ndarray,
     m: np.ndarray,
-    sample_candidates: List[Tuple[np.ndarray, np.ndarray, float]],
-    seen_coords: Optional[List[Tuple[int, int]]] = None,
-    seed: Optional[int] = None,
+    sample_candidates: list[tuple[np.ndarray, np.ndarray, float]],
+    seen_coords: list[tuple[int, int]] | None = None,
+    seed: int | None = None,
 ) -> None:
     """Fold one run's statistics into a zone's arrays (read-modify-write).
 
@@ -2403,7 +2395,7 @@ def update_zone_stretch_stats(
     count_arr[t] = prev_n + n
 
 
-def reset_zone_stretch_stats(zone_group: "zarr.Group", time_index: int) -> None:
+def reset_zone_stretch_stats(zone_group: zarr.Group, time_index: int) -> None:
     """Empty a (zone, year)'s statistics: nothing folded, nothing seen.
 
     The starting point for a rebuild. With the mask empty and the count at
@@ -2425,16 +2417,16 @@ def reset_zone_stretch_stats(zone_group: "zarr.Group", time_index: int) -> None:
     zone_group["stretch_stats_count"][t] = 0
 
 
-def _seen_shard_coords(zone_group: "zarr.Group", time_index: int) -> set:
+def _seen_shard_coords(zone_group: zarr.Group, time_index: int) -> set:
     """Shards the coverage mask records as folded into the slot."""
     mask = np.asarray(zone_group["stretch_stats_shards"][time_index])
     return {(int(r), int(c)) for r, c in zip(*np.nonzero(mask))}
 
 
 def fold_shard_stats(
-    zone_group: "zarr.Group",
+    zone_group: zarr.Group,
     time_index: int,
-    shard_stats: List[Dict[str, Any]],
+    shard_stats: list[dict[str, Any]],
 ) -> int:
     """Fold a batch of per-shard results into the slot; returns pixels added."""
     if not shard_stats:
@@ -2467,13 +2459,13 @@ STATS_BATCH_SHARDS = 64
 class _StatsFolder:
     """``on_stats`` callback for the pool: fold each batch, count pixels."""
 
-    def __init__(self, group: "zarr.Group", time_index: int):
+    def __init__(self, group: zarr.Group, time_index: int):
         self.group = group
         self.time_index = time_index
         self.pixels = 0
         self.shards = 0
 
-    def __call__(self, shard_stats: List[Dict[str, Any]]) -> None:
+    def __call__(self, shard_stats: list[dict[str, Any]]) -> None:
         self.pixels += fold_shard_stats(self.group, self.time_index, shard_stats)
         self.shards += len(shard_stats)
 
@@ -2481,15 +2473,15 @@ class _StatsFolder:
 def _catch_up_stretch_stats(
     store: StoreLocation,
     zone_group: str,
-    group: "zarr.Group",
+    group: zarr.Group,
     time_index: int,
-    coords: List[Tuple[int, int]],
+    coords: list[tuple[int, int]],
     workers: int,
     sample_cap: int,
     label: str,
-    console: Optional["rich.console.Console"],
+    console: rich.console.Console | None,
     batch_size: int = STATS_BATCH_SHARDS,
-) -> Tuple[set, int]:
+) -> tuple[set, int]:
     """Read *coords* back from the store and fold them as they arrive.
 
     Results are folded in batches while the pool is still reading, so the
@@ -2578,7 +2570,7 @@ def load_merged_registry(store: StoreLocation):
 
 def merge_tile_registry(
     store: StoreLocation,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
 ) -> int:
     """Merge every per-zone tracking file into one ``_registry.parquet``.
 
@@ -2638,20 +2630,20 @@ def merge_tile_registry(
 # ---------------------------------------------------------------------------
 
 _worker_store = None
-_worker_source_options: Optional[Dict[str, Any]] = None
-_worker_spill_dir: Optional[str] = None
+_worker_source_options: dict[str, Any] | None = None
+_worker_spill_dir: str | None = None
 _worker_sample_cap: int = 0  # 0 = stats collection off
 _worker_time_index: int = 0
-_worker_depths: Tuple[int, ...] = ()  # nested depths to write alongside the full one
+_worker_depths: tuple[int, ...] = ()  # nested depths to write alongside the full one
 _worker_use_landmask: bool = True
 
 
 def _init_shard_worker(
     store_url: str,
     zone_group: str,
-    store_options: Optional[Dict[str, Any]] = None,
-    source_options: Optional[Dict[str, Any]] = None,
-    spill_dir: Optional[str] = None,
+    store_options: dict[str, Any] | None = None,
+    source_options: dict[str, Any] | None = None,
+    spill_dir: str | None = None,
     sample_cap: int = 0,
     time_index: int = 0,
     depths: Sequence[int] = (),
@@ -2685,13 +2677,13 @@ def _init_shard_worker(
 
 def _write_one_shard(
     spec: ShardSpec,
-    store: "zarr.Group",
-    source_options: Optional[Dict[str, Any]] = None,
-    spill_dir: Optional[str] = None,
+    store: zarr.Group,
+    source_options: dict[str, Any] | None = None,
+    spill_dir: str | None = None,
     sample_cap: int = 0,
     depths: Sequence[int] = (),
     use_landmask: bool = True,
-) -> "bool | Dict[str, Any]":
+) -> bool | dict[str, Any]:
     """Write one shard in NCHW layout: (T, B, H, W).
 
     Tile reads go through :mod:`geotessera.remote`, so ``spec`` may reference
@@ -2738,7 +2730,7 @@ def _write_one_shard(
             shutil.rmtree(spill, ignore_errors=True)
 
 
-def _open_spill(spill_dir: Optional[str]):
+def _open_spill(spill_dir: str | None):
     """Create a per-shard scratch directory, or None to stay in memory."""
     if not spill_dir:
         return None
@@ -2750,14 +2742,14 @@ def _open_spill(spill_dir: Optional[str]):
 
 def _fill_and_write_shard(
     spec: ShardSpec,
-    store: "zarr.Group",
+    store: zarr.Group,
     emb_buf: np.ndarray,
     scales_buf: np.ndarray,
-    source_options: Optional[Dict[str, Any]] = None,
+    source_options: dict[str, Any] | None = None,
     sample_cap: int = 0,
     depths: Sequence[int] = (),
     use_landmask: bool = True,
-) -> "bool | Dict[str, Any]":
+) -> bool | dict[str, Any]:
     """Populate the shard buffers from their tiles and write them out.
 
     With ``sample_cap > 0`` the return value is the shard's stretch
@@ -2856,7 +2848,7 @@ def _fill_and_write_shard(
     return True
 
 
-def _write_one_shard_worker(spec: ShardSpec) -> "bool | Dict[str, Any]":
+def _write_one_shard_worker(spec: ShardSpec) -> bool | dict[str, Any]:
     """Picklable wrapper for process pool."""
     return _write_one_shard(
         spec,
@@ -2869,7 +2861,7 @@ def _write_one_shard_worker(spec: ShardSpec) -> "bool | Dict[str, Any]":
     )
 
 
-def _empty_shard_stats() -> Dict[str, Any]:
+def _empty_shard_stats() -> dict[str, Any]:
     """Zero-contribution statistics for a shard with no valid pixels.
 
     Folding zeros is harmless, and returning them (rather than nothing)
@@ -2885,7 +2877,7 @@ def _empty_shard_stats() -> Dict[str, Any]:
     }
 
 
-def _stats_catchup_worker(coord: Tuple[int, int]) -> Dict[str, Any]:
+def _stats_catchup_worker(coord: tuple[int, int]) -> dict[str, Any]:
     """Compute stretch statistics for a shard already in the store.
 
     The catch-up half of automatic collection: reads the shard back from the
@@ -2915,7 +2907,7 @@ def _stats_catchup_worker(coord: Tuple[int, int]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _all_shard_coords(group: "zarr.Group") -> set:
+def _all_shard_coords(group: zarr.Group) -> set:
     """Every (sr, sc) shard coordinate the zone's embeddings grid has."""
     H, W = group["embeddings"].shape[2], group["embeddings"].shape[3]
     return {
@@ -2930,7 +2922,7 @@ def _existing_shards(
     zone_group: str,
     time_index: int,
     wanted: set,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
     array_name: str = "embeddings",
 ) -> set:
     """Return complete shards, or the objects present in a selected depth.
@@ -2953,7 +2945,7 @@ def _existing_array_shards(
     zone_group: str,
     time_index: int,
     wanted: set,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
     array_name: str = "embeddings",
 ) -> set:
     """Which of *wanted* shard objects already exist in one array.
@@ -3008,7 +3000,7 @@ def _existing_array_shards(
     return present
 
 
-def _store_years(store: StoreLocation, zones: Optional[List[int]] = None) -> List[int]:
+def _store_years(store: StoreLocation, zones: list[int] | None = None) -> list[int]:
     """Read the store's year axis from a zone's ``time`` coordinate array.
 
     Tries the requested zones first so a single-zone fill against a remote
@@ -3016,7 +3008,7 @@ def _store_years(store: StoreLocation, zones: Optional[List[int]] = None) -> Lis
     """
     root = store.open_group(mode="r")
 
-    def years_from(name: str) -> Optional[List[int]]:
+    def years_from(name: str) -> list[int] | None:
         try:
             group = root[name]
         except KeyError:
@@ -3045,7 +3037,7 @@ def _store_years(store: StoreLocation, zones: Optional[List[int]] = None) -> Lis
     return []
 
 
-def _member_names(group: "zarr.Group") -> List[str]:
+def _member_names(group: zarr.Group) -> list[str]:
     """Sorted member names of a group, without the sidecar warnings.
 
     A Tessera store deliberately keeps non-Zarr objects at its root (the
@@ -3060,8 +3052,8 @@ def _member_names(group: "zarr.Group") -> List[str]:
 
 
 def _zone_group_names(
-    store: StoreLocation, zones: Optional[List[int]] = None
-) -> List[str]:
+    store: StoreLocation, zones: list[int] | None = None
+) -> list[str]:
     """Names of the store's UTM zone groups, optionally filtered."""
     import re
 
@@ -3079,11 +3071,11 @@ _PENDING_TIME_ATTR = "tessera:pending_years"
 
 
 def extend_store(
-    store_path: "str | Path | StoreLocation",
-    years: List[int],
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
-    zones: Optional[List[int]] = None,
+    store_path: str | Path | StoreLocation,
+    years: list[int],
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
+    zones: list[int] | None = None,
     consolidate: bool = True,
 ) -> int:
     """Append new years to an existing store's time axis.
@@ -3219,9 +3211,9 @@ def extend_store(
 
 def load_landmask_tiles(
     dataset_version: str = "v1",
-    landmasks_path: Optional[str] = None,
-    cache_dir: Optional[Path] = None,
-) -> List[Tuple[float, float]]:
+    landmasks_path: str | None = None,
+    cache_dir: Path | None = None,
+) -> list[tuple[float, float]]:
     """Land tile centres for a dataset version, without touching the manifest.
 
     Land coverage is all that is needed to say which shards can ever hold
@@ -3258,12 +3250,12 @@ def load_landmask_tiles(
 
 
 def _shards_from_tiles(
-    tile_coords: List[Tuple[float, float]],
+    tile_coords: list[tuple[float, float]],
     grid: UnifiedZoneGrid,
-    transformer_cache: Dict[int, Any],
-) -> Dict[Tuple[int, int], int]:
+    transformer_cache: dict[int, Any],
+) -> dict[tuple[int, int], int]:
     """Map tile centres to the shards they touch, with a tile count each."""
-    per_shard: Dict[Tuple[int, int], int] = {}
+    per_shard: dict[tuple[int, int], int] = {}
     for lon, lat in tile_coords:
         ti = project_tile(lon, lat, transformer_cache=transformer_cache)
         for coord in shard_coords_for_tiles([ti], grid):
@@ -3272,17 +3264,17 @@ def _shards_from_tiles(
 
 
 def scan_store(
-    registry: Optional["Registry"],
-    store_path: "str | Path | StoreLocation",
-    years: Optional[List[int]] = None,
-    zones: Optional[List[int]] = None,
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
-    source: Optional[TileSource] = None,
-    output: Optional[str] = None,
+    registry: Registry | None,
+    store_path: str | Path | StoreLocation,
+    years: list[int] | None = None,
+    zones: list[int] | None = None,
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
+    source: TileSource | None = None,
+    output: str | None = None,
     dataset_version: str = "v1",
-    landmasks_path: Optional[str] = None,
-) -> "pandas.DataFrame":
+    landmasks_path: str | None = None,
+) -> pandas.DataFrame:
     """Inventory a store's shards, without writing data.
 
     Answers "how much is left to fill" from the store itself rather than from
@@ -3336,8 +3328,8 @@ def scan_store(
                 f"{', '.join(depth_array_name(d) for d in depths)}"
             )
 
-    transformer_cache: Dict[int, Any] = {}
-    land_by_zone: Dict[int, List[Tuple[float, float]]] = {}
+    transformer_cache: dict[int, Any] = {}
+    land_by_zone: dict[int, list[tuple[float, float]]] = {}
     if registry is None:
         if console:
             console.print("  Land coverage from the landmask registry")
@@ -3346,14 +3338,14 @@ def scan_store(
             if zones is None or zone_num in zones:
                 land_by_zone.setdefault(zone_num, []).append((lon, lat))
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     for scan_year in scan_years:
         if registry is not None:
             year_tiles = gather_tile_infos(
                 registry, scan_year, zones=zones, console=None, source=source
             )
-            zone_items: List[Tuple[int, Any]] = sorted(year_tiles.items())
+            zone_items: list[tuple[int, Any]] = sorted(year_tiles.items())
         else:
             zone_items = sorted(land_by_zone.items())
 
@@ -3473,18 +3465,18 @@ VERIFY_OUTSIDE = "outside-grid"
 
 
 def verify_store(
-    registry: "Registry",
-    store_path: "str | Path | StoreLocation",
+    registry: Registry,
+    store_path: str | Path | StoreLocation,
     source: TileSource,
     samples: int = 1000,
     window: int = 6,
-    years: Optional[List[int]] = None,
-    zones: Optional[List[int]] = None,
+    years: list[int] | None = None,
+    zones: list[int] | None = None,
     workers: int = 16,
     seed: int = 0,
-    storage_options: Optional[Dict[str, Any]] = None,
-    console: Optional["rich.console.Console"] = None,
-) -> Tuple["pandas.DataFrame", Dict[str, int]]:
+    storage_options: dict[str, Any] | None = None,
+    console: rich.console.Console | None = None,
+) -> tuple[pandas.DataFrame, dict[str, int]]:
     """Check a store's contents against the source tiles it was built from.
 
     Samples *samples* random (year, tile) pairs from the manifest, reads a
@@ -3534,8 +3526,8 @@ def verify_store(
             + (f", nested depths {depths}" if depths else "")
         )
 
-    zone_cache: Dict[int, Any] = {}
-    grid_cache: Dict[int, UnifiedZoneGrid] = {}
+    zone_cache: dict[int, Any] = {}
+    grid_cache: dict[int, UnifiedZoneGrid] = {}
     lock = __import__("threading").Lock()
 
     def zone_info(z: int):
@@ -3558,7 +3550,7 @@ def verify_store(
 
     src_options = source.storage_options
 
-    def one(rec) -> Dict[str, Any]:
+    def one(rec) -> dict[str, Any]:
         year = int(rec["year"])
         lon, lat = rec["lon_i"] / 100.0, rec["lat_i"] / 100.0
         out = {"year": year, "lon": lon, "lat": lat, "zone": tile_zone(lon)}
@@ -3645,7 +3637,7 @@ def verify_store(
 
         return {**out, "status": VERIFY_OK, "detail": ""}
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     records = picks.to_dict("records")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(one, r) for r in records]
@@ -3661,7 +3653,7 @@ def verify_store(
 
 
 def summarise_verify(
-    df: "pandas.DataFrame", tally: Dict[str, int], console: "rich.console.Console"
+    df: pandas.DataFrame, tally: dict[str, int], console: rich.console.Console
 ) -> int:
     """Print a verification tally. Returns the number of mismatches."""
     mismatches = sum(v for k, v in tally.items() if "mismatch" in k)
@@ -3690,7 +3682,7 @@ def summarise_verify(
     return mismatches
 
 
-def summarise_scan(df: "pandas.DataFrame", console: "rich.console.Console") -> None:
+def summarise_scan(df: pandas.DataFrame, console: rich.console.Console) -> None:
     """Print per-zone/year and per-year fill summaries from a scan."""
     from rich.table import Table
 
@@ -3750,17 +3742,17 @@ def summarise_scan(df: "pandas.DataFrame", console: "rich.console.Console") -> N
 
 
 def fill_store(
-    registry: "Registry",
-    store_path: "str | Path | StoreLocation",
-    year: Optional[int] = None,
-    zones: Optional[List[int]] = None,
-    console: Optional["rich.console.Console"] = None,
-    workers: Optional[int] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
-    source: Optional[TileSource] = None,
-    consolidate: Optional[bool] = None,
+    registry: Registry,
+    store_path: str | Path | StoreLocation,
+    year: int | None = None,
+    zones: list[int] | None = None,
+    console: rich.console.Console | None = None,
+    workers: int | None = None,
+    storage_options: dict[str, Any] | None = None,
+    source: TileSource | None = None,
+    consolidate: bool | None = None,
     skip_existing_shards: bool = True,
-    spill_dir: Optional[str] = None,
+    spill_dir: str | None = None,
     collect_stretch_stats: bool = True,
     stats_batch_size: int = STATS_BATCH_SHARDS,
 ) -> int:
@@ -3926,7 +3918,7 @@ def fill_store(
             # one the mask has not seen. Catch-up reads are folded a batch
             # at a time, so a run killed part-way is resumed by the next.
             sample_cap = 0
-            catch_up: List[Tuple[int, int]] = []
+            catch_up: list[tuple[int, int]] = []
             rebuild_stats = False
             if collect_stretch_stats or not skip_existing_shards:
                 zone_rw = store.open_group(mode="r+", path=zone_group)
@@ -4045,20 +4037,20 @@ def fill_store(
 def _write_shards(
     store: StoreLocation,
     zone_group: str,
-    shard_specs: List[ShardSpec],
+    shard_specs: list[ShardSpec],
     workers: int,
-    source_options: Optional[Dict[str, Any]],
+    source_options: dict[str, Any] | None,
     label: str,
-    console: Optional["rich.console.Console"],
-    spill_dir: Optional[str] = None,
+    console: rich.console.Console | None,
+    spill_dir: str | None = None,
     sample_cap: int = 0,
-    stats_coords: Optional[List[Tuple[int, int]]] = None,
+    stats_coords: list[tuple[int, int]] | None = None,
     time_index: int = 0,
     depths: Sequence[int] = (),
     use_landmask: bool = True,
-    on_stats: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    on_stats: Callable[[list[dict[str, Any]]], None] | None = None,
     flush_every: int = STATS_BATCH_SHARDS,
-) -> Tuple[int, set, List[Dict[str, Any]]]:
+) -> tuple[int, set, list[dict[str, Any]]]:
     """Run shard writes — and stats catch-up reads — through a process pool.
 
     ``stats_coords`` are shards already in the store whose statistics the
@@ -4081,8 +4073,8 @@ def _write_shards(
 
     written_count = 0
     failed: set = set()
-    stats_results: List[Dict[str, Any]] = []
-    pending: List[Dict[str, Any]] = []
+    stats_results: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
     stats_coords = stats_coords or []
     flush_every = max(1, flush_every)
     initargs = (
@@ -4166,11 +4158,11 @@ def _write_shards(
 
 
 def consolidate_store(
-    store_path: "str | Path | StoreLocation",
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
+    store_path: str | Path | StoreLocation,
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
     merge_registry: bool = True,
-    state_url: Optional[str] = None,
+    state_url: str | None = None,
 ) -> int:
     """Re-consolidate a store's root metadata after in-place changes.
 
@@ -4226,13 +4218,13 @@ def _compute_rgb_chunk(
     emb_bhw: np.ndarray,
     scales_hw: np.ndarray,
     band_indices: tuple,
-    stretch_min: List[float],
-    stretch_max: List[float],
-    cdf: Optional[List[List[float]]] = None,
+    stretch_min: list[float],
+    stretch_max: list[float],
+    cdf: list[list[float]] | None = None,
     gamma: float = 1.0,
     saturation: float = 1.0,
-    pca_components: Optional[List[List[float]]] = None,
-    pca_mean: Optional[List[float]] = None,
+    pca_components: list[list[float]] | None = None,
+    pca_mean: list[float] | None = None,
 ) -> np.ndarray:
     """Compute RGBA preview from NCHW-layout embedding + scales.
 
@@ -4295,7 +4287,7 @@ def _compute_rgb_chunk(
 
     # Keep float channels until after the saturation step to avoid two
     # quantise-then-dequantise rounds.
-    float_channels: List[np.ndarray] = []
+    float_channels: list[np.ndarray] = []
     for i in range(n_iter):
         dequant = per_channel_input[i]
         if cdf is not None:
@@ -4338,10 +4330,10 @@ def _sample_chunk_stats(
     ci: int,
     cj: int,
     shard_size: int,
-    spatial_shape: Tuple[int, int],
+    spatial_shape: tuple[int, int],
     band_indices: tuple = RGB_PREVIEW_BANDS,
     max_per_chunk: int = 10_000,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Sample dequantised values from one shard for stretch estimation.
 
     Reads from NCHW layout: emb_arr[t, bands, r0:r1, c0:c1].
@@ -4379,12 +4371,12 @@ def _sample_chunk_stats(
 
 
 def compute_stretch(
-    store: "zarr.Group",
+    store: zarr.Group,
     time_index: int,
     p_low: float = 2,
     p_high: float = 98,
     workers: int = 8,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
     sample_fraction: float = 0.1,
 ) -> dict:
     """Compute percentile stretch for RGB bands at one time step."""
@@ -4469,7 +4461,7 @@ def _zone_centre_lon(zone: int) -> float:
     return -180.0 + (zone - 0.5) * 6.0
 
 
-def blend_stretches(a: Optional[dict], b: Optional[dict], w_b: float) -> Optional[dict]:
+def blend_stretches(a: dict | None, b: dict | None, w_b: float) -> dict | None:
     """Weighted mean of two stretches; *w_b* is the weight given to *b*.
 
     Missing operands pass through, so a zone with no statistics of its own can
@@ -4496,10 +4488,10 @@ def blend_stretches(a: Optional[dict], b: Optional[dict], w_b: float) -> Optiona
 
 
 def stretch_for_lon(
-    zone_stretches: Dict[int, dict],
+    zone_stretches: dict[int, dict],
     lon: float,
-    fallback: Optional[dict] = None,
-) -> Optional[dict]:
+    fallback: dict | None = None,
+) -> dict | None:
     """The blended stretch that applies at longitude *lon*.
 
     *zone_stretches* is keyed by UTM zone number; zones absent from it fall back
@@ -4519,8 +4511,8 @@ def stretch_for_lon(
 
 
 def load_zone_stretches(
-    store: "StoreLocation | zarr.Group", year: int
-) -> Dict[int, dict]:
+    store: StoreLocation | zarr.Group, year: int
+) -> dict[int, dict]:
     """Per-zone stretches persisted on the root, empty when none are stored."""
     root = store if hasattr(store, "attrs") else store.open_group(mode="r")
     entry = dict(root.attrs).get(_ZONE_STRETCH_ATTR) or {}
@@ -4528,7 +4520,7 @@ def load_zone_stretches(
     return {int(z): v for z, v in per_year.items()}
 
 
-def _parse_pca_perm(pca_rgb_order: str, pca_components: int) -> List[int]:
+def _parse_pca_perm(pca_rgb_order: str, pca_components: int) -> list[int]:
     """Validate a PC→RGB permutation like '213' and return 0-based indices."""
     if len(pca_rgb_order) != pca_components or set(pca_rgb_order) != {
         str(i + 1) for i in range(pca_components)
@@ -4541,9 +4533,9 @@ def _parse_pca_perm(pca_rgb_order: str, pca_components: int) -> List[int]:
 
 
 def compute_stretch_from_stats(
-    store_path: "str | Path | StoreLocation",
+    store_path: str | Path | StoreLocation,
     year: int,
-    zones: Optional[List[int]] = None,
+    zones: list[int] | None = None,
     p_low: float = 2.0,
     p_high: float = 98.0,
     equalise: bool = True,
@@ -4552,8 +4544,8 @@ def compute_stretch_from_stats(
     pca_components: int = 3,
     pca_rgb_order: str = "123",
     drift_threshold: float = 0.25,
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
     persist: bool = True,
     from_sample: bool = False,
     allow_drift: bool = False,
@@ -4600,10 +4592,10 @@ def compute_stretch_from_stats(
     n_total = 0
     s_total = np.zeros(N_BANDS, dtype=np.float64)
     m_total = np.zeros((N_BANDS, N_BANDS), dtype=np.float64)
-    sample_parts: List[Tuple[np.ndarray, np.ndarray, float]] = []
-    zones_used: List[str] = []
-    zones_missing: List[str] = []
-    zones_poisoned: List[str] = []
+    sample_parts: list[tuple[np.ndarray, np.ndarray, float]] = []
+    zones_used: list[str] = []
+    zones_missing: list[str] = []
+    zones_poisoned: list[str] = []
 
     for name in zone_names:
         group = store.open_group(mode="r", path=name)
@@ -4785,7 +4777,7 @@ def compute_stretch_from_stats(
         pca_proj_components = [[float(v) for v in row] for row in components]
         pca_proj_mean = [float(v) for v in proj_mu]
         pca_evr = [float(v) for v in evr]
-        band_indices: Tuple[int, ...] = tuple(range(N_BANDS))
+        band_indices: tuple[int, ...] = tuple(range(N_BANDS))
     else:
         band_indices = RGB_PREVIEW_BANDS
         channels = x[:, list(band_indices)]
@@ -4818,7 +4810,7 @@ def compute_stretch_from_stats(
     # The same key set as the legacy path so readers
     # (_load_global_stretch, build_global_preview) are unaffected.
     method_prefix = "zone_stats_pca" if mode == "pca" else "zone_stats_percentile"
-    entry: Dict[str, Any] = {
+    entry: dict[str, Any] = {
         "min": stretch_min,
         "max": stretch_max,
         "p_low": p_low,
@@ -4865,18 +4857,18 @@ def compute_stretch_from_stats(
 
 
 def _zone_stretches_by_sampling(
-    store_path: "str | Path | StoreLocation",
+    store_path: str | Path | StoreLocation,
     year: int,
-    zones: Optional[List[int]],
-    console: Optional["rich.console.Console"],
-    storage_options: Optional[Dict[str, Any]],
+    zones: list[int] | None,
+    console: rich.console.Console | None,
+    storage_options: dict[str, Any] | None,
     persist: bool,
     sites: int = 12,
     window: int = 48,
     p_low: float = 2.0,
     p_high: float = 98.0,
     breakpoints: int = 257,
-) -> Dict[int, dict]:
+) -> dict[int, dict]:
     """Per-zone stretches sampled from the store, needing no fill-time statistics.
 
     The statistics arrays exist to support a PCA over all 128 dimensions. A
@@ -4904,7 +4896,7 @@ def _zone_stretches_by_sampling(
         )
 
     rng = np.random.default_rng(0)
-    out: Dict[int, dict] = {}
+    out: dict[int, dict] = {}
     for zone in wanted:
         name = _zone_group_name(zone)
         try:
@@ -4989,17 +4981,17 @@ def _zone_stretches_by_sampling(
 
 
 def compute_zone_stretches(
-    store_path: "str | Path | StoreLocation",
+    store_path: str | Path | StoreLocation,
     year: int,
-    zones: Optional[List[int]] = None,
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
+    zones: list[int] | None = None,
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
     persist: bool = True,
     sample_store: bool = False,
     sample_sites: int = 12,
     sample_window: int = 48,
     **stretch_kwargs,
-) -> Dict[int, dict]:
+) -> dict[int, dict]:
     """One stretch per UTM zone, for the blended preview.
 
     Each zone's stretch is the ordinary global calculation restricted to that
@@ -5036,8 +5028,8 @@ def compute_zone_stretches(
             f"Computing per-zone stretches for {year} over {len(wanted)} zone(s)"
         )
 
-    out: Dict[int, dict] = {}
-    skipped: List[int] = []
+    out: dict[int, dict] = {}
+    skipped: list[int] = []
     for zone in wanted:
         try:
             entry = compute_stretch_from_stats(
@@ -5085,13 +5077,13 @@ def compute_zone_stretches(
 
 
 def backfill_stretch_stats(
-    store_path: "str | Path | StoreLocation",
-    zones: Optional[List[int]] = None,
-    years: Optional[List[int]] = None,
+    store_path: str | Path | StoreLocation,
+    zones: list[int] | None = None,
+    years: list[int] | None = None,
     sample_k: int = STRETCH_SAMPLE_K,
-    console: Optional["rich.console.Console"] = None,
-    storage_options: Optional[Dict[str, Any]] = None,
-    workers: Optional[int] = None,
+    console: rich.console.Console | None = None,
+    storage_options: dict[str, Any] | None = None,
+    workers: int | None = None,
     batch_size: int = STATS_BATCH_SHARDS,
 ) -> int:
     """Rebuild a zone's stretch statistics from its existing shards.
@@ -5193,7 +5185,7 @@ def backfill_stretch_stats(
     return rebuilt
 
 
-def _stretch_backfill_marker_parts(zone_name: str, year: int) -> Tuple[str, str]:
+def _stretch_backfill_marker_parts(zone_name: str, year: int) -> tuple[str, str]:
     """Key of a (zone, year)'s statistics-rebuild marker in the state area.
 
     Present while :func:`backfill_stretch_stats` has emptied the slot and
@@ -5212,7 +5204,7 @@ def _sample_shard_task(
     cj: int,
     band_indices: tuple,
     max_per_chunk: int,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Worker-side: open the zone arrays and return a valid-pixel sample.
 
     Lives at module level so ProcessPoolExecutor can pickle it.
@@ -5241,12 +5233,12 @@ def compute_global_stretch(
     store_path: Path,
     year: int,
     target_samples: int = 2_000_000,
-    max_shards: Optional[int] = None,
+    max_shards: int | None = None,
     p_low: float = 2.0,
     p_high: float = 98.0,
     workers: int = 8,
-    zones: Optional[List[int]] = None,
-    band_indices: Tuple[int, ...] = RGB_PREVIEW_BANDS,
+    zones: list[int] | None = None,
+    band_indices: tuple[int, ...] = RGB_PREVIEW_BANDS,
     max_per_chunk: int = 50_000,
     equalise: bool = True,
     equalise_breakpoints: int = 257,
@@ -5254,7 +5246,7 @@ def compute_global_stretch(
     pca_components: int = 3,
     pca_total_bands: int = 128,
     pca_rgb_order: str = "123",
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
 ) -> dict:
     """Sample valid pixels across every UTM zone until ``target_samples`` are
     collected, then derive one ``(min, max)`` percentile stretch shared by
@@ -5306,7 +5298,7 @@ def compute_global_stretch(
 
     # Parse the pca_rgb_order permutation now so we fail fast on bad input.
     # pca_perm[k] = which PC ends up in output channel k ("213" swaps R/G).
-    pca_perm: Optional[List[int]] = (
+    pca_perm: list[int] | None = (
         _parse_pca_perm(pca_rgb_order, pca_components) if mode == "pca" else None
     )
 
@@ -5327,7 +5319,7 @@ def compute_global_stretch(
 
     # Enumerate every (zone, ci, cj) shard.
     zone_pattern = re.compile(r"^utm(\d{2})$")
-    all_shards: List[Tuple[str, int, int]] = []
+    all_shards: list[tuple[str, int, int]] = []
     zones_visited = set()
     for name in _member_names(root):
         m = zone_pattern.match(name)
@@ -5366,7 +5358,7 @@ def compute_global_stretch(
 
     # Process in batches so we can stop early once the target is reached.
     batch_size = max(workers * 4, 32)
-    collected: List[np.ndarray] = []
+    collected: list[np.ndarray] = []
     total_valid = 0
     shards_visited = 0
     shards_with_data = 0
@@ -5421,9 +5413,9 @@ def compute_global_stretch(
     # eigenvectors. The projected samples (n_samples, K) are mathematically
     # decorrelated, so the K output channels paint orthogonal colour axes
     # rather than redundantly tracking the same model feature.
-    pca_proj_components: Optional[List[List[float]]] = None
-    pca_proj_mean: Optional[List[float]] = None
-    pca_explained_variance_ratio: Optional[List[float]] = None
+    pca_proj_components: list[list[float]] | None = None
+    pca_proj_mean: list[float] | None = None
+    pca_explained_variance_ratio: list[float] | None = None
     if mode == "pca":
         from sklearn.decomposition import PCA
 
@@ -5491,7 +5483,7 @@ def compute_global_stretch(
     # ``np.searchsorted(breaks, pixel)`` maps a pixel value into a bin
     # index 0..(n_breaks-1), which scales linearly to uint8 — guaranteeing
     # output bytes are uniformly distributed across 0..255.
-    cdf_breaks: Optional[List[List[float]]] = None
+    cdf_breaks: list[list[float]] | None = None
     if equalise:
         n_break = max(64, int(equalise_breakpoints))
         quantiles = np.linspace(0.0, 100.0, n_break)
@@ -5548,10 +5540,10 @@ def compute_global_stretch(
 
 
 def _load_global_stretch(
-    store_path: "str | Path | StoreLocation",
+    store_path: str | Path | StoreLocation,
     year: int,
-    storage_options: Optional[Dict[str, Any]] = None,
-) -> Optional[dict]:
+    storage_options: dict[str, Any] | None = None,
+) -> dict | None:
     """Look up a previously-computed global stretch for ``year``.
 
     Returns ``{"min": [..], "max": [..], "cdf": [[..], ..],
@@ -5639,7 +5631,7 @@ def _retry_windows_sharing(operation, retries: int = 20, delay: float = 0.5):
 
 
 def _ensure_global_store(
-    dest: "StoreLocation",
+    dest: StoreLocation,
     num_levels: int,
 ) -> None:
     """Create the global_rgb/ pyramid group within the store.
@@ -5653,7 +5645,7 @@ def _ensure_global_store(
     _retry_windows_sharing(lambda: _ensure_global_store_once(dest, num_levels))
 
 
-def _ensure_global_store_once(dest: "StoreLocation", num_levels: int) -> None:
+def _ensure_global_store_once(dest: StoreLocation, num_levels: int) -> None:
     from zarr.codecs import BloscCodec
 
     root = dest.open_group(mode="r+", zarr_format=3)
@@ -5725,7 +5717,7 @@ def _ensure_global_store_once(dest: "StoreLocation", num_levels: int) -> None:
     res = GLOBAL_BASE_RES
     levels = []
     for lvl in range(actual_levels):
-        entry: Dict[str, Any] = {"asset": str(lvl)}
+        entry: dict[str, Any] = {"asset": str(lvl)}
         if lvl > 0:
             entry["derived_from"] = str(lvl - 1)
             entry["transform"] = {"scale": [2.0, 2.0], "translation": [0.0, 0.0]}
@@ -5767,20 +5759,20 @@ _reproj_scales_arr = None
 _reproj_to_utm = None
 _reproj_time_index = None
 _reproj_stretch = None
-_reproj_zone_stretches: Optional[Dict[int, dict]] = None
+_reproj_zone_stretches: dict[int, dict] | None = None
 
 
 def _init_reproj_worker(
     source_url: str,
-    source_options: Optional[Dict[str, Any]],
+    source_options: dict[str, Any] | None,
     dest_url: str,
-    dest_options: Optional[Dict[str, Any]],
+    dest_options: dict[str, Any] | None,
     zone_group: str,
     zone_epsg: int,
     time_index: int,
     stretch: dict,
     emb_array: str = "embeddings",
-    zone_stretches: Optional[Dict[int, dict]] = None,
+    zone_stretches: dict[int, dict] | None = None,
 ) -> None:
     """Process pool initializer: open stores and create transformer.
 
@@ -5864,7 +5856,7 @@ def _reproject_chunk(
     src_h: int,
     src_w: int,
     to_utm,
-    zone_stretches: Optional[Dict[int, dict]] = None,
+    zone_stretches: dict[int, dict] | None = None,
 ) -> bool:
     """Reproject one 512x512 global chunk, computing RGB from embeddings on the fly.
 
@@ -5956,7 +5948,7 @@ def _reproject_chunk(
         emb_chunk = np.asarray(
             emb_arr[time_index, 0:n_pca_bands, r_min:r_max, c_min:c_max]
         )
-        band_tuple: Tuple[int, ...] = tuple(range(n_pca_bands))
+        band_tuple: tuple[int, ...] = tuple(range(n_pca_bands))
     else:
         b0, b1 = RGB_PREVIEW_BANDS[0], RGB_PREVIEW_BANDS[-1] + 1
         emb_chunk = np.asarray(emb_arr[time_index, b0:b1, r_min:r_max, c_min:c_max])
@@ -6041,7 +6033,7 @@ def _reproject_chunk(
 
 def _reproject_zone(
     source: StoreLocation,
-    dest: "StoreLocation",
+    dest: StoreLocation,
     zone_num: int,
     zone_group: str,
     zone_epsg: int,
@@ -6051,12 +6043,12 @@ def _reproject_zone(
     stretch: dict,
     workers: int,
     present: set,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
     force: bool = False,
     emb_array: str = "embeddings",
-    zone_stretches: Optional[Dict[int, dict]] = None,
-    tile_centres: "Optional[Sequence[Tuple[float, float]]]" = None,
-) -> Tuple[set, bool]:
+    zone_stretches: dict[int, dict] | None = None,
+    tile_centres: Sequence[tuple[float, float]] | None = None,
+) -> tuple[set, bool]:
     """Reproject one zone's embeddings into global level 0.
 
     Embeddings are read from *source* and the pyramid's level 0 written into
@@ -6207,24 +6199,24 @@ def _reproject_zone(
 
 
 def build_global_preview(
-    store_path: "str | Path | StoreLocation",
+    store_path: str | Path | StoreLocation,
     year: int = 2024,
-    zones: Optional[List[int]] = None,
+    zones: list[int] | None = None,
     num_levels: int = GLOBAL_DEFAULT_LEVELS,
     workers: int = 4,
     gamma: float = 1.0,
     saturation: float = 1.0,
-    console: Optional["rich.console.Console"] = None,
+    console: rich.console.Console | None = None,
     force: bool = False,
-    storage_options: Optional[Dict[str, Any]] = None,
-    output_path: "Optional[str | Path | StoreLocation]" = None,
-    output_storage_options: Optional[Dict[str, Any]] = None,
-    state_url: Optional[str] = None,
-    state_storage_options: Optional[Dict[str, Any]] = None,
+    storage_options: dict[str, Any] | None = None,
+    output_path: str | Path | StoreLocation | None = None,
+    output_storage_options: dict[str, Any] | None = None,
+    state_url: str | None = None,
+    state_storage_options: dict[str, Any] | None = None,
     reproject_only: bool = False,
     coarsen_only: bool = False,
     blend_zone_stretch: bool = False,
-    manifest_path: Optional[str] = None,
+    manifest_path: str | None = None,
 ) -> None:
     """Build the global EPSG:4326 RGB pyramid from zone-level embeddings.
 
@@ -6332,7 +6324,7 @@ def build_global_preview(
 
     # Discover zones with embedding data
     zone_pattern = re.compile(r"^utm(\d{2})$")
-    zone_infos: Dict[int, dict] = {}
+    zone_infos: dict[int, dict] = {}
 
     for name in _member_names(root):
         m = zone_pattern.match(name)
@@ -6492,7 +6484,7 @@ def build_global_preview(
     # writes them; a pyramid-only destination has no statistics of its own.
     # Tile footprints, when a manifest is to hand: they narrow each zone's work
     # list from "chunks its shards touch" to "chunks a tile can actually reach".
-    tile_centres_by_zone_map: Dict[int, List[Tuple[float, float]]] = {}
+    tile_centres_by_zone_map: dict[int, list[tuple[float, float]]] = {}
     if manifest_path:
         tile_centres_by_zone_map = tile_centres_by_zone(manifest_path, year, zones)
         if console:
@@ -6502,7 +6494,7 @@ def build_global_preview(
                 f"from the manifest"
             )
 
-    zone_stretches: Dict[int, dict] = {}
+    zone_stretches: dict[int, dict] = {}
     if blend_zone_stretch:
         zone_stretches = load_zone_stretches(source, year)
         if not zone_stretches:
