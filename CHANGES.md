@@ -1,19 +1,37 @@
-## Unreleased
+## v0.11.1 (20-11-2026)
 
 - Add a global `--proxy URL` option, the `GEOTESSERA_PROXY` environment
-  variable and the `proxy=` argument of `GeoTesseraZarr` and `zarr_store`,
-  which read the public Zarr stores through a caching proxy standing in for
-  the mirror root. Proxied requests wait up to an hour for a cold
-  whole-object proxy to fetch a shard.
-- Open plain `http://` Zarr stores, such as a loopback proxy. These
-  previously failed with a `BadScheme` error.
+  variable and the `proxy=` argument for `GeoTesseraZarr`. This reads
+  the public Zarr stores through a caching proxy. (#461 @avsm)
+
+- Open plain `http://` Zarr stores, such as the proxy above. These
+  previously failed with a `BadScheme` error. (#461 @avsm)
+
+- Icechunk tile registry queries now handle bounding boxes crossing the
+  antimeridian (`west > east`) (#463 @avsm)
+
+- Remove the forced time chunk size when opening Zarr stores, which
+  conflicted with dClimate's `time_bnds`. (@avsm)
 
 - `zarr-fill --rewrite-existing-shards` no longer follows every zone/year
   with a serial re-read of the shards it has just written to rebuild the
-  stretch statistics. (@mtelvers)
+  stretch statistics. (#448 @mtelvers)
+
 - Stretch statistics are folded into the store as the worker pool produces
   them, in batches (`--stats-batch-size`, default 64), for shards being
-  written and for shards read back alike. (@mtelvers)
+  written and for shards read back alike. Interrupted fills and backfills
+  resume from the saved batches. (#448 @mtelvers)
+
+- Clamp tile shard coordinates to the zone grid, fixing an `IndexError`
+  at grid edges that could leave stretch statistics incomplete and prevent
+  fills from resuming. (#448 @mtelvers)
+
+- New Zarr stores use a fixed grid for each UTM zone, so extending tile
+  coverage no longer requires rebuilding the store and its RGB preview.
+  Existing stores retain their grids. (#448 @mtelvers)
+
+- Modernize Python type annotations and type progress callbacks
+  consistently across the library. (#464 @avsm)
 
 ## v0.11.0 (04-10-2026)
 
